@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "crypto-research-agent"
+version = "0.1.2"
+description = "Read-only, risk-first crypto research agent"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [{ name = "Paweł" }]
+dependencies = [
+  "fastapi>=0.115,<1",
+  "pydantic>=2.8,<3",
+  "python-dotenv>=1,<2",
+  "uvicorn[standard]>=0.30,<1",
+]
+
+[project.optional-dependencies]
+llm = ["openai-agents>=0.0.19"]
+postgres = ["psycopg[binary]>=3.2,<4"]
+dev = [
+  "mypy>=1.11,<2",
+  "pytest>=8,<9",
+  "pytest-cov>=5,<7",
+  "ruff>=0.6,<1",
+]
+
+[project.scripts]
+crypto-agent = "crypto_agent.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/crypto_agent"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"configs/risk_policy.v1.json" = "crypto_agent/resources/configs/risk_policy.v1.json"
+"db/schema.sql" = "crypto_agent/resources/db/schema.sql"
+"db/migrations" = "crypto_agent/resources/db/migrations"
+
+[tool.pytest.ini_options]
+addopts = "-q"
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["crypto_agent"]
