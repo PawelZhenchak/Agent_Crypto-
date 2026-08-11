@@ -128,6 +128,8 @@ def assess_data_quality(
 
     newest_observed_at = max((candle.close_time for candle in unique), default=None)
     newest_available_at = max((candle.available_at for candle in unique), default=None)
+    # Historical OHLC completeness is governed by its own interval. The independent
+    # two-venue reference-price snapshot has a separate five-minute RiskGate check.
     max_age = expected_delta * policy.max_staleness_multiplier
     if newest_observed_at is None or as_of - newest_observed_at > max_age:
         flags.append("STALE_DATA")

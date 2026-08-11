@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Any, Protocol
 
 from ..deadline import AnalysisDeadlineExceeded
-from ..domain import Candle
+from ..domain import Candle, ReferencePriceObservation, ReferencePriceSnapshot
 
 
 @dataclass(frozen=True, slots=True)
@@ -15,6 +15,7 @@ class ProviderFailureEvidence:
     input_candles: tuple[Candle, ...] = ()
     sources: tuple[dict[str, str], ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
+    reference_price: ReferencePriceSnapshot | None = None
 
 
 class ProviderError(RuntimeError):
@@ -40,6 +41,7 @@ class ProviderBatch:
     input_candles: tuple[Candle, ...]
     sources: tuple[dict[str, str], ...]
     metadata: dict[str, Any] = field(default_factory=dict)
+    reference_price: ReferencePriceSnapshot | None = None
 
 
 class CandleProvider(Protocol):
@@ -53,6 +55,15 @@ class CandleProvider(Protocol):
         as_of: datetime,
         limit: int,
     ) -> list[Candle]: ...
+
+
+class ReferencePriceProvider(CandleProvider, Protocol):
+    def fetch_reference_price(
+        self,
+        *,
+        symbol: str,
+        as_of: datetime,
+    ) -> ReferencePriceObservation: ...
 
 
 class BatchCandleProvider(CandleProvider, Protocol):

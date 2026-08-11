@@ -41,7 +41,7 @@ class FactorySafetyTests(unittest.TestCase):
             ):
                 orchestrator = build_orchestrator("synthetic")
 
-        self.assertEqual(orchestrator.policy.policy_id, "v1-read-only-2026-08-10")
+        self.assertEqual(orchestrator.policy.policy_id, "v1-read-only-2026-08-10-r2")
 
     def test_wheel_includes_runtime_policy_and_migrations(self) -> None:
         pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from enum import StrEnum
+from statistics import median
 from typing import Any
 
 
@@ -35,6 +36,50 @@ class Candle:
     source: str
     available_at: datetime
     ingested_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ReferencePriceObservation:
+    """One venue's price from its latest completed one-minute candle."""
+
+    symbol: str
+    price: float
+    event_time: datetime
+    available_at: datetime
+    ingested_at: datetime
+    source: str
+
+
+@dataclass(frozen=True, slots=True)
+class ReferencePriceSnapshot:
+    """Immutable multi-venue reference-price evidence used by the risk gate."""
+
+    symbol: str
+    observations: tuple[ReferencePriceObservation, ...]
+
+    @property
+    def price(self) -> float:
+        if not self.observations:
+            raise ValueError("A reference-price snapshot requires observations")
+        return float(median(item.price for item in self.observations))
+
+    @property
+    def event_time(self) -> datetime:
+        if not self.observations:
+            raise ValueError("A reference-price snapshot requires observations")
+        return min(item.event_time for item in self.observations)
+
+    @property
+    def available_at(self) -> datetime:
+        if not self.observations:
+            raise ValueError("A reference-price snapshot requires observations")
+        return max(item.available_at for item in self.observations)
+
+    @property
+    def ingested_at(self) -> datetime:
+        if not self.observations:
+            raise ValueError("A reference-price snapshot requires observations")
+        return max(item.ingested_at for item in self.observations)
 
 
 @dataclass(frozen=True, slots=True)

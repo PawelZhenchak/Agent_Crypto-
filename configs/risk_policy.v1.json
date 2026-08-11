@@ -1,5 +1,6 @@
 {
-  "policy_id": "v1-read-only-2026-08-10",
+  "policy_id": "v1-read-only-2026-08-10-r2",
+  "policy_schema_version": 2,
   "mode": "V1_READ_ONLY",
   "execution_enabled": false,
   "allowed_decisions": ["NO_SIGNAL", "ALERT"],
@@ -8,6 +9,7 @@
   "min_samples": 60,
   "min_data_quality": 0.85,
   "max_staleness_multiplier": 1.25,
+  "max_reference_price_age_seconds": 300,
   "max_gap_multiplier": 1.5,
   "max_annualized_volatility": 1.2,
   "max_absolute_period_return": 0.2,
@@ -15,6 +17,7 @@
   "max_clock_skew_seconds": 30,
   "min_consensus_sources": 2,
   "min_consensus_overlap": 120,
+  "max_reference_price_deviation_from_median_bps": 50.0,
   "max_cross_source_divergence_bps": 100.0,
   "max_cross_source_ohlc_divergence_bps": 500.0,
   "max_cross_source_volume_zscore_delta": 3.0,

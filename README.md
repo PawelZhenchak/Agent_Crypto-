@@ -1,6 +1,6 @@
 # Crypto Research Agent V1.1
 
-Checkpoint **0.1.2-v1.1** rozwija read-only fundament agenta badawczego o dwa
+Checkpoint **0.1.3-v1.1** rozwija read-only fundament agenta badawczego o dwa
 publiczne feedy spot, deterministyczny konsensus Kraken–Coinbase i point-in-time
 persistence dla PostgreSQL. System nadal służy wyłącznie do developmentu i testów.
 `metadata.v1_gate_passed` zawsze pozostaje `false`.
@@ -8,7 +8,7 @@ persistence dla PostgreSQL. System nadal służy wyłącznie do developmentu i t
 > `ALERT` jest alertem badawczym, nigdy poleceniem kupna lub sprzedaży. Każdy brak,
 > konflikt albo wadliwy dowód konsensusu kończy się `NO_SIGNAL`.
 
-## Co działa w checkpointcie 0.1.2
+## Co działa w checkpointcie 0.1.3
 
 - allowlista `BTC/USD` i `ETH/USD`, interwały 4h, 1d i 1w;
 - publiczne adaptery Kraken i Coinbase Exchange bez kluczy i prywatnych endpointów;
@@ -22,6 +22,9 @@ persistence dla PostgreSQL. System nadal służy wyłącznie do developmentu i t
 - zapieczętowana konfiguracja providera konsensusu: wyłącznie source keys
   `kraken_spot_rest_v1` + `coinbase_exchange_spot_rest_v1`, bez możliwości podmiany
   pary po skonstruowaniu;
+- attestation implementacji feedów przed i po fetchu: exact typy, kod/defaulty/closure
+  metod, krytyczne mapy, origin, timeout oraz lokalny łańcuch transportu; wykryta
+  mutacja kończy się `NO_SIGNAL`;
 - jeden wersjonowany algorytm `cross_exchange_spot_consensus_v1` używany zarówno
   przez ścieżkę runtime, jak i trwałe przeliczenie point-in-time;
 - dokładnie 120 ciągłych, wspólnych i czasowo wyrównanych świec z obu venue,
@@ -32,11 +35,15 @@ persistence dla PostgreSQL. System nadal służy wyłącznie do developmentu i t
   progi i hash dowodu zamiast pustego błędu;
 - standalone `synthetic`, `kraken` i `coinbase` są diagnostyczne — RiskGate dodaje
   `CONSENSUS_REQUIRED`, więc nie mogą wyemitować `ALERT`;
+- osobny snapshot ceny referencyjnej z dokładnie dwóch wyrównanych, zamkniętych świec
+  1m Kraken/Coinbase; historia 4h/1d/1w nie jest używana jako zegar ceny;
+- RiskGate niezależnie przelicza limit wieku **300 s** oraz maksymalne odchylenie
+  każdego źródła **50 pb od mediany** (dla dwóch źródeł dokładnie 100 pb pairwise);
 - niezależna walidacja RiskGate: finite numbers, UTC, expiry, SHA-256, allowlista
-  decyzji i pełny fingerprint `RiskPolicy`;
+  decyzji, pełny fingerprint `RiskPolicy` i fail-closed dla wadliwych DTO;
 - append-only raporty i snapshoty wejścia w lokalnym SQLite;
-- migracja PostgreSQL `0011` i repozytorium raw/canonical z venue-specific market
-  IDs, receipt lineage, provenance oraz manifestem algorytmu, polityki i dowodu;
+- migracje PostgreSQL `0011` i `0012`: repozytorium raw/canonical oraz append-only
+  manifest/provenance ceny referencyjnej z przypiętym `(candle_id, receipt_id)`;
 - DB-derived wybór najnowszych kwalifikujących się raw revisions; identyfikatory
   przekazane przez wywołującego służą wyłącznie jako assertion równości i nie mogą
   wybierać starszej rewizji ani skracać okna;
@@ -51,8 +58,13 @@ persistence dla PostgreSQL. System nadal służy wyłącznie do developmentu i t
 - odczyt canonical ponownie wylicza konsensus z pełnych 240 rekordów provenance,
   sprawdza okres ważności polityki w chwili cutoffu i cały łańcuch hashy manifestu;
 - planowanie, wykonanie i health-check migracji przez CLI;
+- readiness wymaga dokładnie PostgreSQL 16, kompletnego katalogu tabel, funkcji i
+  triggerów, dokładnych kolumn ośmiu tabel migracyjnych, checksummowanych migracji
+  oraz dokładnego zestawu semantycznych seedów; pusty manifest migracji ani
+  nadmiarowy seed nie mogą ominąć kontroli;
 - opcjonalny narrator OpenAI otrzymuje wynik dopiero po deterministycznym RiskGate
-  i nie może zmienić decyzji.
+  i nie może zmienić decyzji; NFKC/casefold, kontrola znaków niewidocznych, Markdownu
+  i fraz PL/EN blokują znane bezpośrednie oraz pośrednie sugestie działania.
 
 Kod V1.1 nie zawiera składania ani anulowania zleceń, kluczy giełdowych, transferów,
 wypłat, margin, futures ani dźwigni. Obecność popularnych zmiennych z sekretami
@@ -70,11 +82,14 @@ giełdowymi blokuje start.
 - brak trades/order booka, spreadu, depth i price impact;
 - brak specjalistów derivatives, on-chain, makro, tokenomics, stablecoin i Sceptyka;
 - brak pełnego trace/evals dashboardu i 4–8 tygodni forward observation.
-- audyt planu wykazał też cztery otwarte defekty graniczne: możliwość podmiany
-  implementacji feedu przez kod w tym samym procesie, zbyt płytki PostgreSQL
-  health-check, rozjazd reguły świeżości/progu ceny referencyjnej oraz niepełne
-  pokrycie parafraz sugestii inwestycyjnych przez filtr narratora. Szczegóły są w
-  `docs/CURRENT_STATUS.md`.
+- repo nie zawiera jeszcze operacyjnych seedów registry, więc poprawny health-check
+  świadomie zwraca `SEEDS_MISSING`, dopóki wymagane bindingi i serie nie istnieją;
+- attestation jest defense-in-depth, nie sandboxem: arbitralny kod lub plugin już
+  uruchomiony w tym samym interpreterze może zmienić także sam RiskGate; rzeczywista
+  granica wymaga osobnego, minimalnego workera ingestu w przypiętym obrazie;
+- deterministyczny filtr tekstu blokuje znane klasy rekomendacji, lecz nie dowodzi
+  pokrycia wszystkich możliwych parafraz; narrator pozostaje domyślnie wyłączony do
+  czasu ukrytych evali z wymaganym 100% recall.
 
 Te punkty blokują formalny Gate V1 i przejście do V2.
 
@@ -115,7 +130,7 @@ PYTHONPATH=src python -m unittest discover -s tests -v
 python -m compileall -q src tests
 ```
 
-Lokalny wynik checkpointu: **155/155 testów standard-library** oraz
+Lokalny wynik checkpointu: **213/213 testów standard-library** oraz
 pełny `compileall` dla `src` i `tests`. Ten wynik nie zastępuje testów live ani
 akceptacji na prawdziwym PostgreSQL.
 
@@ -133,8 +148,12 @@ crypto-agent db migrate
 crypto-agent db health
 ```
 
-`db/schema.sql` jest bootstrapem czystej bazy, a `db/migrations/` zawiera
-checksummowane migracje aplikacyjne. Ustaw `POSTGRES_PASSWORD` i
+Readiness jest fail-closed: po samym bootstrapie i migracjach wynik pozostanie
+`SEEDS_MISSING`, dopóki registry nie ma dokładnych bindingów Kraken/Coinbase dla
+BTC/ETH oraz sześciu kanonicznych serii powiązanych z bieżącą polityką.
+
+`db/schema.sql` jest bootstrapem czystej bazy PostgreSQL 16, a `db/migrations/`
+zawiera checksummowane migracje aplikacyjne. Ustaw `POSTGRES_PASSWORD` i
 `CRYPTO_AGENT_POSTGRES_DSN` w `.env`; CLI nigdy nie wypisuje DSN. Istniejącego wolumenu
 nie należy usuwać w celu „naprawienia” migracji — drift checksumy ma zatrzymać proces.
 
@@ -143,6 +162,13 @@ wiązań źródło–venue–market i zamkniętego okna. Następnie sprawdza dok
 kontekst `Kraken 120 + Coinbase 120`, uruchamia
 `cross_exchange_spot_consensus_v1` i zapisuje uporządkowane provenance oraz manifest
 dowodu. Caller może potwierdzić oczekiwane IDs, ale nie wybiera nimi wejść.
+
+`PointInTimeCandleRepository.append_reference_price` wyprowadza z bazy dokładnie
+dwie najnowsze kwalifikujące się świece 1m, przypina ich receipts, ponownie liczy
+medianę i progi oraz zapisuje manifest `cross_exchange_reference_price_v1`.
+Migracja `0012` powtarza krytyczne kontrole w deferred triggerze na rzeczywistych
+wierszach źródłowych. Historyczna polityka schema-r1 pozostaje dostępna wyłącznie do
+replayu; nowe zapisy wymagają schema-r2.
 
 Canonical OHLC jest wynikiem wspólnego algorytmu. Znormalizowany wolumen jest wartością
 bezwymiarową i pozostaje w manifeście wraz z diagnostyką; nie jest zapisywany jako
@@ -172,8 +198,8 @@ python -m pip install -e ".[llm]"
 
 Następnie ustaw `OPENAI_API_KEY`, `CRYPTO_AGENT_ENABLE_LLM=true` i użyj `--narrate`.
 Subskrypcja ChatGPT i API OpenAI są rozliczane oddzielnie. Narrator ma ścisły schemat,
-postwalidację decyzji i filtr rekomendacji finansowych; pozostaje funkcją laboratoryjną
-do czasu formalnych evals.
+postwalidację decyzji i fail-closed filtr rekomendacji finansowych PL/EN; pozostaje
+funkcją laboratoryjną i domyślnie wyłączoną do czasu formalnych evals.
 
 ## Nienaruszalne zasady
 
@@ -195,4 +221,6 @@ do czasu formalnych evals.
 
 Stan i kolejne bramki opisują `docs/CURRENT_STATUS.md`, `docs/ROADMAP.md`,
 `docs/ARCHITECTURE.md`, `docs/DATA_MODEL.md`, `docs/SAFETY_POLICY.md`,
-`docs/EVALUATION_PLAN.md` i `docs/V1_1_RELEASE_NOTES.md`.
+`docs/EVALUATION_PLAN.md` i `docs/V1_1_RELEASE_NOTES.md`. Pełna instrukcja instalacji,
+uruchomienia oraz oczekiwanych wyników znajduje się w
+[`docs/INSTRUKCJA_URUCHOMIENIA.md`](docs/INSTRUKCJA_URUCHOMIENIA.md).

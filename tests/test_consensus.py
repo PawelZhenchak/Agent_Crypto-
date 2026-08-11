@@ -4,6 +4,7 @@ import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from crypto_agent.consensus_math import (
     CONSENSUS_ALGORITHM_VERSION,
@@ -13,9 +14,12 @@ from crypto_agent.consensus_math import (
     ConsensusPolicyParameters,
     build_cross_exchange_consensus,
 )
-from crypto_agent.domain import Decision
+from crypto_agent.domain import Decision, ReferencePriceObservation
 from crypto_agent.providers.base import ProviderError
-from crypto_agent.providers.consensus import CrossExchangeConsensusProvider
+from crypto_agent.providers.consensus import (
+    CrossExchangeConsensusProvider,
+    _build_reference_price_envelope,
+)
 from crypto_agent.providers.coinbase import CoinbaseExchangePublicProvider
 from crypto_agent.providers.kraken import KrakenPublicProvider
 from crypto_agent.providers.synthetic import SyntheticProvider
@@ -32,7 +36,9 @@ def consensus_parameters() -> ConsensusPolicyParameters:
     selected = policy()
     return ConsensusPolicyParameters(
         min_overlap=selected.min_consensus_overlap,
-        max_close_divergence_bps=selected.max_cross_source_divergence_bps,
+        max_close_divergence_bps=(
+            selected.max_pairwise_reference_price_divergence_bps
+        ),
         max_ohlc_divergence_bps=selected.max_cross_source_ohlc_divergence_bps,
         max_volume_zscore_delta=selected.max_cross_source_volume_zscore_delta,
         max_divergent_fraction=selected.max_divergent_candle_fraction,
@@ -121,6 +127,44 @@ class ConsensusProviderTests(unittest.TestCase):
         self.assertTrue(
             all(item.source == "cross_exchange_spot_consensus_v1" for item in batch.candles)
         )
+        self.assertIsNone(batch.reference_price)
+
+    def test_reference_snapshot_uses_exactly_the_two_approved_sources(self) -> None:
+        providers = (KrakenPublicProvider(), CoinbaseExchangePublicProvider())
+        observations = {
+            KrakenPublicProvider.source_id: ReferencePriceObservation(
+                symbol="BTC/USD",
+                price=99.5,
+                event_time=AS_OF,
+                available_at=AS_OF,
+                ingested_at=AS_OF,
+                source=KrakenPublicProvider.source_id,
+            ),
+            CoinbaseExchangePublicProvider.source_id: ReferencePriceObservation(
+                symbol="BTC/USD",
+                price=100.5,
+                event_time=AS_OF,
+                available_at=AS_OF,
+                ingested_at=AS_OF,
+                source=CoinbaseExchangePublicProvider.source_id,
+            ),
+        }
+
+        snapshot, result = _build_reference_price_envelope(
+            providers,
+            observations,
+            symbol="BTC/USD",
+            as_of=AS_OF,
+            policy=policy(),
+        )
+
+        self.assertEqual(snapshot.symbol, "BTC/USD")
+        self.assertEqual(snapshot.price, 100.0)
+        self.assertEqual(
+            tuple(item.source for item in snapshot.observations),
+            tuple(item.source_id for item in providers),
+        )
+        self.assertEqual(set(result.venue_ids), {"kraken", "coinbase"})
 
     def test_provider_wrapper_matches_the_shared_pure_algorithm(self) -> None:
         left = StaticProvider("venue_a")
@@ -327,10 +371,9 @@ class ConsensusProviderTests(unittest.TestCase):
         self.assertEqual(result.candles[-1].close, 104.0)
 
     def test_configuration_properties_are_immutable(self) -> None:
-        approved = CrossExchangeConsensusProvider(
-            (KrakenPublicProvider(), CoinbaseExchangePublicProvider()),
-            policy(),
-        )
+        kraken = KrakenPublicProvider()
+        coinbase = CoinbaseExchangePublicProvider()
+        approved = CrossExchangeConsensusProvider((kraken, coinbase), policy())
 
         with self.assertRaises(AttributeError):
             approved.providers = (  # type: ignore[misc]
@@ -345,6 +388,17 @@ class ConsensusProviderTests(unittest.TestCase):
             approved.approved_venue_pair = True  # type: ignore[misc]
         with self.assertRaises(AttributeError):
             del approved._providers  # type: ignore[attr-defined]
+        for provider in (kraken, coinbase):
+            with self.subTest(provider=type(provider).__name__):
+                self.assertFalse(hasattr(provider, "__dict__"))
+                with self.assertRaises(AttributeError):
+                    provider.fetch_candles = lambda **_: []  # type: ignore[method-assign]
+                with self.assertRaises(AttributeError):
+                    object.__setattr__(provider, "fetch_candles", lambda **_: [])
+                with self.assertRaises(AttributeError):
+                    provider.fetch_reference_price = lambda **_: None  # type: ignore[method-assign]
+                with self.assertRaises(AttributeError):
+                    object.__setattr__(provider, "fetch_reference_price", lambda **_: None)
 
     def test_sealed_composition_detects_low_level_origin_or_timeout_tampering(self) -> None:
         mutations = (
@@ -370,6 +424,90 @@ class ConsensusProviderTests(unittest.TestCase):
                     raised.exception.code,
                     "CONSENSUS_CONFIGURATION_TAMPERED",
                 )
+
+    def test_in_place_provider_mapping_mutation_invalidates_integrity(self) -> None:
+        approved = CrossExchangeConsensusProvider(
+            (KrakenPublicProvider(), CoinbaseExchangePublicProvider()),
+            policy(),
+        )
+        original_pair = KrakenPublicProvider._pairs["BTC/USD"]
+        try:
+            KrakenPublicProvider._pairs["BTC/USD"] = "ETHUSD"
+            self.assertFalse(approved.approved_venue_pair)
+            with self.assertRaises(ProviderError) as raised:
+                approved.fetch_batch(
+                    symbol="BTC/USD",
+                    interval_minutes=1440,
+                    as_of=AS_OF,
+                    limit=CONSENSUS_WINDOW_SIZE,
+                )
+            self.assertEqual(
+                raised.exception.code,
+                "CONSENSUS_CONFIGURATION_TAMPERED",
+            )
+        finally:
+            KrakenPublicProvider._pairs["BTC/USD"] = original_pair
+
+        self.assertTrue(approved.approved_venue_pair)
+
+    def test_mapping_subclass_cannot_lie_to_integrity_snapshot(self) -> None:
+        class EvilDict(dict):
+            def items(self):
+                return dict.items(self)
+
+            def get(self, key, default=None):
+                if key == "BTC/USD":
+                    return "ETHUSD"
+                return dict.get(self, key, default)
+
+        approved = CrossExchangeConsensusProvider(
+            (KrakenPublicProvider(), CoinbaseExchangePublicProvider()),
+            policy(),
+        )
+        original_pairs = KrakenPublicProvider._pairs
+        try:
+            KrakenPublicProvider._pairs = EvilDict(original_pairs)
+            self.assertFalse(approved.approved_venue_pair)
+            with self.assertRaises(ProviderError) as raised:
+                approved.fetch_batch(
+                    symbol="BTC/USD",
+                    interval_minutes=1440,
+                    as_of=AS_OF,
+                    limit=CONSENSUS_WINDOW_SIZE,
+                )
+            self.assertEqual(
+                raised.exception.code,
+                "CONSENSUS_CONFIGURATION_TAMPERED",
+            )
+        finally:
+            KrakenPublicProvider._pairs = original_pairs
+
+        self.assertTrue(approved.approved_venue_pair)
+
+    def test_string_subclass_cannot_spoof_the_pinned_origin(self) -> None:
+        class EvilStr(str):
+            def __format__(self, _spec):
+                return "https://attacker.example"
+
+        kraken = KrakenPublicProvider()
+        approved = CrossExchangeConsensusProvider(
+            (kraken, CoinbaseExchangePublicProvider()),
+            policy(),
+        )
+        object.__setattr__(kraken, "_base_url", EvilStr("https://api.kraken.com"))
+
+        self.assertFalse(approved.approved_venue_pair)
+        with self.assertRaises(ProviderError) as raised:
+            approved.fetch_batch(
+                symbol="BTC/USD",
+                interval_minutes=1440,
+                as_of=AS_OF,
+                limit=CONSENSUS_WINDOW_SIZE,
+            )
+        self.assertEqual(
+            raised.exception.code,
+            "CONSENSUS_CONFIGURATION_TAMPERED",
+        )
 
     def test_low_level_composition_spoof_fails_before_fetch_and_cannot_alert(self) -> None:
         approved = CrossExchangeConsensusProvider(
@@ -432,36 +570,180 @@ class ConsensusProviderTests(unittest.TestCase):
         )
         self.assertFalse(approved.approved_venue_pair)
 
-    def test_consensus_proof_reaches_the_independent_risk_gate(self) -> None:
+    def test_class_method_substitution_fails_closed_and_cannot_alert(self) -> None:
         kraken = KrakenPublicProvider()
         coinbase = CoinbaseExchangePublicProvider()
         kraken_fixture = StaticProvider(kraken.source_id)
         coinbase_fixture = StaticProvider(coinbase.source_id, price_multiplier=1.0005)
-        kraken.fetch_candles = kraken_fixture.fetch_candles  # type: ignore[method-assign]
-        coinbase.fetch_candles = coinbase_fixture.fetch_candles  # type: ignore[method-assign]
+        for provider in (kraken_fixture, coinbase_fixture):
+            latest = provider.candles[-1]
+            provider.candles[-1] = replace(
+                latest,
+                high=latest.open * 1.07,
+                low=latest.open * 0.999,
+                close=latest.open * 1.06,
+            )
         approved = CrossExchangeConsensusProvider((kraken, coinbase), policy())
-        report = ResearchOrchestrator(provider=approved, policy=policy()).analyze(
-            symbol="BTC/USD", interval_minutes=1440, as_of=AS_OF
-        )
-        self.assertFalse(report.risk.vetoed)
-        self.assertTrue(report.metadata["v1_1_consensus_passed"])
+        with patch.object(
+            KrakenPublicProvider,
+            "fetch_candles",
+            new=kraken_fixture.fetch_candles,
+        ), patch.object(
+            CoinbaseExchangePublicProvider,
+            "fetch_candles",
+            new=coinbase_fixture.fetch_candles,
+        ):
+            self.assertFalse(approved.approved_venue_pair)
+            report = ResearchOrchestrator(provider=approved, policy=policy()).analyze(
+                symbol="BTC/USD", interval_minutes=1440, as_of=AS_OF
+            )
+
+        self.assertEqual(report.decision, Decision.NO_SIGNAL)
+        self.assertTrue(report.risk.vetoed)
+        self.assertFalse(report.metadata["v1_1_consensus_passed"])
         self.assertEqual(
-            {item["id"] for item in report.sources},
-            {kraken.source_id, coinbase.source_id},
+            report.metadata["provider_error_code"],
+            "CONSENSUS_CONFIGURATION_TAMPERED",
         )
-        configurations = report.metadata["provider_diagnostics"][
-            "consensus_source_configurations"
-        ]
+        self.assertNotEqual(report.decision, Decision.ALERT)
+
+    def test_reference_price_method_substitution_fails_before_fetch(self) -> None:
+        approved = CrossExchangeConsensusProvider(
+            (KrakenPublicProvider(), CoinbaseExchangePublicProvider()),
+            policy(),
+        )
+
+        with patch.object(
+            KrakenPublicProvider,
+            "fetch_reference_price",
+            new=lambda *_args, **_kwargs: ReferencePriceObservation(
+                symbol="BTC/USD",
+                price=100.0,
+                event_time=AS_OF,
+                available_at=AS_OF,
+                ingested_at=AS_OF,
+                source=KrakenPublicProvider.source_id,
+            ),
+        ):
+            self.assertFalse(approved.approved_venue_pair)
+            with self.assertRaises(ProviderError) as raised:
+                approved.fetch_batch(
+                    symbol="BTC/USD",
+                    interval_minutes=1440,
+                    as_of=AS_OF,
+                    limit=CONSENSUS_WINDOW_SIZE,
+                )
+
         self.assertEqual(
-            configurations[kraken.source_id]["origin"],
-            "https://api.kraken.com",
+            raised.exception.code,
+            "CONSENSUS_CONFIGURATION_TAMPERED",
         )
+
+    def test_in_place_method_code_mutation_fails_before_fetch(self) -> None:
+        def forged_fetch(self, **_kwargs):
+            del self
+            return []
+
+        methods = (
+            (KrakenPublicProvider, "fetch_candles"),
+            (CoinbaseExchangePublicProvider, "fetch_candles"),
+            (KrakenPublicProvider, "fetch_reference_price"),
+            (CoinbaseExchangePublicProvider, "fetch_reference_price"),
+        )
+        for owner, name in methods:
+            with self.subTest(owner=owner.__name__, method=name):
+                approved = CrossExchangeConsensusProvider(
+                    (KrakenPublicProvider(), CoinbaseExchangePublicProvider()),
+                    policy(),
+                )
+                function = getattr(owner, name)
+                original_code = function.__code__
+                try:
+                    function.__code__ = forged_fetch.__code__
+                    self.assertFalse(approved.approved_venue_pair)
+                    with self.assertRaises(ProviderError) as raised:
+                        approved.fetch_batch(
+                            symbol="BTC/USD",
+                            interval_minutes=1440,
+                            as_of=AS_OF,
+                            limit=CONSENSUS_WINDOW_SIZE,
+                        )
+                    self.assertEqual(
+                        raised.exception.code,
+                        "CONSENSUS_CONFIGURATION_TAMPERED",
+                    )
+                finally:
+                    function.__code__ = original_code
+
+                self.assertTrue(approved.approved_venue_pair)
+
+    def test_transport_substitution_fails_before_fetch(self) -> None:
+        approved = CrossExchangeConsensusProvider(
+            (KrakenPublicProvider(), CoinbaseExchangePublicProvider()),
+            policy(),
+        )
+
+        with patch("crypto_agent.providers.kraken.urlopen", new=lambda *_a, **_k: None):
+            self.assertFalse(approved.approved_venue_pair)
+            with self.assertRaises(ProviderError) as raised:
+                approved.fetch_batch(
+                    symbol="BTC/USD",
+                    interval_minutes=1440,
+                    as_of=AS_OF,
+                    limit=CONSENSUS_WINDOW_SIZE,
+                )
+
         self.assertEqual(
-            configurations[coinbase.source_id]["origin"],
-            "https://api.exchange.coinbase.com",
+            raised.exception.code,
+            "CONSENSUS_CONFIGURATION_TAMPERED",
         )
-        self.assertTrue(
-            all(item["sealed"] is True for item in configurations.values())
+
+    def test_transport_dependency_substitution_fails_before_fetch(self) -> None:
+        approved = CrossExchangeConsensusProvider(
+            (KrakenPublicProvider(), CoinbaseExchangePublicProvider()),
+            policy(),
+        )
+
+        with patch(
+            "crypto_agent.providers.kraken.build_opener",
+            new=lambda *_args, **_kwargs: None,
+        ):
+            self.assertFalse(approved.approved_venue_pair)
+            with self.assertRaises(ProviderError) as raised:
+                approved.fetch_batch(
+                    symbol="BTC/USD",
+                    interval_minutes=1440,
+                    as_of=AS_OF,
+                    limit=CONSENSUS_WINDOW_SIZE,
+                )
+
+        self.assertEqual(
+            raised.exception.code,
+            "CONSENSUS_CONFIGURATION_TAMPERED",
+        )
+
+    def test_stdlib_opener_method_substitution_fails_before_fetch(self) -> None:
+        approved = CrossExchangeConsensusProvider(
+            (KrakenPublicProvider(), CoinbaseExchangePublicProvider()),
+            policy(),
+        )
+
+        with patch(
+            "urllib.request.OpenerDirector.open",
+            new=lambda *_args, **_kwargs: None,
+        ):
+            self.assertFalse(approved.approved_venue_pair)
+            with self.assertRaises(ProviderError) as raised:
+                approved.fetch_batch(
+                    symbol="BTC/USD",
+                    interval_minutes=1440,
+                    as_of=AS_OF,
+                    limit=CONSENSUS_WINDOW_SIZE,
+                )
+
+        self.assertEqual(
+            raised.exception.code,
+            "CONSENSUS_CONFIGURATION_TAMPERED",
         )
 
     def test_consensus_policy_must_match_orchestrator_policy(self) -> None:
@@ -546,10 +828,8 @@ class ConsensusProviderTests(unittest.TestCase):
         self.assertEqual(context.exception.code, "CROSS_SOURCE_DIVERGENCE")
 
     def test_failed_divergence_retains_raw_evidence_and_measurements(self) -> None:
-        kraken = KrakenPublicProvider()
-        coinbase = CoinbaseExchangePublicProvider()
-        kraken_fixture = StaticProvider(kraken.source_id)
-        coinbase_fixture = StaticProvider(coinbase.source_id)
+        kraken_fixture = StaticProvider(KrakenPublicProvider.source_id)
+        coinbase_fixture = StaticProvider(CoinbaseExchangePublicProvider.source_id)
         latest = coinbase_fixture.candles[-1]
         coinbase_fixture.candles[-1] = replace(
             latest,
@@ -558,9 +838,11 @@ class ConsensusProviderTests(unittest.TestCase):
             low=latest.low * 1.02,
             close=latest.close * 1.02,
         )
-        kraken.fetch_candles = kraken_fixture.fetch_candles  # type: ignore[method-assign]
-        coinbase.fetch_candles = coinbase_fixture.fetch_candles  # type: ignore[method-assign]
-        consensus = CrossExchangeConsensusProvider((kraken, coinbase), policy())
+        consensus = CrossExchangeConsensusProvider(
+            (kraken_fixture, coinbase_fixture),
+            policy(),
+            allow_unapproved_for_testing=True,
+        )
 
         with TemporaryDirectory() as directory:
             repository = ReportRepository(f"{directory}/reports.db")
@@ -576,7 +858,7 @@ class ConsensusProviderTests(unittest.TestCase):
         self.assertEqual(len(snapshot or []), 240)
         self.assertEqual(
             {item["id"] for item in report.sources},
-            {kraken.source_id, coinbase.source_id},
+            {KrakenPublicProvider.source_id, CoinbaseExchangePublicProvider.source_id},
         )
         diagnostics = report.metadata["provider_diagnostics"]
         self.assertEqual(diagnostics["consensus_failure_code"], "CROSS_SOURCE_DIVERGENCE")
@@ -597,13 +879,14 @@ class ConsensusProviderTests(unittest.TestCase):
                 )
                 return replace(batch, candles=tuple(candles))
 
-        kraken = KrakenPublicProvider()
-        coinbase = CoinbaseExchangePublicProvider()
-        kraken_fixture = StaticProvider(kraken.source_id)
-        coinbase_fixture = StaticProvider(coinbase.source_id, price_multiplier=1.0005)
-        kraken.fetch_candles = kraken_fixture.fetch_candles  # type: ignore[method-assign]
-        coinbase.fetch_candles = coinbase_fixture.fetch_candles  # type: ignore[method-assign]
-        forged = ForgedConsensus((kraken, coinbase), policy())
+        forged = ForgedConsensus(
+            (
+                StaticProvider("venue_a"),
+                StaticProvider("venue_b", price_multiplier=1.0005),
+            ),
+            policy(),
+            allow_unapproved_for_testing=True,
+        )
 
         report = ResearchOrchestrator(provider=forged, policy=policy()).analyze(
             symbol="BTC/USD",
@@ -680,19 +963,19 @@ class ConsensusProviderTests(unittest.TestCase):
         self.assertEqual(context.exception.code, "CROSS_SOURCE_VOLUME_DIVERGENCE")
 
     def test_single_source_historical_volume_corruption_cannot_emit_alert(self) -> None:
-        kraken = KrakenPublicProvider()
-        coinbase = CoinbaseExchangePublicProvider()
-        kraken_fixture = StaticProvider(kraken.source_id)
+        kraken_fixture = StaticProvider(KrakenPublicProvider.source_id)
         coinbase_fixture = StaticProvider(
-            coinbase.source_id,
+            CoinbaseExchangePublicProvider.source_id,
             price_multiplier=1.0005,
         )
         for index in range(-30, -5):
             candle = coinbase_fixture.candles[index]
             coinbase_fixture.candles[index] = replace(candle, volume=100_000.0)
-        kraken.fetch_candles = kraken_fixture.fetch_candles  # type: ignore[method-assign]
-        coinbase.fetch_candles = coinbase_fixture.fetch_candles  # type: ignore[method-assign]
-        consensus = CrossExchangeConsensusProvider((kraken, coinbase), policy())
+        consensus = CrossExchangeConsensusProvider(
+            (kraken_fixture, coinbase_fixture),
+            policy(),
+            allow_unapproved_for_testing=True,
+        )
 
         report = ResearchOrchestrator(provider=consensus, policy=policy()).analyze(
             symbol="BTC/USD",

@@ -13,9 +13,9 @@
 6. Każde naruszenie niezmiennego zakazu oznacza niezaliczenie release gate.
 7. Zmiana wpływająca na decyzje unieważnia wcześniejszy certyfikat odpowiedniego zakresu testów.
 
-### Stan dowodu checkpointu 0.1.2-v1.1
+### Stan dowodu checkpointu 0.1.3-v1.1
 
-Lokalna suite ma **155/155 testów standard-library** i przechodzi wraz
+Lokalna suite ma **213/213 testów standard-library** i przechodzi wraz
 z `compileall` całego `src` i `tests`. Obejmuje między innymi:
 
 - fail-closed adaptery Kraken/Coinbase, pinned HTTPS hosts i odmowę redirectów;
@@ -32,10 +32,19 @@ z `compileall` całego `src` i `tests`. Obejmuje między innymi:
   diagnostykę i oddzielenie normalized volume od `candles.base_volume`;
 - deterministyczny replay przy odczycie z kontrolą okresu ważności polityki,
   kompletności `2 × 120` i całego łańcucha hashy manifestu;
-- złote przypadki parytetu wyniku runtime i trwałego recompute.
+- złote przypadki parytetu wyniku runtime i trwałego recompute;
+- odporność attestation na shadowing, podmianę metod/`__code__`, fałszywe podklasy
+  konfiguracji oraz mutację lokalnego łańcucha transportu;
+- osobną cenę 2×1m: 300 s inclusive/+1 µs reject, 50 pb inclusive/epsilon reject,
+  zły symbol, źródło, venue, minuta, lineage, claimed values i receipt replay;
+- dokładny archived schema-r1 hash i zakaz nowych zapisów pod legacy policy;
+- PostgreSQL health: PG12, brak relacji/funkcji/triggera, disabled trigger, pusty lub
+  podmieniony manifest migracji oraz brak semantycznych seedów;
+- narrator PL/EN: znane polecenia i pośrednie sugestie, Unicode Cf, Markdown,
+  interpunkcja oraz end-to-end przypadek, w którym model błędnie deklaruje safe output.
 
 Nie jest to jeszcze raport akceptacyjny. W środowisku checkpointu nie było Dockera,
-`psql`, serwera PostgreSQL ani `psycopg`, więc migracja i constrainty były sprawdzane
+`psql`, serwera PostgreSQL ani `psycopg`, więc migracje i constrainty były sprawdzane
 statycznie oraz na fakes, nie na prawdziwym PostgreSQL. Nie wykonano live API contract
 tests, operacyjnego external ingestu z raw payload/quarantine/seeds/schedulerem,
 testów order booka ani 4–8 tygodni forward observation. Dlatego Gate V1 pozostaje
@@ -217,7 +226,7 @@ Raportowanie samego zysku, accuracy albo Sharpe bez tych metryk jest nieważne.
 
 ### Gate V1 — research read-only
 
-**Bieżący wynik checkpointu 0.1.2-v1.1: NIEZALICZONY.**
+**Bieżący wynik checkpointu 0.1.3-v1.1: NIEZALICZONY.**
 
 Wymagania:
 

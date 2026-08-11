@@ -51,6 +51,10 @@ class CliTests(unittest.TestCase):
         self.assertIn("db/schema.sql:/docker-entrypoint-initdb.d", compose)
         self.assertNotIn("0011_canonical_candle_provenance.sql:/docker-entrypoint", compose)
 
+        cli_source = Path("src/crypto_agent/cli.py").read_text(encoding="utf-8")
+        self.assertIn('"missing_seeds": list(health.missing_seeds)', cli_source)
+        self.assertIn('"missing_triggers": list(health.missing_triggers)', cli_source)
+
 
 if __name__ == "__main__":
     unittest.main()

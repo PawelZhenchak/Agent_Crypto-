@@ -102,8 +102,15 @@ def _run_database_command(action: str, migration_directory: str | None) -> int:
                 "database_reachable": health.database_reachable,
                 "base_schema_ready": health.base_schema_ready,
                 "migrations_current": health.migrations_current,
+                "schema_ready": health.schema_ready,
+                "triggers_ready": health.triggers_ready,
+                "seeds_ready": health.seeds_ready,
                 "server_version": health.server_version,
                 "missing_migrations": list(health.missing_migrations),
+                "unexpected_migrations": list(health.unexpected_migrations),
+                "missing_schema_objects": list(health.missing_schema_objects),
+                "missing_triggers": list(health.missing_triggers),
+                "missing_seeds": list(health.missing_seeds),
             }
             exit_code = 0 if health.healthy else 1
     except (PostgresError, ValueError) as exc:

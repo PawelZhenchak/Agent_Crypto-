@@ -35,6 +35,8 @@ class ApiV11Tests(unittest.TestCase):
         self.assertIn("_build_and_analyze_with_deadline", source)
         self.assertNotIn("orchestrator = build_orchestrator(provider)\n", source)
         self.assertIn("check_postgres_health", source)
+        self.assertIn('"missing_seeds": list(database.missing_seeds)', source)
+        self.assertIn('"missing_triggers": list(database.missing_triggers)', source)
         self.assertIn("MIGRATIONS_PENDING", Path("src/crypto_agent/postgres.py").read_text())
 
 if __name__ == "__main__":

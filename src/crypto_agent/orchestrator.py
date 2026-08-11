@@ -15,6 +15,8 @@ from .domain import (
     DataQualityReport,
     Decision,
     MarketMetrics,
+    ReferencePriceObservation,
+    ReferencePriceSnapshot,
     ResearchReport,
     RiskAssessment,
 )
@@ -22,6 +24,7 @@ from .policy import RiskGate, RiskPolicy
 from .providers.base import CandleProvider, ProviderBatch, ProviderError, fetch_provider_batch
 from .providers.consensus import CrossExchangeConsensusProvider
 from .quality import assess_data_quality, deduplicate_exact_candles
+from .reference_price import REFERENCE_PRICE_ALGORITHM_VERSION
 from .signals import VOLUME_ALERT_ZSCORE, propose_research_alert
 from .storage import ReportRepository
 
@@ -102,6 +105,7 @@ class ResearchOrchestrator:
                             **exc.evidence.metadata,
                             "consensus_failure_code": exc.code,
                         },
+                        reference_price=exc.evidence.reference_price,
                     )
                 quality = _failure_quality(exc.code)
                 analysis_time = as_of or datetime.now(timezone.utc)
@@ -121,7 +125,11 @@ class ResearchOrchestrator:
         input_candles = (
             list(provider_batch.input_candles) if provider_batch is not None else candles
         )
-        snapshot = _canonical_input(input_candles)
+        reference_price = (
+            provider_batch.reference_price if provider_batch is not None else None
+        )
+        candle_snapshot = _canonical_input(input_candles)
+        snapshot = _canonical_evidence(candle_snapshot, reference_price)
         input_fingerprint = _input_fingerprint(snapshot)
         metrics_allowed = quality.passed and quality.score >= self.policy.min_data_quality
         analytics_candles = deduplicate_exact_candles(candles) if metrics_allowed else []
@@ -147,6 +155,7 @@ class ResearchOrchestrator:
             interval_minutes=interval_minutes,
             quality=quality,
             metrics=metrics,
+            reference_price=reference_price,
             as_of=analysis_time,
             expires_at=expires_at,
             input_fingerprint_sha256=input_fingerprint,
@@ -207,6 +216,8 @@ class ResearchOrchestrator:
                 "analysis_candle_count": len(candles),
                 "input_first_available_at": _timestamp_bound(input_candles, minimum=True),
                 "input_last_available_at": _timestamp_bound(input_candles, minimum=False),
+                "reference_price_present": reference_price is not None,
+                "reference_price_evidence": _canonical_reference_price(reference_price),
                 "provider_error": provider_error,
                 "provider_error_code": provider_error_code,
                 "provider_diagnostics": (
@@ -292,6 +303,49 @@ def _canonical_input(candles: list[Candle]) -> list[dict[str, object]]:
     ]
 
 
+def _canonical_evidence(
+    candle_snapshot: list[dict[str, object]],
+    reference_price: ReferencePriceSnapshot | None,
+) -> list[dict[str, object]]:
+    reference = _canonical_reference_price(reference_price)
+    if reference is None:
+        return candle_snapshot
+    return [
+        *candle_snapshot,
+        {
+            "record_type": "reference_price_snapshot",
+            **reference,
+        },
+    ]
+
+
+def _canonical_reference_price(
+    snapshot: ReferencePriceSnapshot | None,
+) -> dict[str, object] | None:
+    if not isinstance(snapshot, ReferencePriceSnapshot):
+        return None
+    return {
+        "symbol": snapshot.symbol,
+        "observations": [
+            {
+                "symbol": item.symbol,
+                "price": _safe_number(item.price),
+                "event_time": _safe_timestamp(item.event_time),
+                "available_at": _safe_timestamp(item.available_at),
+                "ingested_at": _safe_timestamp(item.ingested_at),
+                "source": item.source,
+            }
+            for item in sorted(
+                snapshot.observations,
+                key=lambda observation: (
+                    str(observation.source),
+                    _safe_timestamp(observation.event_time),
+                ),
+            )
+        ],
+    }
+
+
 def _consensus_attested(
     *,
     provider: CandleProvider,
@@ -313,6 +367,8 @@ def _consensus_attested(
         source_counts = batch.metadata.get("consensus_source_counts")
         overlap = batch.metadata.get("consensus_overlap_count")
         window_size = batch.metadata.get("consensus_window_size")
+        reference_price = batch.reference_price
+        reference_source_ids = batch.metadata.get("reference_price_source_ids")
 
         if not (
             provider.approved_venue_pair is True
@@ -340,6 +396,22 @@ def _consensus_attested(
                 and source_counts[source_id] >= CONSENSUS_WINDOW_SIZE
                 for source_id in sealed_source_ids
             )
+            and type(reference_price) is ReferencePriceSnapshot
+            and type(reference_price.observations) is tuple
+            and len(reference_price.observations) == required_sources
+            and all(
+                type(item) is ReferencePriceObservation
+                for item in reference_price.observations
+            )
+            and tuple(
+                item.source for item in reference_price.observations
+            )
+            == sealed_source_ids
+            and batch.metadata.get("reference_price_present") is True
+            and batch.metadata.get("reference_price_version")
+            == REFERENCE_PRICE_ALGORITHM_VERSION
+            and isinstance(reference_source_ids, list)
+            and tuple(reference_source_ids) == tuple(sorted(sealed_source_ids))
         ):
             return False
 
@@ -370,6 +442,14 @@ def _consensus_attested(
             return False
 
         expected_scope = next(iter(canonical_scopes))
+        if (
+            reference_price.symbol != expected_scope[0]
+            or any(
+                item.symbol != expected_scope[0]
+                for item in reference_price.observations
+            )
+        ):
+            return False
         raw_by_source: dict[str, list[Candle]] = {
             source_id: [] for source_id in sealed_source_ids
         }

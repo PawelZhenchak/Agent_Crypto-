@@ -16,18 +16,26 @@ from crypto_agent.consensus_math import (
 )
 from crypto_agent.domain import Candle
 from crypto_agent.ingest import (
+    LEGACY_R1_POLICY_HASH,
     NORMALIZED_VOLUME_UNIT,
     SUPPORTED_CANONICAL_ALGORITHM,
     CanonicalCandleDraft,
     IngestValidationError,
     PersistenceInvariantError,
     PointInTimeCandleRepository,
+    ReferencePriceDraft,
     source_candle_content_hash,
 )
 from crypto_agent.postgres import PostgresOperationError, PostgresUnavailableError
 from crypto_agent.providers.consensus import CrossExchangeConsensusProvider
 from crypto_agent.providers.coinbase import CoinbaseExchangePublicProvider
 from crypto_agent.providers.kraken import KrakenPublicProvider
+from crypto_agent.reference_price import (
+    REFERENCE_PRICE_ALGORITHM_VERSION,
+    ReferencePriceInput,
+    ReferencePriceMathError,
+    build_reference_price_snapshot,
+)
 
 from tests.db_fakes import FakeConnection, SQLStep
 from tests.helpers import policy
@@ -50,6 +58,15 @@ SOURCE_AVAILABLE_AT = SOURCE_CLOSE_TIME + timedelta(minutes=1)
 SOURCE_PROVIDER_INGESTED_AT = SOURCE_CLOSE_TIME + timedelta(minutes=2)
 RISK_POLICY = policy()
 POLICY_HASH = RISK_POLICY.fingerprint()
+LEGACY_POLICY_DOCUMENT = asdict(RISK_POLICY)
+LEGACY_POLICY_DOCUMENT["policy_id"] = "v1-read-only-2026-08-10"
+for _legacy_only_field in (
+    "policy_schema_version",
+    "max_reference_price_age_seconds",
+    "max_reference_price_deviation_from_median_bps",
+):
+    LEGACY_POLICY_DOCUMENT.pop(_legacy_only_field)
+LEGACY_POLICY = ingest_module._risk_policy_from_document(LEGACY_POLICY_DOCUMENT)
 KRAKEN_SOURCE_IDS = tuple(range(1, CONSENSUS_WINDOW_SIZE + 1))
 COINBASE_SOURCE_IDS = tuple(range(1_001, 1_001 + CONSENSUS_WINDOW_SIZE))
 CANONICAL_CONTEXT_IDS = (*KRAKEN_SOURCE_IDS, *COINBASE_SOURCE_IDS)
@@ -57,6 +74,14 @@ CANONICAL_OBSERVATION_IDS = (
     KRAKEN_SOURCE_IDS[-1],
     COINBASE_SOURCE_IDS[-1],
 )
+REFERENCE_EVENT_TIME = CLOSE_TIME + timedelta(minutes=2)
+REFERENCE_OPEN_TIME = REFERENCE_EVENT_TIME - timedelta(minutes=1)
+REFERENCE_AVAILABLE_AT = REFERENCE_EVENT_TIME + timedelta(seconds=30)
+REFERENCE_PROVIDER_INGESTED_AT = REFERENCE_EVENT_TIME + timedelta(minutes=1)
+REFERENCE_CUTOFF = REFERENCE_EVENT_TIME + timedelta(seconds=15)
+REFERENCE_EVALUATED_AT = REFERENCE_EVENT_TIME + timedelta(minutes=5)
+REFERENCE_CAPTURED_AT = REFERENCE_EVALUATED_AT + timedelta(minutes=1)
+REFERENCE_SOURCE_IDS = (21, 22)
 
 
 def source_candle(
@@ -93,6 +118,7 @@ def series_row(
     effective_to: datetime | None = None,
     registry_available_at: datetime = REGISTRY_AVAILABLE_AT,
     registry_ingested_at: datetime = REGISTRY_INGESTED_AT,
+    persisted_policy_document: dict[str, object] | None = None,
 ) -> tuple[object, ...]:
     return (
         5,
@@ -107,7 +133,11 @@ def series_row(
         1,
         2,
         "spot",
-        asdict(selected_policy),
+        (
+            asdict(selected_policy)
+            if persisted_policy_document is None
+            else persisted_policy_document
+        ),
         effective_from,
         effective_to,
         registry_available_at,
@@ -144,7 +174,7 @@ def canonical_series_model(
         policy_parameters=ConsensusPolicyParameters(
             min_overlap=CONSENSUS_WINDOW_SIZE,
             max_close_divergence_bps=(
-                selected_policy.max_cross_source_divergence_bps
+                selected_policy.max_pairwise_reference_price_divergence_bps
             ),
             max_ohlc_divergence_bps=(
                 selected_policy.max_cross_source_ohlc_divergence_bps
@@ -304,9 +334,10 @@ def provenance_insert_steps(
 def stored_canonical_row(
     *,
     normalized_volume_override: Decimal | None = None,
+    selected_policy=RISK_POLICY,
 ) -> tuple[object, ...]:
-    series = canonical_series_model()
-    draft = canonical_draft()
+    series = canonical_series_model(selected_policy=selected_policy)
+    draft = canonical_draft(policy_hash=selected_policy.fingerprint())
     raw_rows = tuple(ingest_module._raw_row(row) for row in independent_raw_rows())
     computed = ingest_module._recompute_canonical(draft, series, raw_rows)
     manifest_computed = (
@@ -358,7 +389,7 @@ def stored_canonical_row(
         5,
         77,
         SUPPORTED_CANONICAL_ALGORITHM,
-        POLICY_HASH,
+        selected_policy.fingerprint(),
         manifest_computed.normalized_volume,
         NORMALIZED_VOLUME_UNIT,
         evidence_hash,
@@ -403,7 +434,443 @@ def canonical_persist_steps(
     ]
 
 
+def reference_scope_row() -> tuple[object, ...]:
+    return (
+        900,
+        77,
+        "BTC/USD",
+        POLICY_HASH,
+        9000,
+        1,
+        2,
+        "spot",
+        asdict(RISK_POLICY),
+        POLICY_EFFECTIVE_FROM,
+        None,
+        REGISTRY_AVAILABLE_AT,
+        REGISTRY_INGESTED_AT,
+    )
+
+
+def reference_raw_row(
+    candle_id: int,
+    source_id: int,
+    *,
+    price: Decimal,
+    open_time: datetime = REFERENCE_OPEN_TIME,
+    close_time: datetime = REFERENCE_EVENT_TIME,
+    provider_ingested_at: datetime = REFERENCE_PROVIDER_INGESTED_AT,
+) -> dict[str, object]:
+    is_kraken = source_id == 1
+    row: dict[str, object] = {
+        "candle_id": candle_id,
+        "market_id": 101 if is_kraken else 202,
+        "interval_seconds": 60,
+        "open_time": open_time,
+        "close_time": close_time,
+        "open_price": price,
+        "high_price": price,
+        "low_price": price,
+        "close_price": price,
+        "base_volume": Decimal("10"),
+        "trade_count": None,
+        "source_id": source_id,
+        "source_record_key": f"reference:{source_id}:{open_time.isoformat()}",
+        "source_version": "v1",
+        "revision_no": 1,
+        "content_hash": "0" * 64,
+        "observed_at": close_time,
+        "available_at": REFERENCE_AVAILABLE_AT,
+        "ingested_at": REFERENCE_CAPTURED_AT - timedelta(seconds=30),
+        "is_final": True,
+        "exchange_id": 1001 if is_kraken else 2002,
+        "exchange_key": "kraken" if is_kraken else "coinbase",
+        "base_asset_id": 1,
+        "quote_asset_id": 2,
+        "instrument_type": "spot",
+        "source_key": (
+            KrakenPublicProvider.source_id
+            if is_kraken
+            else CoinbaseExchangePublicProvider.source_id
+        ),
+        "canonical_symbol": "BTC/USD",
+        "venue_symbol": "XBTUSD" if is_kraken else "BTC-USD",
+        "source_candle_receipt_id": 210 if is_kraken else 220,
+        "provider_ingested_at": provider_ingested_at,
+    }
+    row["content_hash"] = ingest_module._raw_source_candle_content_hash(
+        ingest_module._raw_row(row)
+    )
+    return row
+
+
+def reference_raw_rows() -> list[dict[str, object]]:
+    return [
+        reference_raw_row(21, 1, price=Decimal("99.5")),
+        reference_raw_row(22, 2, price=Decimal("100.5")),
+    ]
+
+
+def reference_draft() -> ReferencePriceDraft:
+    return ReferencePriceDraft(
+        canonical_market_id=900,
+        risk_policy_id=77,
+        symbol="BTC/USD",
+        event_time=REFERENCE_EVENT_TIME,
+        median_price=Decimal("100"),
+        pairwise_divergence_bps=Decimal("100"),
+        max_deviation_from_median_bps=Decimal("50"),
+        algorithm_version=REFERENCE_PRICE_ALGORITHM_VERSION,
+        policy_hash=POLICY_HASH,
+        source_candle_ids=REFERENCE_SOURCE_IDS,
+    )
+
+
+def reference_persist_steps() -> list[SQLStep]:
+    return [
+        SQLStep("FROM crypto_agent.markets market", [reference_scope_row()]),
+        SQLStep("pg_advisory_xact_lock"),
+        SQLStep("FROM crypto_agent.reference_price_manifests", []),
+        SQLStep("WITH eligible_revisions AS", reference_raw_rows()),
+        SQLStep("INSERT INTO crypto_agent.reference_price_manifests", [(901,)]),
+        SQLStep("FROM crypto_agent.reference_price_provenance", []),
+        SQLStep("INSERT INTO crypto_agent.reference_price_provenance"),
+        SQLStep("INSERT INTO crypto_agent.reference_price_provenance"),
+        SQLStep(
+            "FROM crypto_agent.reference_price_provenance",
+            [(21, 210), (22, 220)],
+        ),
+    ]
+
+
 class IngestV11Tests(unittest.TestCase):
+    def test_reference_price_persists_db_derived_two_venue_boundary(self) -> None:
+        connection = FakeConnection(reference_persist_steps())
+        persisted = PointInTimeCandleRepository(
+            lambda: connection,
+            clock=lambda: REFERENCE_CAPTURED_AT,
+        ).append_reference_price(
+            reference_draft(),
+            cutoff_as_of=REFERENCE_CUTOFF,
+            evaluated_at=REFERENCE_EVALUATED_AT,
+        )
+
+        self.assertEqual(persisted.reference_price_id, 901)
+        self.assertTrue(persisted.inserted)
+        raw_query, raw_params = next(
+            (query, params)
+            for query, params in connection.scripted_cursor.executions
+            if "WITH eligible_revisions AS" in query
+        )
+        self.assertIn("candle.interval_seconds = 60", raw_query)
+        self.assertIn("candle.open_time = %s", raw_query)
+        self.assertEqual(
+            raw_params[:3],
+            (
+                REFERENCE_EVALUATED_AT,
+                REFERENCE_EVALUATED_AT,
+                REFERENCE_CAPTURED_AT,
+            ),
+        )
+        # Provider receipt/eligibility may follow the requested selection
+        # cutoff, but never the later evaluation boundary.
+        self.assertGreater(REFERENCE_PROVIDER_INGESTED_AT, REFERENCE_CUTOFF)
+        manifest_params = next(
+            params
+            for query, params in connection.scripted_cursor.executions
+            if "INSERT INTO crypto_agent.reference_price_manifests" in query
+        )
+        self.assertEqual(manifest_params[6], REFERENCE_EVENT_TIME)
+        self.assertEqual(manifest_params[7], REFERENCE_CUTOFF)
+        self.assertEqual(manifest_params[8], REFERENCE_EVALUATED_AT)
+        self.assertEqual(manifest_params[9:12], (
+            Decimal("100"),
+            Decimal("100"),
+            Decimal("50"),
+        ))
+        self.assertEqual(manifest_params[14], REFERENCE_AVAILABLE_AT)
+        self.assertEqual(manifest_params[15], REFERENCE_CAPTURED_AT)
+        self.assertRegex(manifest_params[12], r"^[0-9a-f]{64}$")
+        self.assertRegex(manifest_params[13], r"^[0-9a-f]{64}$")
+        self.assertRegex(manifest_params[16], r"^[0-9a-f]{64}$")
+
+    def test_reference_price_retry_keeps_original_capture_time(self) -> None:
+        first_connection = FakeConnection(reference_persist_steps())
+        first = PointInTimeCandleRepository(
+            lambda: first_connection,
+            clock=lambda: REFERENCE_CAPTURED_AT,
+        ).append_reference_price(
+            reference_draft(),
+            cutoff_as_of=REFERENCE_CUTOFF,
+            evaluated_at=REFERENCE_EVALUATED_AT,
+        )
+        manifest_params = next(
+            params
+            for query, params in first_connection.scripted_cursor.executions
+            if "INSERT INTO crypto_agent.reference_price_manifests" in query
+        )
+        existing_row = (901, *manifest_params[1:])
+        later_capture = REFERENCE_CAPTURED_AT + timedelta(minutes=2)
+        retry_connection = FakeConnection(
+            [
+                SQLStep("FROM crypto_agent.markets market", [reference_scope_row()]),
+                SQLStep("pg_advisory_xact_lock"),
+                SQLStep(
+                    "FROM crypto_agent.reference_price_manifests",
+                    [existing_row],
+                ),
+                SQLStep("WITH eligible_revisions AS", reference_raw_rows()),
+                SQLStep(
+                    "FROM crypto_agent.reference_price_provenance",
+                    [(21, 210), (22, 220)],
+                ),
+            ]
+        )
+        retried = PointInTimeCandleRepository(
+            lambda: retry_connection,
+            clock=lambda: later_capture,
+        ).append_reference_price(
+            reference_draft(),
+            cutoff_as_of=REFERENCE_CUTOFF,
+            evaluated_at=REFERENCE_EVALUATED_AT,
+        )
+        self.assertFalse(retried.inserted)
+        self.assertEqual(retried.reference_price_id, first.reference_price_id)
+        self.assertEqual(retried.content_hash, first.content_hash)
+        retry_raw_params = next(
+            params
+            for query, params in retry_connection.scripted_cursor.executions
+            if "WITH eligible_revisions AS" in query
+        )
+        self.assertEqual(retry_raw_params[2], REFERENCE_CAPTURED_AT)
+        self.assertNotEqual(retry_raw_params[2], later_capture)
+
+    def test_reference_price_load_replays_pinned_candles_receipts_and_hashes(self) -> None:
+        append_connection = FakeConnection(reference_persist_steps())
+        persisted = PointInTimeCandleRepository(
+            lambda: append_connection,
+            clock=lambda: REFERENCE_CAPTURED_AT,
+        ).append_reference_price(
+            reference_draft(),
+            cutoff_as_of=REFERENCE_CUTOFF,
+            evaluated_at=REFERENCE_EVALUATED_AT,
+        )
+        manifest_params = next(
+            params
+            for query, params in append_connection.scripted_cursor.executions
+            if "INSERT INTO crypto_agent.reference_price_manifests" in query
+        )
+        manifest_row = (persisted.reference_price_id, *manifest_params)
+        load_connection = FakeConnection(
+            [
+                SQLStep(
+                    "FROM crypto_agent.reference_price_manifests",
+                    [manifest_row],
+                ),
+                SQLStep("FROM crypto_agent.markets market", [reference_scope_row()]),
+                SQLStep("WITH eligible_revisions AS", reference_raw_rows()),
+                SQLStep(
+                    "FROM crypto_agent.reference_price_provenance provenance",
+                    reference_raw_rows(),
+                ),
+            ]
+        )
+        record = PointInTimeCandleRepository(
+            lambda: load_connection
+        ).load_reference_price(
+            reference_price_id=persisted.reference_price_id,
+            as_of=REFERENCE_CAPTURED_AT + timedelta(minutes=1),
+        )
+        self.assertEqual(record.content_hash, persisted.content_hash)
+        self.assertEqual(record.source_candle_ids, REFERENCE_SOURCE_IDS)
+        self.assertEqual(record.source_candle_receipt_ids, (210, 220))
+        provenance_query, provenance_params = load_connection.scripted_cursor.executions[3]
+        self.assertIn(
+            "receipt.source_candle_receipt_id = provenance.source_candle_receipt_id",
+            provenance_query,
+        )
+        self.assertEqual(
+            provenance_params[:3],
+            (
+                REFERENCE_EVALUATED_AT,
+                REFERENCE_EVALUATED_AT,
+                REFERENCE_CAPTURED_AT,
+            ),
+        )
+
+    def test_reference_price_rejects_claimed_value_and_staleness(self) -> None:
+        claimed = replace(reference_draft(), median_price=Decimal("101"))
+        claimed_connection = FakeConnection(
+            [
+                SQLStep("FROM crypto_agent.markets market", [reference_scope_row()]),
+                SQLStep("pg_advisory_xact_lock"),
+                SQLStep("FROM crypto_agent.reference_price_manifests", []),
+                SQLStep("WITH eligible_revisions AS", reference_raw_rows()),
+            ]
+        )
+        with self.assertRaisesRegex(IngestValidationError, "VALUE_MISMATCH"):
+            PointInTimeCandleRepository(
+                lambda: claimed_connection,
+                clock=lambda: REFERENCE_CAPTURED_AT,
+            ).append_reference_price(
+                claimed,
+                cutoff_as_of=REFERENCE_CUTOFF,
+                evaluated_at=REFERENCE_EVALUATED_AT,
+            )
+
+        stale_at = REFERENCE_EVALUATED_AT + timedelta(microseconds=1)
+        stale_connection = FakeConnection(
+            [
+                SQLStep("FROM crypto_agent.markets market", [reference_scope_row()]),
+                SQLStep("pg_advisory_xact_lock"),
+                SQLStep("FROM crypto_agent.reference_price_manifests", []),
+                SQLStep("WITH eligible_revisions AS", reference_raw_rows()),
+            ]
+        )
+        with self.assertRaisesRegex(IngestValidationError, "REFERENCE_PRICE_STALE"):
+            PointInTimeCandleRepository(
+                lambda: stale_connection,
+                clock=lambda: REFERENCE_CAPTURED_AT,
+            ).append_reference_price(
+                reference_draft(),
+                cutoff_as_of=REFERENCE_CUTOFF,
+                evaluated_at=stale_at,
+            )
+
+    def test_reference_price_builder_rejects_shifted_one_minute_window(self) -> None:
+        shifted_open = REFERENCE_OPEN_TIME + timedelta(seconds=27)
+        inputs = (
+            ReferencePriceInput(
+                source_id=KrakenPublicProvider.source_id,
+                venue_id="kraken",
+                symbol="BTC/USD",
+                open_time=shifted_open,
+                close_time=shifted_open + timedelta(minutes=1),
+                price=Decimal("99.5"),
+                available_at=REFERENCE_AVAILABLE_AT + timedelta(seconds=27),
+                ingested_at=REFERENCE_PROVIDER_INGESTED_AT + timedelta(seconds=27),
+            ),
+            ReferencePriceInput(
+                source_id=CoinbaseExchangePublicProvider.source_id,
+                venue_id="coinbase",
+                symbol="BTC/USD",
+                open_time=shifted_open,
+                close_time=shifted_open + timedelta(minutes=1),
+                price=Decimal("100.5"),
+                available_at=REFERENCE_AVAILABLE_AT + timedelta(seconds=27),
+                ingested_at=REFERENCE_PROVIDER_INGESTED_AT + timedelta(seconds=27),
+            ),
+        )
+        with self.assertRaisesRegex(
+            ReferencePriceMathError,
+            "UTC-aligned closed minute",
+        ):
+            build_reference_price_snapshot(
+                inputs,
+                cutoff_as_of=REFERENCE_CUTOFF + timedelta(minutes=1),
+                evaluated_at=REFERENCE_EVALUATED_AT,
+                max_age_seconds=300,
+                max_deviation_from_median_bps=50,
+                max_market_price=RISK_POLICY.max_market_price,
+                approved_source_venues=ingest_module.APPROVED_SOURCE_VENUES,
+            )
+
+    def test_reference_price_bps_are_versioned_to_twelve_decimal_places(self) -> None:
+        inputs = (
+            ReferencePriceInput(
+                source_id=KrakenPublicProvider.source_id,
+                venue_id="kraken",
+                symbol="BTC/USD",
+                open_time=REFERENCE_OPEN_TIME,
+                close_time=REFERENCE_EVENT_TIME,
+                price=Decimal("10000"),
+                available_at=REFERENCE_EVENT_TIME,
+                ingested_at=REFERENCE_EVENT_TIME,
+            ),
+            ReferencePriceInput(
+                source_id=CoinbaseExchangePublicProvider.source_id,
+                venue_id="coinbase",
+                symbol="BTC/USD",
+                open_time=REFERENCE_OPEN_TIME,
+                close_time=REFERENCE_EVENT_TIME,
+                price=Decimal("10003"),
+                available_at=REFERENCE_EVENT_TIME,
+                ingested_at=REFERENCE_EVENT_TIME,
+            ),
+        )
+        result = build_reference_price_snapshot(
+            inputs,
+            cutoff_as_of=REFERENCE_EVENT_TIME,
+            evaluated_at=REFERENCE_EVENT_TIME,
+            max_age_seconds=300,
+            max_deviation_from_median_bps=50,
+            max_market_price=RISK_POLICY.max_market_price,
+            approved_source_venues=ingest_module.APPROVED_SOURCE_VENUES,
+        )
+        self.assertEqual(result.pairwise_divergence_bps, Decimal("2.999550067490"))
+        self.assertEqual(
+            result.max_deviation_from_median_bps,
+            Decimal("1.499775033745"),
+        )
+
+    def test_reference_price_draft_rejects_non_decimal_direct_values(self) -> None:
+        with self.assertRaisesRegex(IngestValidationError, "Decimal instances"):
+            ReferencePriceDraft(
+                canonical_market_id=900,
+                risk_policy_id=77,
+                symbol="BTC/USD",
+                event_time=REFERENCE_EVENT_TIME,
+                median_price=100.0,  # type: ignore[arg-type]
+                pairwise_divergence_bps=Decimal("100"),
+                max_deviation_from_median_bps=Decimal("50"),
+                algorithm_version=REFERENCE_PRICE_ALGORITHM_VERSION,
+                policy_hash=POLICY_HASH,
+                source_candle_ids=REFERENCE_SOURCE_IDS,
+            )
+
+    def test_exact_archived_r1_policy_loads_but_cannot_append(self) -> None:
+        self.assertEqual(LEGACY_POLICY.policy_schema_version, 1)
+        self.assertEqual(LEGACY_POLICY.fingerprint(), LEGACY_R1_POLICY_HASH)
+        archived_series = series_row(
+            selected_policy=LEGACY_POLICY,
+            persisted_policy_document=LEGACY_POLICY_DOCUMENT,
+        )
+        connection = FakeConnection(
+            [SQLStep("canonical_candle_series", [archived_series])]
+        )
+        with self.assertRaisesRegex(IngestValidationError, "replay-only"):
+            PointInTimeCandleRepository(
+                lambda: connection,
+                clock=lambda: CAPTURED_AT,
+            ).append_canonical_candle(
+                canonical_draft(policy_hash=LEGACY_R1_POLICY_HASH),
+                as_of=AS_OF,
+            )
+        self.assertTrue(connection.rolled_back)
+
+        replay_connection = FakeConnection(
+            [
+                SQLStep("canonical_candle_series", [archived_series]),
+                SQLStep(
+                    "WITH eligible AS",
+                    [stored_canonical_row(selected_policy=LEGACY_POLICY)],
+                ),
+                SQLStep(
+                    "WHERE provenance.canonical_candle_id = ANY",
+                    stored_provenance_evidence_rows(),
+                ),
+            ]
+        )
+        records = PointInTimeCandleRepository(
+            lambda: replay_connection
+        ).load_canonical_candles(
+            canonical_series_id=5,
+            as_of=QUERY_AS_OF,
+            limit=100,
+        )
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].policy_hash, LEGACY_R1_POLICY_HASH)
+
     def test_source_ingest_requires_explicit_market_binding(self) -> None:
         connection = FakeConnection([SQLStep("market_data_source_bindings", [])])
         repository = PointInTimeCandleRepository(
@@ -726,6 +1193,19 @@ class IngestV11Tests(unittest.TestCase):
             if "FROM crypto_agent.candles candle" in query
         )
         self.assertEqual(raw_params[-3:], (AS_OF, AS_OF, CAPTURED_AT))
+
+    def test_historical_canonical_candle_has_no_reference_price_age_cap(self) -> None:
+        historical_cutoff = CLOSE_TIME + timedelta(hours=12)
+        historical_capture = historical_cutoff + timedelta(minutes=1)
+        connection = FakeConnection(canonical_persist_steps())
+        accepted = PointInTimeCandleRepository(
+            lambda: connection,
+            clock=lambda: historical_capture,
+        ).append_canonical_candle(
+            canonical_draft(),
+            as_of=historical_cutoff,
+        )
+        self.assertTrue(accepted.inserted)
 
     def test_canonical_recomputes_and_rejects_manipulated_price(self) -> None:
         connection = FakeConnection(
@@ -1075,15 +1555,26 @@ class IngestV11Tests(unittest.TestCase):
                 if row["source_id"] == source_id
             ]
 
-        kraken = KrakenPublicProvider()
-        coinbase = CoinbaseExchangePublicProvider()
-        kraken_rows = provider_candles(1, kraken.source_id)
-        coinbase_rows = provider_candles(2, coinbase.source_id)
-        kraken.fetch_candles = lambda **_: list(kraken_rows)  # type: ignore[method-assign]
-        coinbase.fetch_candles = lambda **_: list(coinbase_rows)  # type: ignore[method-assign]
+        class StaticProvider:
+            def __init__(self, source_id: str, candles: list[Candle]) -> None:
+                self.source_id = source_id
+                self.candles = candles
+
+            def fetch_candles(self, **_: object) -> list[Candle]:
+                return list(self.candles)
+
+        kraken = StaticProvider(
+            KrakenPublicProvider.source_id,
+            provider_candles(1, KrakenPublicProvider.source_id),
+        )
+        coinbase = StaticProvider(
+            CoinbaseExchangePublicProvider.source_id,
+            provider_candles(2, CoinbaseExchangePublicProvider.source_id),
+        )
         runtime = CrossExchangeConsensusProvider(
             (kraken, coinbase),
             RISK_POLICY,
+            allow_unapproved_for_testing=True,
         ).fetch_batch(
             symbol="BTC/USD",
             interval_minutes=1_440,

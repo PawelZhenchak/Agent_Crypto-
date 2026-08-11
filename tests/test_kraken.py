@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 
 from crypto_agent.providers.kraken import KrakenPublicProvider, _NoRedirectHandler
 from crypto_agent.providers.base import ProviderError
@@ -27,7 +29,137 @@ class _RedirectedResponse:
         return b"{}"
 
 
+class _Response:
+    def __init__(self, payload: object, url: str) -> None:
+        self._raw = json.dumps(payload).encode("utf-8")
+        self._url = url
+        self.headers = {"Content-Length": str(len(self._raw))}
+
+    def __enter__(self) -> _Response:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def geturl(self) -> str:
+        return self._url
+
+    def read(self, size: int) -> bytes:
+        return self._raw[:size]
+
+
 class KrakenProviderTests(unittest.TestCase):
+    def test_reference_price_uses_a_separate_latest_closed_one_minute_candle(self) -> None:
+        noon = datetime(2026, 8, 10, 12, tzinfo=timezone.utc)
+        rows = [
+            [
+                int((noon - timedelta(minutes=2 - index)).timestamp()),
+                "100",
+                "120",
+                "90",
+                str(111 + index),
+                "100",
+                "1",
+                1,
+            ]
+            for index in range(3)
+        ]
+        payload = {"error": [], "result": {"XXBTZUSD": rows, "last": rows[-1][0]}}
+
+        observation = KrakenPublicProvider().parse_reference_price_payload(
+            payload,
+            symbol="BTC/USD",
+            as_of=noon,
+        )
+
+        self.assertEqual(observation.price, 112.0)
+        self.assertEqual(observation.event_time, noon)
+        self.assertEqual(observation.symbol, "BTC/USD")
+        self.assertEqual(observation.source, KrakenPublicProvider.source_id)
+        self.assertLessEqual(observation.event_time, observation.available_at)
+        self.assertLessEqual(observation.available_at, observation.ingested_at)
+
+    def test_reference_price_request_is_pinned_to_one_minute_public_ohlc(self) -> None:
+        noon = datetime(2026, 8, 10, 12, tzinfo=timezone.utc)
+        current_open = noon
+        rows = [
+            [
+                int((noon - timedelta(minutes=1)).timestamp()),
+                "100",
+                "120",
+                "90",
+                "115",
+                "100",
+                "1",
+                1,
+            ],
+            [
+                int(current_open.timestamp()),
+                "100",
+                "120",
+                "90",
+                "116",
+                "100",
+                "1",
+                1,
+            ],
+        ]
+        payload = {"error": [], "result": {"XXBTZUSD": rows, "last": rows[-1][0]}}
+        requests: list[str] = []
+
+        def fake_urlopen(request: object, timeout: float) -> _Response:
+            del timeout
+            url = request.full_url  # type: ignore[attr-defined]
+            requests.append(url)
+            return _Response(payload, url)
+
+        with patch("crypto_agent.providers.kraken.urlopen", side_effect=fake_urlopen):
+            observation = KrakenPublicProvider().fetch_reference_price(
+                symbol="BTC/USD",
+                as_of=noon,
+            )
+
+        self.assertEqual(observation.event_time, noon)
+        self.assertEqual(len(requests), 1)
+        parsed = urlsplit(requests[0])
+        self.assertEqual(parsed.path, "/0/public/OHLC")
+        self.assertEqual(parse_qs(parsed.query)["interval"], ["1"])
+
+    def test_reference_price_does_not_fall_back_to_an_older_closed_minute(self) -> None:
+        noon = datetime(2026, 8, 10, 12, tzinfo=timezone.utc)
+        rows = [
+            [
+                int((noon - timedelta(minutes=4)).timestamp()),
+                "100",
+                "120",
+                "90",
+                "115",
+                "100",
+                "1",
+                1,
+            ],
+            [
+                int(noon.timestamp()),
+                "100",
+                "120",
+                "90",
+                "116",
+                "100",
+                "1",
+                1,
+            ],
+        ]
+        payload = {"error": [], "result": {"XXBTZUSD": rows, "last": rows[-1][0]}}
+
+        with self.assertRaises(ProviderError) as raised:
+            KrakenPublicProvider().parse_reference_price_payload(
+                payload,
+                symbol="BTC/USD",
+                as_of=noon,
+            )
+
+        self.assertEqual(raised.exception.code, "REFERENCE_PRICE_UNAVAILABLE")
+
     def test_parser_drops_uncommitted_last_candle(self) -> None:
         payload = {
             "error": [],

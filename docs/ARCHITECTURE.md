@@ -1,10 +1,11 @@
 # Architektura Crypto Agent
 
 > **Status implementacji:** dokument opisuje architekturę docelową V1–V4. Kod jest
-> checkpointem `0.1.2 / V1.1`: dwa publiczne feedy spot i cross-source consensus są
-> zaimplementowane oraz testowane na fixture'ach. Research i risk pozostają logicznymi
-> modułami jednego procesu, nie osobnymi usługami. Gate V1 jest niezaliczony, live contract
-> tests i integracja z prawdziwym PostgreSQL nie zostały wykonane, a produkcja jest
+> checkpointem `0.1.3 / V1.1`: dwa publiczne feedy spot, cross-source consensus i
+> osobny dwuźródłowy snapshot ceny referencyjnej są zaimplementowane oraz testowane
+> na fixture'ach. Research i risk pozostają logicznymi modułami jednego procesu, nie
+> osobnymi usługami. Gate V1 jest niezaliczony, live contract tests i integracja z
+> prawdziwym PostgreSQL nie zostały wykonane, a produkcja jest
 > zablokowana do zamknięcia wszystkich kontroli z roadmapy.
 
 ## 1. Założenie nadrzędne
@@ -103,8 +104,10 @@ niezależnie sprawdza dane, limity oraz stan portfela. W checkpointcie V1.1 jest
 deterministycznym modułem w tym samym procesie i wiąże wynik z hashem snapshotu oraz
 pełnym fingerprintem polityki. Provider konsensusu jest zapieczętowany na source keys
 `kraken_spot_rest_v1` + `coinbase_exchange_spot_rest_v1`, a zmiana składu po
-skonstruowaniu unieważnia dowód. Separacja usługowa i niezależny odczyt snapshotu są
-warunkiem kolejnej bramki.
+skonstruowaniu unieważnia dowód. Kod, krytyczne mapy, origin i transport są
+rewalidowane przed i po fetchu. Jest to defense-in-depth wobec znanych/przypadkowych
+mutacji, nie sandbox dla arbitralnego kodu w tym samym interpreterze. Separacja
+usługowa i niezależny odczyt snapshotu są warunkiem kolejnej bramki.
 
 Statusy zależą od wersji:
 
@@ -258,13 +261,21 @@ Dane surowe są append-only. Korekta tworzy nową wersję, nie usuwa starej. Dzi
 Ścieżka publiczna ma dwie z góry przypięte granice sieciowe: Kraken i Coinbase.
 Adaptery dopuszczają wyłącznie oczekiwane hosty HTTPS i odrzucają redirect zamiast za
 nim podążać. Provider nie akceptuje aliasów, podklas ani dwóch źródeł reprezentujących
-to samo venue. Jego konfiguracja i fingerprint polityki są zamrażane przed fetchami.
+to samo venue. Jego konfiguracja, implementacja i fingerprint polityki są zamrażane
+oraz ponownie sprawdzane przed i po fetchach.
 
 Runtime i persistence korzystają z jednego czystego, wersjonowanego algorytmu
 `cross_exchange_spot_consensus_v1`. Wejściem jest dokładnie 120 ciągłych i wyrównanych
 czasowo świec z każdego źródła, zakończonych najnowszym kwalifikującym się zamkniętym
 oknem. Luka, brak jednego feedu, różny koniec, konflikt OHLC/close albo niezgodna
 anomalia wolumenu kończą się `NO_SIGNAL`; nie ma degradacji do pojedynczego źródła.
+
+Cena referencyjna jest oddzielona od tej historii. Każde venue dostarcza dokładnie
+ostatnią zamkniętą świecę 1m z tego samego okna UTC. Czysty algorytm
+`cross_exchange_reference_price_v1` sprawdza exact source→venue, lineage,
+`event_time <= cutoff_as_of <= evaluated_at`, wiek do 300 s oraz maksymalnie 50 pb
+każdego źródła od midpoint mediany. RiskGate ponownie wykonuje tę kontrolę i wiąże raw
+observations z fingerprintem wejścia.
 
 W trwałej ścieżce repozytorium, a nie caller, wyznacza latest eligible revision dla
 każdego wymaganego source/window według cutoffu. Opcjonalna lista IDs od callera jest
@@ -277,16 +288,26 @@ volume, evidence digest, role wejść, okno oraz diagnostyka pozostają w niezmi
 manifeście; `candles.base_volume` jest `NULL`, ponieważ wartość po normalizacji nie jest
 wolumenem bazowym żadnego venue.
 
+Migracja `0012` zapisuje referencję w append-only `reference_price_manifests` i
+`reference_price_provenance`. Repozytorium wyprowadza z bazy najnowsze dokładne 2×1,
+przypina `candle_id` wraz z `source_candle_receipt_id`, a deferred trigger ponownie
+liczy medianę, divergence, świeżość i pełny eligible revision universe przy COMMIT.
+Archiwalna polityka schema-r1 jest dozwolona tylko dla historycznego odczytu; nowe
+manifesty wymagają schema-r2.
+
 Ta ścieżka została sprawdzona na fakes i statycznie. Nie wykonano jej jeszcze na
-prawdziwym PostgreSQL; nie ma też operacyjnego raw-payload ingestu, quarantine,
-seedów registry ani schedulera.
+prawdziwym PostgreSQL 16; nie ma też operacyjnego raw-payload ingestu, quarantine,
+seedów registry ani schedulera. Health pozostaje fail-closed jako `SEEDS_MISSING`,
+dopóki wymagany registry footprint nie zostanie jawnie utworzony.
 
 ```mermaid
 flowchart TD
-    K["Kraken: 120"] --> A["cross_exchange_spot_consensus_v1"]
-    C["Coinbase: 120"] --> A
-    A --> R["Runtime snapshot"]
-    A --> M["Canonical + manifest"]
+    K["Kraken: 120 + 1m"] --> A["Consensus 2×120"]
+    C["Coinbase: 120 + 1m"] --> A
+    K --> P["Reference 2×1m"]
+    C --> P
+    A --> R["Runtime + durable"]
+    P --> R
 ```
 
 ### 8.3. Od danych do proposalu

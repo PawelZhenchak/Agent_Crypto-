@@ -4,7 +4,7 @@
 **Zakres:** V1–V4  
 **Zasada nadrzędna:** `deny by default` — brak jednoznacznego spełnienia warunku oznacza odmowę działania, a nie zgodę warunkową.
 
-Checkpoint `0.1.2-v1.1` pozostaje read-only i ma `metadata.v1_gate_passed=false`.
+Checkpoint `0.1.3-v1.1` pozostaje read-only i ma `metadata.v1_gate_passed=false`.
 Zielona suite lokalna nie jest sama w sobie formalnym dowodem przejścia Gate V1.
 
 ## 1. Cel i granice systemu
@@ -151,6 +151,12 @@ Przekroczenie limitu daje `DATA_STALE`. W V1–V3 wynik to `NO_SIGNAL`; w V4 pro
 - Dla BTC i ETH maksymalna różnica od mediany wynosi 50 pb; dla pozostałych aktywów 100 pb; dla stablecoinów 25 pb.
 - Różnica ceny venue wykonawczego od mediany referencyjnej w V4 nie może przekroczyć 50 pb.
 - Sprzeczne informacje o adresie kontraktu, decimals, podaży, statusie wypłat, depegu, exploicie, upgrade proxy lub rezerwach są zawsze konfliktem krytycznym niezależnie od ceny.
+
+Checkpoint V1.1 realizuje ten kontrakt dla BTC/ETH przez dokładnie dwie niezależne,
+wyrównane i zamknięte świece 1m Kraken/Coinbase. Granica 300 s jest inkluzywna;
+odchylenie o dowolną wartość ponad 50 pb od mediany kończy się `DATA_CONFLICT`.
+Przy dokładnie dwóch cenach 50 pb każdego źródła od midpoint mediany odpowiada
+100 pb pełnej różnicy pairwise.
 
 Przekroczenie progu daje `DATA_CONFLICT` i `NO_SIGNAL`/`REJECT`. Konflikt dotyczący salda, kontraktu, stablecoina rozliczeniowego albo bezpieczeństwa venue daje `HALT`.
 
