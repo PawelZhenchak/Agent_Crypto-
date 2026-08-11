@@ -4,6 +4,7 @@ import hashlib
 import importlib
 import os
 import re
+from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -182,9 +183,375 @@ class PostgresHealth:
     server_version: str | None
     missing_migrations: tuple[str, ...]
     status_code: str
+    schema_ready: bool = False
+    triggers_ready: bool = False
+    seeds_ready: bool = False
+    missing_schema_objects: tuple[str, ...] = ()
+    missing_triggers: tuple[str, ...] = ()
+    missing_seeds: tuple[str, ...] = ()
+    unexpected_migrations: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _TriggerRequirement:
+    name: str
+    table: str
+    function: str
+    type_mask: int
+    deferrable: bool = False
+    initially_deferred: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _ColumnRequirement:
+    table: str
+    name: str
+    type_name: str
+    not_null: bool = True
 
 
 _MIGRATION_FILE = re.compile(r"^(?P<version>[0-9]{4})_(?P<name>[a-z0-9_]+)\.sql$")
+
+_REQUIRED_POSTGRES_MAJOR = 16
+_BASE_TABLES = (
+    "data_sources",
+    "data_source_versions",
+    "ingestion_batches",
+    "exchanges",
+    "exchange_versions",
+    "assets",
+    "asset_versions",
+    "asset_symbols",
+    "markets",
+    "market_versions",
+    "market_symbols",
+    "candles",
+    "trades",
+    "orderbook_snapshots",
+    "orderbook_levels",
+    "derivatives_metrics",
+    "onchain_metrics",
+    "macro_series",
+    "macro_observations",
+    "documents",
+    "document_entities",
+    "token_unlocks",
+    "data_quality_incidents",
+    "data_quality_incident_events",
+    "research_runs",
+    "research_run_events",
+    "research_run_universe",
+    "research_run_inputs",
+    "research_artifacts",
+    "risk_policies",
+    "risk_assessments",
+    "risk_assessment_flags",
+    "alerts",
+    "alert_events",
+    "approval_requests",
+    "approval_decisions",
+    "paper_accounts",
+    "paper_orders",
+    "paper_order_events",
+    "paper_fills",
+    "paper_position_snapshots",
+    "audit_log",
+)
+_MIGRATED_TABLES = (
+    "schema_migrations",
+    "market_data_source_bindings",
+    "canonical_candle_series",
+    "source_candle_receipts",
+    "canonical_candle_manifests",
+    "canonical_candle_provenance",
+    "reference_price_manifests",
+    "reference_price_provenance",
+)
+_BASE_TRIGGER_FUNCTIONS = (
+    "forbid_append_only_change",
+    "enforce_research_input_cutoff",
+    "enforce_paper_order_approval",
+    "enforce_audit_hash_chain",
+)
+_MIGRATED_TRIGGER_FUNCTIONS = (
+    "enforce_market_data_source_binding",
+    "enforce_canonical_candle_series",
+    "enforce_source_candle_receipt",
+    "enforce_canonical_candle_manifest",
+    "enforce_canonical_candle_provenance",
+    "enforce_canonical_exact_provenance",
+    "enforce_v1_canonical_manifest_policy",
+    "enforce_v1_reference_price_manifest",
+    "enforce_v1_reference_price_provenance",
+    "enforce_v1_reference_price_exact_provenance",
+)
+
+
+def _column_requirements(
+    table: str,
+    definitions: Sequence[tuple[str, str]],
+) -> tuple[_ColumnRequirement, ...]:
+    return tuple(
+        _ColumnRequirement(table=table, name=name, type_name=type_name)
+        for name, type_name in definitions
+    )
+
+
+_MIGRATED_COLUMN_REQUIREMENTS = (
+    _column_requirements(
+        "schema_migrations",
+        (
+            ("version", "text"),
+            ("name", "text"),
+            ("checksum_sha256", "sha256_hex"),
+            ("applied_at", "timestamptz"),
+        ),
+    )
+    + _column_requirements(
+        "market_data_source_bindings",
+        (
+            ("binding_id", "int8"),
+            ("source_id", "int8"),
+            ("market_id", "int8"),
+            ("canonical_symbol", "text"),
+            ("venue_symbol", "text"),
+            ("observed_at", "timestamptz"),
+            ("available_at", "timestamptz"),
+            ("ingested_at", "timestamptz"),
+            ("content_hash", "sha256_hex"),
+        ),
+    )
+    + _column_requirements(
+        "canonical_candle_series",
+        (
+            ("canonical_series_id", "int8"),
+            ("series_key", "text"),
+            ("canonical_market_id", "int8"),
+            ("canonical_source_id", "int8"),
+            ("risk_policy_id", "int8"),
+            ("canonical_symbol", "text"),
+            ("interval_seconds", "int4"),
+            ("algorithm_version", "text"),
+            ("policy_hash", "sha256_hex"),
+            ("observed_at", "timestamptz"),
+            ("available_at", "timestamptz"),
+            ("ingested_at", "timestamptz"),
+            ("content_hash", "sha256_hex"),
+        ),
+    )
+    + _column_requirements(
+        "source_candle_receipts",
+        (
+            ("source_candle_receipt_id", "int8"),
+            ("candle_id", "int8"),
+            ("provider_ingested_at", "timestamptz"),
+            ("received_at", "timestamptz"),
+            ("cutoff_as_of", "timestamptz"),
+            ("receipt_hash", "sha256_hex"),
+        ),
+    )
+    + _column_requirements(
+        "canonical_candle_manifests",
+        (
+            ("canonical_candle_id", "int8"),
+            ("canonical_series_id", "int8"),
+            ("risk_policy_id", "int8"),
+            ("algorithm_version", "text"),
+            ("policy_hash", "sha256_hex"),
+            ("consensus_window_size", "int4"),
+            ("cutoff_as_of", "timestamptz"),
+            ("inputs_hash", "sha256_hex"),
+            ("computed_payload_hash", "sha256_hex"),
+            ("normalized_volume", "numeric"),
+            ("normalized_volume_unit", "text"),
+            ("diagnostics_document", "jsonb"),
+            ("evidence_hash", "sha256_hex"),
+            ("created_at", "timestamptz"),
+        ),
+    )
+    + _column_requirements(
+        "canonical_candle_provenance",
+        (
+            ("canonical_candle_id", "int8"),
+            ("source_candle_id", "int8"),
+            ("input_role", "text"),
+            ("linked_at", "timestamptz"),
+        ),
+    )
+    + _column_requirements(
+        "reference_price_manifests",
+        (
+            ("reference_price_id", "int8"),
+            ("reference_key", "text"),
+            ("canonical_market_id", "int8"),
+            ("risk_policy_id", "int8"),
+            ("symbol", "text"),
+            ("algorithm_version", "text"),
+            ("policy_hash", "sha256_hex"),
+            ("event_time", "timestamptz"),
+            ("cutoff_as_of", "timestamptz"),
+            ("evaluated_at", "timestamptz"),
+            ("median_price", "numeric"),
+            ("pairwise_divergence_bps", "numeric"),
+            ("max_deviation_from_median_bps", "numeric"),
+            ("inputs_hash", "sha256_hex"),
+            ("evidence_hash", "sha256_hex"),
+            ("available_at", "timestamptz"),
+            ("ingested_at", "timestamptz"),
+            ("content_hash", "sha256_hex"),
+        ),
+    )
+    + _column_requirements(
+        "reference_price_provenance",
+        (
+            ("reference_price_id", "int8"),
+            ("source_candle_id", "int8"),
+            ("source_candle_receipt_id", "int8"),
+            ("linked_at", "timestamptz"),
+        ),
+    )
+)
+
+
+def _append_only_trigger_requirements(
+    tables: Sequence[str],
+) -> tuple[_TriggerRequirement, ...]:
+    requirements: list[_TriggerRequirement] = []
+    for table in tables:
+        requirements.extend(
+            (
+                _TriggerRequirement(
+                    name=f"{table}_append_only_row_guard",
+                    table=table,
+                    function="forbid_append_only_change",
+                    # ROW | BEFORE | DELETE | UPDATE
+                    type_mask=1 | 2 | 8 | 16,
+                ),
+                _TriggerRequirement(
+                    name=f"{table}_append_only_truncate_guard",
+                    table=table,
+                    function="forbid_append_only_change",
+                    # STATEMENT | BEFORE | TRUNCATE
+                    type_mask=2 | 32,
+                ),
+            )
+        )
+    return tuple(requirements)
+
+
+_BASE_TRIGGER_REQUIREMENTS = _append_only_trigger_requirements(_BASE_TABLES) + (
+    _TriggerRequirement(
+        "research_inputs_cutoff_guard",
+        "research_run_inputs",
+        "enforce_research_input_cutoff",
+        1 | 2 | 4,
+    ),
+    _TriggerRequirement(
+        "paper_order_approval_guard",
+        "paper_orders",
+        "enforce_paper_order_approval",
+        1 | 2 | 4,
+    ),
+    _TriggerRequirement(
+        "audit_hash_chain_guard",
+        "audit_log",
+        "enforce_audit_hash_chain",
+        1 | 2 | 4,
+    ),
+)
+_MIGRATED_TRIGGER_REQUIREMENTS = _append_only_trigger_requirements(_MIGRATED_TABLES) + (
+    _TriggerRequirement(
+        "source_candle_receipt_integrity_guard",
+        "source_candle_receipts",
+        "enforce_source_candle_receipt",
+        1 | 2 | 4,
+    ),
+    _TriggerRequirement(
+        "market_data_source_binding_integrity_guard",
+        "market_data_source_bindings",
+        "enforce_market_data_source_binding",
+        1 | 2 | 4,
+    ),
+    _TriggerRequirement(
+        "canonical_candle_series_integrity_guard",
+        "canonical_candle_series",
+        "enforce_canonical_candle_series",
+        1 | 2 | 4,
+    ),
+    _TriggerRequirement(
+        "canonical_candle_manifest_integrity_guard",
+        "canonical_candle_manifests",
+        "enforce_canonical_candle_manifest",
+        1 | 2 | 4,
+    ),
+    _TriggerRequirement(
+        "canonical_candle_provenance_integrity_guard",
+        "canonical_candle_provenance",
+        "enforce_canonical_candle_provenance",
+        1 | 2 | 4,
+    ),
+    _TriggerRequirement(
+        "canonical_candle_exact_provenance_guard",
+        "canonical_candle_manifests",
+        "enforce_canonical_exact_provenance",
+        1 | 4,
+        deferrable=True,
+        initially_deferred=True,
+    ),
+    _TriggerRequirement(
+        "canonical_candle_exact_provenance_link_guard",
+        "canonical_candle_provenance",
+        "enforce_canonical_exact_provenance",
+        1 | 4,
+        deferrable=True,
+        initially_deferred=True,
+    ),
+    _TriggerRequirement(
+        "canonical_candle_manifest_reference_price_policy_guard",
+        "canonical_candle_manifests",
+        "enforce_v1_canonical_manifest_policy",
+        1 | 2 | 4,
+    ),
+    _TriggerRequirement(
+        "reference_price_manifest_integrity_guard",
+        "reference_price_manifests",
+        "enforce_v1_reference_price_manifest",
+        1 | 2 | 4,
+    ),
+    _TriggerRequirement(
+        "reference_price_provenance_integrity_guard",
+        "reference_price_provenance",
+        "enforce_v1_reference_price_provenance",
+        1 | 2 | 4,
+    ),
+    _TriggerRequirement(
+        "reference_price_exact_provenance_guard",
+        "reference_price_manifests",
+        "enforce_v1_reference_price_exact_provenance",
+        1 | 4,
+        deferrable=True,
+        initially_deferred=True,
+    ),
+    _TriggerRequirement(
+        "reference_price_exact_provenance_link_guard",
+        "reference_price_provenance",
+        "enforce_v1_reference_price_exact_provenance",
+        1 | 4,
+        deferrable=True,
+        initially_deferred=True,
+    ),
+)
+_EXPECTED_BINDINGS = (
+    ("kraken_spot_rest_v1", "kraken", "BTC/USD", "XBTUSD"),
+    ("kraken_spot_rest_v1", "kraken", "ETH/USD", "ETHUSD"),
+    ("coinbase_exchange_spot_rest_v1", "coinbase", "BTC/USD", "BTC-USD"),
+    ("coinbase_exchange_spot_rest_v1", "coinbase", "ETH/USD", "ETH-USD"),
+)
+_EXPECTED_CANONICAL_SERIES = tuple(
+    (symbol, interval_seconds)
+    for symbol in ("BTC/USD", "ETH/USD")
+    for interval_seconds in (14_400, 86_400, 604_800)
+)
 
 
 def discover_migrations(directory: str | Path) -> tuple[Migration, ...]:
@@ -307,88 +674,559 @@ def check_postgres_health(
     *,
     expected_migrations: Sequence[Migration] = (),
 ) -> PostgresHealth:
-    """Perform a non-mutating readiness check without returning driver diagnostics."""
+    """Perform a fail-closed, non-mutating PostgreSQL 16 readiness check.
+
+    Readiness is deliberately tied to the migrations packaged with this binary.
+    A caller-provided empty directory or a hand-picked subset therefore cannot turn
+    an incomplete database into ``READY``.
+    """
 
     try:
+        required_migrations = _packaged_health_migrations(expected_migrations)
+        policy_id, policy_hash = _health_policy_contract()
+    except Exception:
+        return _health_result(
+            status_code="MIGRATION_MANIFEST_INVALID",
+            missing_migrations=(),
+        )
+
+    required_versions = tuple(item.version for item in required_migrations)
+    server_version: str | None = None
+    try:
         with transaction(connection_factory) as connection, cursor(connection) as db_cursor:
-            db_cursor.execute("SHOW server_version")
-            server_version_value = _first_value(db_cursor.fetchone())
-            server_version = None if server_version_value is None else str(server_version_value)
-            db_cursor.execute("SELECT to_regclass('crypto_agent.candles')")
-            base_ready = _first_value(db_cursor.fetchone()) is not None
-            if not base_ready:
-                return PostgresHealth(
-                    healthy=False,
+            db_cursor.execute("SET TRANSACTION READ ONLY")
+            db_cursor.execute(
+                """
+                SELECT current_setting('server_version_num'),
+                       current_setting('server_version'),
+                       current_setting('session_replication_role')
+                """
+            )
+            version_row = db_cursor.fetchone()
+            if version_row is None:
+                return _health_result(
+                    status_code="POSTGRES_VERSION_UNSUPPORTED",
                     database_reachable=True,
-                    base_schema_ready=False,
-                    migrations_current=False,
+                    missing_migrations=required_versions,
+                )
+            version_number_raw = _row_value(version_row, "server_version_num", 0)
+            server_version = str(_row_value(version_row, "server_version", 1))
+            replication_role = str(
+                _row_value(version_row, "session_replication_role", 2)
+            )
+            try:
+                version_number = int(str(version_number_raw))
+            except (TypeError, ValueError):
+                version_number = 0
+            if version_number // 10_000 != _REQUIRED_POSTGRES_MAJOR:
+                return _health_result(
+                    status_code="POSTGRES_VERSION_UNSUPPORTED",
+                    database_reachable=True,
                     server_version=server_version,
-                    missing_migrations=tuple(item.version for item in expected_migrations),
+                    missing_migrations=required_versions,
+                )
+            if replication_role != "origin":
+                return _health_result(
+                    status_code="POSTGRES_SESSION_UNSAFE",
+                    database_reachable=True,
+                    server_version=server_version,
+                    missing_migrations=required_versions,
+                )
+
+            db_cursor.execute(
+                "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = %s)",
+                ("crypto_agent",),
+            )
+            schema_exists = _first_value(db_cursor.fetchone()) is True
+            base_missing: list[str] = []
+            if not schema_exists:
+                base_missing.append("schema:crypto_agent")
+
+            base_relations = _catalog_relations(db_cursor, _BASE_TABLES)
+            base_missing.extend(
+                f"table:{name}"
+                for name in _BASE_TABLES
+                if base_relations.get(name) != "r"
+            )
+            db_cursor.execute(
+                """
+                SELECT typ.typname, typ.typtype
+                FROM pg_catalog.pg_type AS typ
+                JOIN pg_catalog.pg_namespace AS ns
+                  ON ns.oid = typ.typnamespace
+                WHERE ns.nspname = 'crypto_agent'
+                  AND typ.typname = ANY(%s)
+                """,
+                (["sha256_hex"],),
+            )
+            domains = {
+                (str(_row_value(row, "typname", 0)), str(_row_value(row, "typtype", 1)))
+                for row in db_cursor.fetchall()
+            }
+            if ("sha256_hex", "d") not in domains:
+                base_missing.append("domain:sha256_hex")
+
+            base_functions = _catalog_trigger_functions(
+                db_cursor, _BASE_TRIGGER_FUNCTIONS
+            )
+            base_missing.extend(
+                f"function:{name}"
+                for name in _BASE_TRIGGER_FUNCTIONS
+                if name not in base_functions
+            )
+            if base_missing:
+                return _health_result(
                     status_code="BASE_SCHEMA_MISSING",
+                    database_reachable=True,
+                    server_version=server_version,
+                    missing_migrations=required_versions,
+                    missing_schema_objects=tuple(sorted(base_missing)),
+                )
+
+            base_trigger_differences = _trigger_differences(
+                _BASE_TRIGGER_REQUIREMENTS,
+                _catalog_triggers(db_cursor, _BASE_TABLES),
+            )
+            if base_trigger_differences:
+                return _health_result(
+                    status_code="BASE_TRIGGERS_MISSING",
+                    database_reachable=True,
+                    server_version=server_version,
+                    missing_migrations=required_versions,
+                    missing_triggers=base_trigger_differences,
                 )
 
             db_cursor.execute("SELECT to_regclass('crypto_agent.schema_migrations')")
             ledger_exists = _first_value(db_cursor.fetchone()) is not None
-            applied: dict[str, str] = {}
+            applied: dict[str, tuple[str, str]] = {}
             if ledger_exists:
                 db_cursor.execute(
                     """
-                    SELECT version, checksum_sha256
+                    SELECT version, name, checksum_sha256
                     FROM crypto_agent.schema_migrations
                     ORDER BY version
                     """
                 )
                 applied = {
-                    str(_row_value(row, "version", 0)): str(
-                        _row_value(row, "checksum_sha256", 1)
+                    str(_row_value(row, "version", 0)): (
+                        str(_row_value(row, "name", 1)),
+                        str(_row_value(row, "checksum_sha256", 2)),
                     )
                     for row in db_cursor.fetchall()
                 }
+
+            required_by_version = {
+                item.version: (item.name, item.checksum_sha256)
+                for item in required_migrations
+            }
+            drifted = tuple(
+                version
+                for version, expected in required_by_version.items()
+                if version in applied and applied[version] != expected
+            )
+            missing = tuple(
+                version for version in required_by_version if version not in applied
+            )
+            ahead = tuple(
+                sorted(version for version in applied if version not in required_by_version)
+            )
+            if drifted:
+                return _health_result(
+                    status_code="MIGRATION_DRIFT",
+                    database_reachable=True,
+                    base_schema_ready=True,
+                    server_version=server_version,
+                    missing_migrations=drifted,
+                )
+            if missing:
+                return _health_result(
+                    status_code="MIGRATIONS_PENDING",
+                    database_reachable=True,
+                    base_schema_ready=True,
+                    server_version=server_version,
+                    missing_migrations=missing,
+                )
+            if ahead:
+                return _health_result(
+                    status_code="MIGRATIONS_AHEAD",
+                    database_reachable=True,
+                    base_schema_ready=True,
+                    server_version=server_version,
+                    unexpected_migrations=ahead,
+                )
+
+            migrated_missing: list[str] = []
+            migrated_relations = _catalog_relations(db_cursor, _MIGRATED_TABLES)
+            migrated_missing.extend(
+                f"table:{name}"
+                for name in _MIGRATED_TABLES
+                if migrated_relations.get(name) != "r"
+            )
+            migrated_missing.extend(
+                _column_differences(
+                    _MIGRATED_COLUMN_REQUIREMENTS,
+                    _catalog_columns(db_cursor, _MIGRATED_TABLES),
+                )
+            )
+            migrated_functions = _catalog_trigger_functions(
+                db_cursor, _MIGRATED_TRIGGER_FUNCTIONS
+            )
+            migrated_missing.extend(
+                f"function:{name}"
+                for name in _MIGRATED_TRIGGER_FUNCTIONS
+                if name not in migrated_functions
+            )
+            if migrated_missing:
+                return _health_result(
+                    status_code="MIGRATED_SCHEMA_MISSING",
+                    database_reachable=True,
+                    base_schema_ready=True,
+                    migrations_current=True,
+                    server_version=server_version,
+                    missing_schema_objects=tuple(sorted(migrated_missing)),
+                )
+
+            migrated_trigger_differences = _trigger_differences(
+                _MIGRATED_TRIGGER_REQUIREMENTS,
+                _catalog_triggers(db_cursor, _MIGRATED_TABLES),
+            )
+            if migrated_trigger_differences:
+                return _health_result(
+                    status_code="MIGRATED_TRIGGERS_MISSING",
+                    database_reachable=True,
+                    base_schema_ready=True,
+                    migrations_current=True,
+                    server_version=server_version,
+                    schema_ready=True,
+                    missing_triggers=migrated_trigger_differences,
+                )
+
+            missing_seeds = _missing_seed_requirements(
+                db_cursor,
+                policy_id=policy_id,
+                policy_hash=policy_hash,
+            )
+            if missing_seeds:
+                return _health_result(
+                    status_code="SEEDS_MISSING",
+                    database_reachable=True,
+                    base_schema_ready=True,
+                    migrations_current=True,
+                    server_version=server_version,
+                    schema_ready=True,
+                    triggers_ready=True,
+                    missing_seeds=missing_seeds,
+                )
     except Exception:
-        return PostgresHealth(
-            healthy=False,
-            database_reachable=False,
-            base_schema_ready=False,
-            migrations_current=False,
-            server_version=None,
-            missing_migrations=tuple(item.version for item in expected_migrations),
+        return _health_result(
             status_code="POSTGRES_UNAVAILABLE",
+            server_version=server_version,
+            missing_migrations=required_versions,
         )
 
-    missing = tuple(item.version for item in expected_migrations if item.version not in applied)
-    drifted = tuple(
-        item.version
-        for item in expected_migrations
-        if item.version in applied and applied[item.version] != item.checksum_sha256
-    )
-    if drifted:
-        return PostgresHealth(
-            healthy=False,
-            database_reachable=True,
-            base_schema_ready=True,
-            migrations_current=False,
-            server_version=server_version,
-            missing_migrations=drifted,
-            status_code="MIGRATION_DRIFT",
-        )
-    if missing:
-        return PostgresHealth(
-            healthy=False,
-            database_reachable=True,
-            base_schema_ready=True,
-            migrations_current=False,
-            server_version=server_version,
-            missing_migrations=missing,
-            status_code="MIGRATIONS_PENDING",
-        )
-    return PostgresHealth(
+    return _health_result(
+        status_code="READY",
         healthy=True,
         database_reachable=True,
         base_schema_ready=True,
         migrations_current=True,
         server_version=server_version,
-        missing_migrations=(),
-        status_code="READY",
+        schema_ready=True,
+        triggers_ready=True,
+        seeds_ready=True,
+    )
+
+
+def _packaged_health_migrations(
+    supplied: Sequence[Migration],
+) -> tuple[Migration, ...]:
+    from .resource_paths import default_migration_directory
+
+    packaged = discover_migrations(default_migration_directory())
+    if not packaged:
+        raise MigrationError("Packaged PostgreSQL migration manifest is empty")
+    if supplied:
+        packaged_identity = tuple(
+            (item.version, item.name, item.checksum_sha256) for item in packaged
+        )
+        supplied_identity = tuple(
+            (item.version, item.name, item.checksum_sha256) for item in supplied
+        )
+        if supplied_identity != packaged_identity:
+            raise MigrationError("PostgreSQL migration manifest is not packaged")
+    return packaged
+
+
+def _health_policy_contract() -> tuple[str, str]:
+    from .policy import RiskPolicy
+    from .resource_paths import default_risk_policy_path
+
+    policy = RiskPolicy.load(default_risk_policy_path())
+    return policy.policy_id, policy.fingerprint()
+
+
+def _catalog_relations(db_cursor: DBCursor, names: Sequence[str]) -> dict[str, str]:
+    db_cursor.execute(
+        """
+        SELECT rel.relname, rel.relkind
+        FROM pg_catalog.pg_class AS rel
+        JOIN pg_catalog.pg_namespace AS ns
+          ON ns.oid = rel.relnamespace
+        WHERE ns.nspname = 'crypto_agent'
+          AND rel.relname = ANY(%s)
+        """,
+        (list(names),),
+    )
+    return {
+        str(_row_value(row, "relname", 0)): str(_row_value(row, "relkind", 1))
+        for row in db_cursor.fetchall()
+    }
+
+
+def _catalog_trigger_functions(
+    db_cursor: DBCursor, names: Sequence[str]
+) -> set[str]:
+    db_cursor.execute(
+        """
+        SELECT proc.proname
+        FROM pg_catalog.pg_proc AS proc
+        JOIN pg_catalog.pg_namespace AS ns
+          ON ns.oid = proc.pronamespace
+        WHERE ns.nspname = 'crypto_agent'
+          AND proc.proname = ANY(%s)
+          AND proc.prorettype = 'pg_catalog.trigger'::pg_catalog.regtype
+        """,
+        (list(names),),
+    )
+    return {str(_row_value(row, "proname", 0)) for row in db_cursor.fetchall()}
+
+
+def _catalog_columns(
+    db_cursor: DBCursor,
+    tables: Sequence[str],
+) -> tuple[_ColumnRequirement, ...]:
+    db_cursor.execute(
+        """
+        SELECT rel.relname, attr.attname, typ.typname, attr.attnotnull
+        FROM pg_catalog.pg_attribute AS attr
+        JOIN pg_catalog.pg_class AS rel ON rel.oid = attr.attrelid
+        JOIN pg_catalog.pg_namespace AS ns ON ns.oid = rel.relnamespace
+        JOIN pg_catalog.pg_type AS typ ON typ.oid = attr.atttypid
+        WHERE ns.nspname = 'crypto_agent'
+          AND rel.relname = ANY(%s)
+          AND attr.attnum > 0
+          AND NOT attr.attisdropped
+        """,
+        (list(tables),),
+    )
+    return tuple(
+        _ColumnRequirement(
+            table=str(_row_value(row, "relname", 0)),
+            name=str(_row_value(row, "attname", 1)),
+            type_name=str(_row_value(row, "typname", 2)),
+            not_null=_row_value(row, "attnotnull", 3) is True,
+        )
+        for row in db_cursor.fetchall()
+    )
+
+
+def _column_differences(
+    required: Sequence[_ColumnRequirement],
+    actual: Sequence[_ColumnRequirement],
+) -> tuple[str, ...]:
+    required_by_key = {(item.table, item.name): item for item in required}
+    actual_by_key = {(item.table, item.name): item for item in actual}
+    differences = {
+        f"column:{table}.{name}"
+        for (table, name), requirement in required_by_key.items()
+        if actual_by_key.get((table, name)) != requirement
+    }
+    differences.update(
+        f"unexpected:column:{table}.{name}"
+        for table, name in actual_by_key.keys() - required_by_key.keys()
+    )
+    return tuple(sorted(differences))
+
+
+def _catalog_triggers(
+    db_cursor: DBCursor, tables: Sequence[str]
+) -> tuple[_TriggerRequirement, ...]:
+    db_cursor.execute(
+        """
+        SELECT trg.tgname, rel.relname, proc.proname,
+               trg.tgenabled, trg.tgtype,
+               trg.tgdeferrable, trg.tginitdeferred
+        FROM pg_catalog.pg_trigger AS trg
+        JOIN pg_catalog.pg_class AS rel ON rel.oid = trg.tgrelid
+        JOIN pg_catalog.pg_namespace AS ns ON ns.oid = rel.relnamespace
+        JOIN pg_catalog.pg_proc AS proc ON proc.oid = trg.tgfoid
+        WHERE ns.nspname = 'crypto_agent'
+          AND rel.relname = ANY(%s)
+          AND NOT trg.tgisinternal
+        """,
+        (list(tables),),
+    )
+    result: list[_TriggerRequirement] = []
+    for row in db_cursor.fetchall():
+        enabled = str(_row_value(row, "tgenabled", 3))
+        if enabled not in {"O", "A"}:
+            continue
+        result.append(
+            _TriggerRequirement(
+                name=str(_row_value(row, "tgname", 0)),
+                table=str(_row_value(row, "relname", 1)),
+                function=str(_row_value(row, "proname", 2)),
+                type_mask=int(_row_value(row, "tgtype", 4)),
+                deferrable=_row_value(row, "tgdeferrable", 5) is True,
+                initially_deferred=_row_value(row, "tginitdeferred", 6) is True,
+            )
+        )
+    return tuple(result)
+
+
+def _trigger_differences(
+    required: Sequence[_TriggerRequirement],
+    actual: Sequence[_TriggerRequirement],
+) -> tuple[str, ...]:
+    required_set = set(required)
+    actual_set = set(actual)
+    missing = {item.name for item in required_set - actual_set}
+    unexpected = {f"unexpected:{item.name}" for item in actual_set - required_set}
+    return tuple(sorted(missing | unexpected))
+
+
+def _missing_seed_requirements(
+    db_cursor: DBCursor,
+    *,
+    policy_id: str,
+    policy_hash: str,
+) -> tuple[str, ...]:
+    db_cursor.execute(
+        """
+        SELECT source.source_key, exchange.exchange_key,
+               binding.canonical_symbol, binding.venue_symbol
+        FROM crypto_agent.market_data_source_bindings binding
+        JOIN crypto_agent.data_sources source ON source.source_id = binding.source_id
+        JOIN crypto_agent.markets market ON market.market_id = binding.market_id
+        JOIN crypto_agent.exchanges exchange ON exchange.exchange_id = market.exchange_id
+        WHERE source.available_at <= CURRENT_TIMESTAMP
+          AND source.ingested_at <= CURRENT_TIMESTAMP
+          AND exchange.available_at <= CURRENT_TIMESTAMP
+          AND exchange.ingested_at <= CURRENT_TIMESTAMP
+          AND market.available_at <= CURRENT_TIMESTAMP
+          AND market.ingested_at <= CURRENT_TIMESTAMP
+          AND binding.available_at <= CURRENT_TIMESTAMP
+          AND binding.ingested_at <= CURRENT_TIMESTAMP
+        """,
+    )
+    binding_counts = Counter(
+        tuple(
+            str(_row_value(row, key, index))
+            for index, key in enumerate(
+                ("source_key", "exchange_key", "canonical_symbol", "venue_symbol")
+            )
+        )
+        for row in db_cursor.fetchall()
+    )
+    missing = [
+        f"binding:{source}:{venue}:{symbol}:{venue_symbol}"
+        for source, venue, symbol, venue_symbol in _EXPECTED_BINDINGS
+        if binding_counts[(source, venue, symbol, venue_symbol)] != 1
+    ]
+    expected_bindings = set(_EXPECTED_BINDINGS)
+    missing.extend(
+        f"unexpected_binding:{source}:{venue}:{symbol}:{venue_symbol}"
+        for source, venue, symbol, venue_symbol in sorted(binding_counts)
+        if (source, venue, symbol, venue_symbol) not in expected_bindings
+    )
+
+    db_cursor.execute(
+        """
+        SELECT series.canonical_symbol, series.interval_seconds
+        FROM crypto_agent.canonical_candle_series series
+        JOIN crypto_agent.markets market
+          ON market.market_id = series.canonical_market_id
+        JOIN crypto_agent.exchanges exchange ON exchange.exchange_id = market.exchange_id
+        JOIN crypto_agent.data_sources source
+          ON source.source_id = series.canonical_source_id
+        JOIN crypto_agent.risk_policies policy
+          ON policy.risk_policy_id = series.risk_policy_id
+         AND policy.content_hash = series.policy_hash
+        WHERE series.algorithm_version = 'cross_exchange_spot_consensus_v1'
+          AND series.policy_hash = %s
+          AND policy.content_hash = %s
+          AND policy.policy_document->>'policy_id' = %s
+          AND policy.effective_from <= CURRENT_TIMESTAMP
+          AND (policy.effective_to IS NULL OR policy.effective_to > CURRENT_TIMESTAMP)
+          AND series.available_at <= CURRENT_TIMESTAMP
+          AND series.ingested_at <= CURRENT_TIMESTAMP
+          AND policy.available_at <= CURRENT_TIMESTAMP
+          AND policy.ingested_at <= CURRENT_TIMESTAMP
+          AND market.instrument_type = 'spot'
+          AND source.source_key <> ALL(%s)
+          AND exchange.exchange_key <> ALL(%s)
+        """,
+        (
+            policy_hash,
+            policy_hash,
+            policy_id,
+            ["kraken_spot_rest_v1", "coinbase_exchange_spot_rest_v1"],
+            ["kraken", "coinbase"],
+        ),
+    )
+    series_counts = Counter(
+        (
+            str(_row_value(row, "canonical_symbol", 0)),
+            int(_row_value(row, "interval_seconds", 1)),
+        )
+        for row in db_cursor.fetchall()
+    )
+    missing.extend(
+        f"series:{symbol}:{interval_seconds}"
+        for symbol, interval_seconds in _EXPECTED_CANONICAL_SERIES
+        if series_counts[(symbol, interval_seconds)] != 1
+    )
+    expected_series = set(_EXPECTED_CANONICAL_SERIES)
+    missing.extend(
+        f"unexpected_series:{symbol}:{interval_seconds}"
+        for symbol, interval_seconds in sorted(series_counts)
+        if (symbol, interval_seconds) not in expected_series
+    )
+    return tuple(sorted(missing))
+
+
+def _health_result(
+    *,
+    status_code: str,
+    healthy: bool = False,
+    database_reachable: bool = False,
+    base_schema_ready: bool = False,
+    migrations_current: bool = False,
+    server_version: str | None = None,
+    missing_migrations: tuple[str, ...] = (),
+    schema_ready: bool = False,
+    triggers_ready: bool = False,
+    seeds_ready: bool = False,
+    missing_schema_objects: tuple[str, ...] = (),
+    missing_triggers: tuple[str, ...] = (),
+    missing_seeds: tuple[str, ...] = (),
+    unexpected_migrations: tuple[str, ...] = (),
+) -> PostgresHealth:
+    return PostgresHealth(
+        healthy=healthy,
+        database_reachable=database_reachable,
+        base_schema_ready=base_schema_ready,
+        migrations_current=migrations_current,
+        server_version=server_version,
+        missing_migrations=missing_migrations,
+        status_code=status_code,
+        schema_ready=schema_ready,
+        triggers_ready=triggers_ready,
+        seeds_ready=seeds_ready,
+        missing_schema_objects=missing_schema_objects,
+        missing_triggers=missing_triggers,
+        missing_seeds=missing_seeds,
+        unexpected_migrations=unexpected_migrations,
     )
 
 

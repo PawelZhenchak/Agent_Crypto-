@@ -1,8 +1,8 @@
 # Bieżący status
 
 Data checkpointu: **2026-08-10**  
-Pakiet: **0.1.2**  
-System: **0.1.2-v1.1**  
+Pakiet: **0.1.3**  
+System: **0.1.3-v1.1**  
 Stan: **V1.1 development checkpoint — Gate V1 niezaliczony**
 
 ## Ukończone w tym checkpointcie
@@ -15,6 +15,8 @@ Stan: **V1.1 development checkpoint — Gate V1 niezaliczony**
   zgodnie z kontraktem fixtures;
 - zapieczętowany provider cross-exchange consensus tylko dla dokładnych source keys
   `kraken_spot_rest_v1` + `coinbase_exchange_spot_rest_v1` i dwóch różnych venue;
+- rewalidacja kodu/defaultów/closure metod, krytycznych map, originu, timeoutu i
+  łańcucha transportu przed i po fetchu; znane podmiany kończą się fail-closed;
 - wspólny dla runtime i persistence, wersjonowany algorytm
   `cross_exchange_spot_consensus_v1`;
 - stałe okno dokładnie 120 wyrównanych, ciągłych świec na źródło, zakończone
@@ -25,12 +27,18 @@ Stan: **V1.1 development checkpoint — Gate V1 niezaliczony**
   RiskGate i trwałym recompute;
 - standalone i synthetic nie mogą dostarczyć dowodu pozwalającego na `ALERT`;
 - RiskGate niezależnie waliduje jakość, metryki, UTC, expiry, SHA-256 i decyzję;
+- osobny `cross_exchange_reference_price_v1`: dokładnie dwie zamknięte i wyrównane
+  świece 1m, 300 s wieku oraz maksymalnie 50 pb każdego źródła od mediany;
+- RiskGate ponownie przelicza snapshot ceny, a raw observations są związane z hashem
+  wejścia i zapisywanym snapshotem raportu;
 - bounded deadline API obejmuje build, inicjalizację storage, fetch, analizę i zapis;
   synchroniczne operacje nie blokują event loop FastAPI, a 504 nie może zakończyć
   się późnym zapisem raportu;
 - CLI PostgreSQL: `plan`, `migrate`, `health`;
 - migracja `0011` dla venue bindings, receipts, canonical series, computation
   manifests i raw provenance;
+- migracja `0012` dla append-only reference-price manifests/provenance, przypiętych
+  receipt IDs i deferred DB-derived replayu 2×1;
 - repozytorium wyprowadza z bazy latest eligible revision dla każdego wymaganego
   source/window; caller IDs są tylko assertion równości i nie wybierają danych;
 - trwałe przeliczenie wymaga dokładnego kontekstu `Kraken 120 + Coinbase 120`,
@@ -48,28 +56,29 @@ Stan: **V1.1 development checkpoint — Gate V1 niezaliczony**
   canonical lineage;
 - ścieżka odczytu odtwarza wynik z pełnego provenance `2 × 120`, kontroluje okres
   ważności polityki przy cutoffie oraz odrzuca zmianę danych, diagnostyki lub hashy;
-- append-only raporty i snapshoty SQLite pozostają dostępne do lokalnego replayu.
+- append-only raporty i snapshoty SQLite pozostają dostępne do lokalnego replayu;
+- health wymusza PostgreSQL 16, pełny relkind/domain/function/trigger footprint,
+  dokładne kolumny ośmiu tabel migracyjnych, packaged manifest migracji i dokładny
+  zestaw semantycznych seedów;
+- narrator normalizuje Unicode/Markdown i blokuje znane bezpośrednie oraz pośrednie
+  rekomendacje PL/EN także wtedy, gdy model błędnie oznaczy tekst jako bezpieczny.
 
-Lokalny dowód regresyjny: **155/155 testów standard-library** i pełny
+Lokalny dowód regresyjny: **213/213 testów standard-library** i pełny
 `compileall` dla `src` oraz `tests`. Nie zastępuje to live contract testów ani
 akceptacji na prawdziwym PostgreSQL.
 
-## Znane ustalenia z audytu planu — jeszcze nienaprawione
+## Wynik audytu czterech defektów
 
-- zapieczętowanie pary feedów chroni konfigurację aplikacyjną, ale kod uruchomiony
-  w tym samym procesie może podmienić implementację zatwierdzonego providera;
-- PostgreSQL `health` nie wymusza jeszcze wersji 16 ani obecności pełnego zestawu
-  wymaganych tabel, triggerów, migracji i seedów;
-- polityka dokumentacyjna wymaga ceny referencyjnej młodszej niż 5 minut i progu
-  50 pb dla BTC/ETH, a bieżący runtime wiąże świeżość z interwałem świecy i używa
-  progu 100 pb — kontrakt wymaga ujednolicenia;
-- filtr narratora blokuje podstawowe polecenia kupna/sprzedaży, ale nie pokrywa
-  jeszcze wszystkich parafraz sugestii inwestycyjnych; narrator jest domyślnie
-  wyłączony i przed Gate V1 wymaga pełnych evali.
+Wszystkie cztery znane reprodukcje mają poprawki i regresje: podmiana feedu nie może
+już zatwierdzić konsensusu, health nie akceptuje PG12 ani płytkiego schematu, cena
+referencyjna ma oddzielny kontrakt 2×1m/300 s/50 pb, a znane parafrazy narratora są
+odrzucane fail-closed.
 
-Żadne z tych ustaleń nie tworzy ścieżki wykonywania transakcji, ponieważ projekt
-nie zawiera kodu zleceń ani kluczy giełdowych. Wszystkie cztery blokują jednak
-formalny Gate V1.
+Pozostają dwie granice architektoniczne. Attestation w jednym interpreterze jest
+defense-in-depth, a nie sandboxem dla arbitralnego pluginu — rzeczywista granica
+wymaga osobnego immutable ingest workera. Filtr językowy nie jest formalnym dowodem
+pokrycia wszystkich parafraz, więc narrator pozostaje domyślnie wyłączony do czasu
+ukrytych evali z 100% recall. Te ograniczenia nadal blokują formalny Gate V1.
 
 ## Częściowo ukończone
 
@@ -78,7 +87,9 @@ formalny Gate V1.
 Runner migracji, health-check, migracja i repozytorium zostały sprawdzone statycznie
 oraz na kontrolowanych połączeniach/fakes. Środowisko checkpointu nie posiadało Dockera,
 `psql`, lokalnego serwera PostgreSQL ani opcjonalnego `psycopg`, więc nie ma jeszcze
-dowodu wykonania `schema.sql + 0011` na prawdziwym PostgreSQL.
+dowodu wykonania `schema.sql + 0011 + 0012` na prawdziwym PostgreSQL. Repo nie ma
+jeszcze operacyjnego pakietu seedów, dlatego health ma poprawnie pozostać w
+`SEEDS_MISSING` po samym wykonaniu migracji.
 
 ### Trwały ingest
 
@@ -99,17 +110,19 @@ zaakceptowanych live API contracts.
 
 ## Najbliższa kolejność prac
 
-1. Uruchomić czystą bazę PostgreSQL 16 w CI i wykonać `schema.sql`, `0011`, scenariusze
-   awarii oraz testy wszystkich constraintów i triggerów.
-2. Dodać atomowy external-ingest batch: request URI, raw response bytes/hash,
+1. Uruchomić czystą bazę PostgreSQL 16 w CI i wykonać `schema.sql`, `0011`, `0012`,
+   seedy oraz transakcyjne testy wszystkich constraintów i triggerów.
+2. Wydzielić minimalny ingest worker do przypiętego, immutable obrazu z osobną rolą
+   bazy i allowlistą egress.
+3. Dodać atomowy external-ingest batch: request URI, raw response bytes/hash,
    extractor/source-registry versions, wynik `completed|failed|quarantined` i replay.
-3. Seedować jawne identyfikatory Kraken, Coinbase i canonical series bez sekretów.
 4. Dodać idempotentny `ingest-once` przeznaczony do uruchamiania przez scheduler.
 5. Powiązać failed-consensus evidence z trwałym batch/quarantine registry.
 6. Uruchomić live contract tests dla publicznych API Kraken i Coinbase.
-7. Zbudować dwusource trades/order book, spread, depth i price impact.
-8. Dodać specjalistów V1, Sceptyka, evidence service, trace evals i dashboard.
-9. Przeprowadzić 4–8 tygodni forward observation i formalny Gate V1.
+7. Przeprowadzić ukryte evale narratora PL/EN z 100% recall dla rekomendacji.
+8. Zbudować dwusource trades/order book, spread, depth i price impact.
+9. Dodać specjalistów V1, Sceptyka, evidence service, trace evals i dashboard.
+10. Przeprowadzić 4–8 tygodni forward observation i formalny Gate V1.
 
 Do wykonania wszystkich punktów `metadata.v1_gate_passed=false`, środowisko
 `production` jest blokowane, a V2 nie może się rozpocząć.

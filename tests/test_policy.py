@@ -8,7 +8,14 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from crypto_agent.domain import DataQualityReport, Decision, MarketMetrics, Regime
+from crypto_agent.domain import (
+    DataQualityReport,
+    Decision,
+    MarketMetrics,
+    ReferencePriceObservation,
+    ReferencePriceSnapshot,
+    Regime,
+)
 from crypto_agent.policy import PolicyConfigurationError, RiskGate, RiskPolicy
 
 from tests.helpers import PROJECT_ROOT, policy
@@ -60,7 +67,9 @@ class PolicyTests(unittest.TestCase):
         loaded = policy()
         invalid_values = (
             ("allowed_intervals_minutes", (240, 1440, True)),
+            ("policy_schema_version", True),
             ("min_samples", True),
+            ("max_reference_price_age_seconds", True),
             ("report_ttl_seconds", True),
             ("max_clock_skew_seconds", False),
             ("min_consensus_sources", True),
@@ -75,7 +84,9 @@ class PolicyTests(unittest.TestCase):
         loaded = policy()
         invalid_values = (
             ("allowed_intervals_minutes", (240.0, 1440.0, 10080.0)),
+            ("policy_schema_version", 2.0),
             ("min_samples", 60.0),
+            ("max_reference_price_age_seconds", 300.0),
             ("report_ttl_seconds", 3600.0),
             ("max_clock_skew_seconds", 30.0),
             ("min_consensus_sources", 2.0),
@@ -119,6 +130,49 @@ class PolicyTests(unittest.TestCase):
             with self.assertRaises(PolicyConfigurationError):
                 RiskPolicy.load(path)
 
+    def test_reference_price_contract_is_explicit_and_cannot_be_weakened(self) -> None:
+        loaded = policy()
+        self.assertEqual(loaded.policy_schema_version, 2)
+        self.assertEqual(loaded.max_reference_price_age_seconds, 300)
+        self.assertEqual(
+            loaded.max_reference_price_deviation_from_median_bps,
+            50.0,
+        )
+        self.assertEqual(loaded.max_pairwise_reference_price_divergence_bps, 100.0)
+        for changes in (
+            {"max_reference_price_age_seconds": 301},
+            {"max_reference_price_age_seconds": 299},
+            {"max_reference_price_deviation_from_median_bps": 51.0},
+            {
+                "max_reference_price_deviation_from_median_bps": 40.0,
+                "max_cross_source_divergence_bps": 100.0,
+            },
+        ):
+            with self.subTest(changes=changes):
+                with self.assertRaises(PolicyConfigurationError):
+                    replace(loaded, **changes).validate_v1_safety()
+
+    def test_two_source_pairwise_limit_equals_fifty_bps_from_median(self) -> None:
+        loaded = policy()
+        left, right = 99.5, 100.5
+        midpoint_median = (left + right) / 2.0
+        pairwise_bps = abs(left - right) / midpoint_median * 10_000.0
+        per_source_bps = max(
+            abs(left - midpoint_median),
+            abs(right - midpoint_median),
+        ) / midpoint_median * 10_000.0
+
+        self.assertAlmostEqual(pairwise_bps, 100.0)
+        self.assertAlmostEqual(per_source_bps, 50.0)
+        self.assertEqual(
+            pairwise_bps,
+            loaded.max_pairwise_reference_price_divergence_bps,
+        )
+        self.assertEqual(
+            per_source_bps,
+            loaded.max_reference_price_deviation_from_median_bps,
+        )
+
     def test_consensus_overlap_is_the_exact_versioned_window(self) -> None:
         loaded = policy()
         self.assertEqual(loaded.min_consensus_overlap, 120)
@@ -161,6 +215,7 @@ class PolicyTests(unittest.TestCase):
             interval_minutes=1440,
             quality=self._valid_quality(),
             metrics=self._valid_metrics(),
+            reference_price=self._valid_reference_price(as_of),
             as_of=as_of,
             expires_at=as_of,
             input_fingerprint_sha256="not-a-sha256",
@@ -181,6 +236,7 @@ class PolicyTests(unittest.TestCase):
             interval_minutes=1440,
             quality=self._valid_quality(),
             metrics=self._valid_metrics(),
+            reference_price=self._valid_reference_price(as_of),
             as_of=as_of,
             expires_at=as_of + timedelta(seconds=loaded.report_ttl_seconds + 1),
             input_fingerprint_sha256="a" * 64,
@@ -206,6 +262,103 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(assessment.decision, Decision.NO_SIGNAL)
         self.assertIn("INVALID_RISK_INPUT", assessment.flags)
 
+    def test_malformed_quality_collections_fail_closed_without_crashing(self) -> None:
+        malformed_reports = (
+            replace(self._valid_quality(), flags=None),  # type: ignore[arg-type]
+            replace(self._valid_quality(), critical_flags=None),  # type: ignore[arg-type]
+            replace(
+                self._valid_quality(),
+                critical_flags=(["STALE_DATA"],),  # type: ignore[arg-type,list-item]
+            ),
+        )
+
+        for quality in malformed_reports:
+            with self.subTest(quality=quality):
+                assessment = self._risk_gate_assessment(quality=quality)
+                self.assertTrue(assessment.vetoed)
+                self.assertEqual(assessment.decision, Decision.NO_SIGNAL)
+                self.assertIn("INVALID_RISK_INPUT", assessment.flags)
+
+    def test_risk_gate_independently_rejects_a_stale_reference_price(self) -> None:
+        as_of = datetime(2026, 8, 10, tzinfo=timezone.utc)
+        at_boundary = self._valid_reference_price(
+            as_of,
+            event_time=as_of - timedelta(seconds=300),
+        )
+        after_boundary = as_of + timedelta(microseconds=1)
+        stale = self._valid_reference_price(
+            after_boundary,
+            event_time=as_of - timedelta(seconds=300),
+        )
+
+        accepted = self._risk_gate_assessment(reference_price=at_boundary)
+        rejected = self._risk_gate_assessment(
+            reference_price=stale,
+            as_of=after_boundary,
+        )
+
+        self.assertNotIn("STALE_DATA", accepted.flags)
+        self.assertIn("STALE_DATA", rejected.flags)
+        self.assertTrue(rejected.vetoed)
+        self.assertEqual(rejected.decision, Decision.NO_SIGNAL)
+
+    def test_risk_gate_recomputes_two_source_median_threshold(self) -> None:
+        accepted = self._risk_gate_assessment(
+            reference_price=self._valid_reference_price(
+                datetime(2026, 8, 10, tzinfo=timezone.utc),
+                prices=(99.5, 100.5),
+            )
+        )
+        rejected = self._risk_gate_assessment(
+            reference_price=self._valid_reference_price(
+                datetime(2026, 8, 10, tzinfo=timezone.utc),
+                prices=(99.49, 100.51),
+            )
+        )
+
+        self.assertNotIn("DATA_CONFLICT", accepted.flags)
+        self.assertIn("DATA_CONFLICT", rejected.flags)
+        self.assertTrue(rejected.vetoed)
+
+    def test_risk_gate_requires_exact_reference_price_provenance(self) -> None:
+        as_of = datetime(2026, 8, 10, tzinfo=timezone.utc)
+        snapshot = self._valid_reference_price(as_of)
+        wrong_source = replace(
+            snapshot.observations[1],
+            source="kraken_spot_rest_v1",
+        )
+        rejected = self._risk_gate_assessment(
+            reference_price=replace(
+                snapshot,
+                observations=(snapshot.observations[0], wrong_source),
+            )
+        )
+        missing = self._risk_gate_assessment(reference_price=None)
+
+        self.assertIn("REFERENCE_PRICE_INVALID", rejected.flags)
+        self.assertIn("REFERENCE_PRICE_MISSING", missing.flags)
+        self.assertTrue(rejected.vetoed)
+        self.assertTrue(missing.vetoed)
+
+    def test_risk_gate_rejects_malformed_reference_fields_without_crashing(self) -> None:
+        as_of = datetime(2026, 8, 10, tzinfo=timezone.utc)
+        snapshot = self._valid_reference_price(as_of)
+        malformed = replace(
+            snapshot.observations[0],
+            source=["kraken_spot_rest_v1"],  # type: ignore[arg-type]
+        )
+
+        rejected = self._risk_gate_assessment(
+            reference_price=replace(
+                snapshot,
+                observations=(malformed, snapshot.observations[1]),
+            )
+        )
+
+        self.assertTrue(rejected.vetoed)
+        self.assertEqual(rejected.decision, Decision.NO_SIGNAL)
+        self.assertIn("REFERENCE_PRICE_INVALID", rejected.flags)
+
     @staticmethod
     def _valid_quality() -> DataQualityReport:
         as_of = datetime(2026, 8, 10, tzinfo=timezone.utc)
@@ -214,7 +367,7 @@ class PolicyTests(unittest.TestCase):
             sample_count=120,
             flags=(),
             critical_flags=(),
-            newest_observed_at=as_of - timedelta(days=1),
+            newest_observed_at=as_of - timedelta(hours=12),
             newest_available_at=as_of - timedelta(seconds=1),
         )
 
@@ -237,18 +390,57 @@ class PolicyTests(unittest.TestCase):
         *,
         quality: DataQualityReport | None = None,
         metrics: MarketMetrics | None = None,
+        reference_price: ReferencePriceSnapshot | None | object = ..., 
+        as_of: datetime | None = None,
     ):
-        as_of = datetime(2026, 8, 10, tzinfo=timezone.utc)
+        evaluation_time = as_of or datetime(2026, 8, 10, tzinfo=timezone.utc)
+        selected_reference = (
+            self._valid_reference_price(evaluation_time)
+            if reference_price is ...
+            else reference_price
+        )
         return RiskGate(policy()).evaluate(
             symbol="BTC/USD",
             interval_minutes=1440,
             quality=quality or self._valid_quality(),
             metrics=metrics or self._valid_metrics(),
-            as_of=as_of,
-            expires_at=as_of + timedelta(hours=1),
+            reference_price=selected_reference,  # type: ignore[arg-type]
+            as_of=evaluation_time,
+            expires_at=evaluation_time + timedelta(hours=1),
             input_fingerprint_sha256="a" * 64,
             consensus_passed=True,
             proposed_decision=Decision.ALERT,
+        )
+
+    @staticmethod
+    def _valid_reference_price(
+        as_of: datetime,
+        *,
+        event_time: datetime | None = None,
+        prices: tuple[float, float] = (99.5, 100.5),
+    ) -> ReferencePriceSnapshot:
+        observed_at = event_time or as_of - timedelta(minutes=1)
+        available_at = min(as_of, observed_at + timedelta(seconds=1))
+        return ReferencePriceSnapshot(
+            symbol="BTC/USD",
+            observations=(
+                ReferencePriceObservation(
+                    symbol="BTC/USD",
+                    price=prices[0],
+                    event_time=observed_at,
+                    available_at=available_at,
+                    ingested_at=available_at,
+                    source="kraken_spot_rest_v1",
+                ),
+                ReferencePriceObservation(
+                    symbol="BTC/USD",
+                    price=prices[1],
+                    event_time=observed_at,
+                    available_at=available_at,
+                    ingested_at=available_at,
+                    source="coinbase_exchange_spot_rest_v1",
+                ),
+            ),
         )
 
 

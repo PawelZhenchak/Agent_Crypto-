@@ -10,7 +10,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .. import __version__
 from ..deadline import bounded_analysis_timeout, ensure_analysis_deadline
-from ..domain import Candle
+from ..domain import Candle, ReferencePriceObservation
 from .base import ProviderError
 
 
@@ -39,6 +39,8 @@ def urlopen(request: Request, *, timeout: float):  # type: ignore[no-untyped-def
 class KrakenPublicProvider:
     """Public OHLC adapter. It has no code path for private endpoints or credentials."""
 
+    __slots__ = ("_base_url", "_timeout_seconds", "_configuration_sealed")
+
     source_id = "kraken_spot_rest_v1"
     _immutable_configuration_attributes = frozenset(
         {
@@ -64,18 +66,12 @@ class KrakenPublicProvider:
     }
 
     def __setattr__(self, name: str, value: object) -> None:
-        if (
-            getattr(self, "_configuration_sealed", False)
-            and name in type(self)._immutable_configuration_attributes
-        ):
+        if getattr(self, "_configuration_sealed", False):
             raise AttributeError("Kraken provider origin and configuration are immutable")
         object.__setattr__(self, name, value)
 
     def __delattr__(self, name: str) -> None:
-        if (
-            getattr(self, "_configuration_sealed", False)
-            and name in type(self)._immutable_configuration_attributes
-        ):
+        if getattr(self, "_configuration_sealed", False):
             raise AttributeError("Kraken provider origin and configuration are immutable")
         object.__delattr__(self, name)
 
@@ -131,9 +127,48 @@ class KrakenPublicProvider:
             as_of=as_of,
             limit=limit,
         )
+        payload = self._request_ohlc_payload(
+            pair=pair,
+            source_interval_minutes=source_interval_minutes,
+        )
+        return self.parse_payload(
+            payload,
+            symbol=symbol,
+            interval_minutes=interval_minutes,
+            as_of=as_of,
+            limit=limit,
+            source_interval_minutes=source_interval_minutes,
+        )
+
+    def fetch_reference_price(
+        self,
+        *,
+        symbol: str,
+        as_of: datetime,
+    ) -> ReferencePriceObservation:
+        pair = self._pairs.get(symbol)
+        if pair is None:
+            raise ProviderError(f"Unsupported Kraken V1 symbol: {symbol}")
+        self._validate_reference_request(as_of=as_of)
+        payload = self._request_ohlc_payload(
+            pair=pair,
+            source_interval_minutes=1,
+        )
+        return self.parse_reference_price_payload(
+            payload,
+            symbol=symbol,
+            as_of=as_of,
+        )
+
+    def _request_ohlc_payload(
+        self,
+        *,
+        pair: str,
+        source_interval_minutes: int,
+    ) -> dict[str, Any]:
         query = urlencode({"pair": pair, "interval": source_interval_minutes})
         request = Request(
-            f"{self.base_url}/0/public/OHLC?{query}",
+            f"https://api.kraken.com/0/public/OHLC?{query}",
             headers={"User-Agent": f"crypto-research-agent/{__version__} read-only"},
         )
         try:
@@ -161,13 +196,48 @@ class KrakenPublicProvider:
             raise ProviderError(f"Kraken public data request failed: {exc}") from exc
         if not isinstance(payload, dict):
             raise ProviderError("Kraken response root must be an object")
-        return self.parse_payload(
-            payload,
+        return payload
+
+    def parse_reference_price_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        symbol: str,
+        as_of: datetime,
+    ) -> ReferencePriceObservation:
+        self._validate_reference_request(as_of=as_of)
+        series = self._extract_ohlc_series(payload, symbol=symbol)
+        expected_close = as_of.replace(second=0, microsecond=0)
+        matches: list[float] = []
+        # Kraken documents the last row as the current, not-yet-committed candle.
+        for row in series[:-1]:
+            if not isinstance(row, list) or len(row) < 7:
+                raise ProviderError("Malformed Kraken OHLC row")
+            try:
+                open_time = datetime.fromtimestamp(int(row[0]), tz=timezone.utc)
+                close_time = open_time + timedelta(minutes=1)
+                price = float(row[4])
+            except (TypeError, ValueError, OverflowError, OSError) as exc:
+                raise ProviderError("Malformed Kraken OHLC value") from exc
+            if not math.isfinite(price) or price <= 0:
+                raise ProviderError("Kraken reference price must be positive and finite")
+            if close_time == expected_close:
+                matches.append(price)
+        if not matches:
+            raise ProviderError(
+                "Kraken returned no completed one-minute reference candle",
+                code="REFERENCE_PRICE_UNAVAILABLE",
+            )
+        if any(item != matches[0] for item in matches[1:]):
+            raise ProviderError("Conflicting duplicate Kraken reference candle")
+        ingested_at = datetime.now(timezone.utc)
+        return ReferencePriceObservation(
             symbol=symbol,
-            interval_minutes=interval_minutes,
-            as_of=as_of,
-            limit=limit,
-            source_interval_minutes=source_interval_minutes,
+            price=matches[0],
+            event_time=expected_close,
+            available_at=ingested_at,
+            ingested_at=ingested_at,
+            source=self.source_id,
         )
 
     def parse_payload(
@@ -189,20 +259,7 @@ class KrakenPublicProvider:
             source_interval_minutes = expected_source_interval
         if source_interval_minutes != expected_source_interval:
             raise ProviderError("Kraken source interval does not match the target interval")
-        errors = payload.get("error") or []
-        if not isinstance(errors, list):
-            raise ProviderError("Kraken error field must be an array")
-        if errors:
-            raise ProviderError(f"Kraken returned errors: {errors}")
-        result = payload.get("result")
-        if not isinstance(result, dict):
-            raise ProviderError("Kraken response has no result object")
-        data_keys = [key for key in result if key != "last"]
-        if len(data_keys) != 1 or data_keys[0] not in self._result_keys.get(symbol, set()):
-            raise ProviderError("Kraken response pair does not match the requested symbol")
-        series = result[data_keys[0]]
-        if not isinstance(series, list):
-            raise ProviderError("Kraken response has no OHLC series")
+        series = self._extract_ohlc_series(payload, symbol=symbol)
 
         ingested_at = datetime.now(timezone.utc)
         source_step = timedelta(minutes=source_interval_minutes)
@@ -241,6 +298,30 @@ class KrakenPublicProvider:
             return source_candles[-limit:]
         raise ProviderError("Kraken source interval does not match the target interval")
 
+    def _extract_ohlc_series(
+        self,
+        payload: dict[str, Any],
+        *,
+        symbol: str,
+    ) -> list[Any]:
+        if not isinstance(payload, dict):
+            raise ProviderError("Kraken response root must be an object")
+        errors = payload.get("error") or []
+        if not isinstance(errors, list):
+            raise ProviderError("Kraken error field must be an array")
+        if errors:
+            raise ProviderError(f"Kraken returned errors: {errors}")
+        result = payload.get("result")
+        if not isinstance(result, dict):
+            raise ProviderError("Kraken response has no result object")
+        data_keys = [key for key in result if key != "last"]
+        if len(data_keys) != 1 or data_keys[0] not in self._result_keys.get(symbol, set()):
+            raise ProviderError("Kraken response pair does not match the requested symbol")
+        series = result[data_keys[0]]
+        if not isinstance(series, list):
+            raise ProviderError("Kraken response has no OHLC series")
+        return series
+
     def _validate_request(
         self,
         *,
@@ -256,3 +337,8 @@ class KrakenPublicProvider:
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 720:
             raise ProviderError("Kraken limit must be an integer between 1 and 720")
         return source_interval
+
+    @staticmethod
+    def _validate_reference_request(*, as_of: datetime) -> None:
+        if as_of.tzinfo is None or as_of.utcoffset() != timedelta(0):
+            raise ProviderError("as_of must be timezone-aware and normalized to UTC")

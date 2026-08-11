@@ -11,7 +11,26 @@ from typing import Any
 from uuid import uuid4
 
 from .consensus_math import CONSENSUS_WINDOW_SIZE
-from .domain import DataQualityReport, Decision, MarketMetrics, Regime, RiskAssessment
+from .domain import (
+    DataQualityReport,
+    Decision,
+    MarketMetrics,
+    ReferencePriceObservation,
+    ReferencePriceSnapshot,
+    Regime,
+    RiskAssessment,
+)
+from .reference_price import (
+    ReferencePriceInput,
+    ReferencePriceMathError,
+    build_reference_price_snapshot,
+)
+
+
+_APPROVED_REFERENCE_SOURCE_VENUES = {
+    "kraken_spot_rest_v1": "kraken",
+    "coinbase_exchange_spot_rest_v1": "coinbase",
+}
 
 
 class PolicyConfigurationError(ValueError):
@@ -21,6 +40,7 @@ class PolicyConfigurationError(ValueError):
 @dataclass(frozen=True, slots=True)
 class RiskPolicy:
     policy_id: str
+    policy_schema_version: int
     mode: str
     execution_enabled: bool
     allowed_decisions: tuple[str, ...]
@@ -29,6 +49,7 @@ class RiskPolicy:
     min_samples: int
     min_data_quality: float
     max_staleness_multiplier: float
+    max_reference_price_age_seconds: int
     max_gap_multiplier: float
     max_annualized_volatility: float
     max_absolute_period_return: float
@@ -36,6 +57,7 @@ class RiskPolicy:
     max_clock_skew_seconds: int
     min_consensus_sources: int
     min_consensus_overlap: int
+    max_reference_price_deviation_from_median_bps: float
     max_cross_source_divergence_bps: float
     max_cross_source_ohlc_divergence_bps: float
     max_cross_source_volume_zscore_delta: float
@@ -55,6 +77,10 @@ class RiskPolicy:
         )
         policy = cls(**_normalize(payload))
         policy.validate_v1_safety()
+        if policy.policy_schema_version != 2:
+            raise PolicyConfigurationError(
+                "Legacy policies are replay-only and cannot be loaded for a current run"
+            )
         return policy
 
     def validate_v1_safety(self) -> None:
@@ -64,6 +90,16 @@ class RiskPolicy:
             type(self.min_consensus_overlap) is int
             and self.min_consensus_overlap == CONSENSUS_WINDOW_SIZE
         )
+        legacy_replay_policy = bool(
+            self.policy_id == "v1-read-only-2026-08-10"
+            and type(self.policy_schema_version) is int
+            and self.policy_schema_version == 1
+        )
+        if not legacy_replay_policy and (
+            type(self.policy_schema_version) is not int
+            or self.policy_schema_version != 2
+        ):
+            errors.append("V1 policy_schema_version must be 2 (or archived replay v1)")
         if self.mode != "V1_READ_ONLY":
             errors.append("V1 requires mode=V1_READ_ONLY")
         if self.execution_enabled is not False:
@@ -89,6 +125,11 @@ class RiskPolicy:
             errors.append("min_samples must be an integer in [60, 720]")
         if not _finite_between(self.max_staleness_multiplier, 0.5, 1.25):
             errors.append("max_staleness_multiplier must be finite and in [0.5, 1.25]")
+        if (
+            type(self.max_reference_price_age_seconds) is not int
+            or self.max_reference_price_age_seconds != 300
+        ):
+            errors.append("V1 reference price age must be exactly 300 seconds")
         if not _finite_between(self.max_gap_multiplier, 1.0, 1.5):
             errors.append("max_gap_multiplier must be finite and in [1.0, 1.5]")
         if not _finite_between(self.max_annualized_volatility, 0.1, 2.0):
@@ -109,9 +150,31 @@ class RiskPolicy:
                 f"V1.1 min_consensus_overlap must equal the versioned "
                 f"{CONSENSUS_WINDOW_SIZE}-candle window"
             )
+        if not _finite_between(
+            self.max_reference_price_deviation_from_median_bps,
+            1.0,
+            50.0,
+        ):
+            errors.append(
+                "BTC/ETH reference-price deviation from the median must be finite "
+                "and in [1.0, 50.0] bps"
+            )
         if not _finite_between(self.max_cross_source_divergence_bps, 1.0, 100.0):
             errors.append(
                 "max_cross_source_divergence_bps must be finite and in [1.0, 100.0]"
+            )
+        elif (
+            _finite_between(
+                self.max_reference_price_deviation_from_median_bps,
+                1.0,
+                50.0,
+            )
+            and self.max_cross_source_divergence_bps
+            > 2.0 * self.max_reference_price_deviation_from_median_bps
+        ):
+            errors.append(
+                "pairwise reference-price divergence cannot exceed twice the "
+                "per-source deviation from the two-source median"
             )
         if not _finite_between(self.max_cross_source_ohlc_divergence_bps, 1.0, 500.0):
             errors.append(
@@ -133,10 +196,30 @@ class RiskPolicy:
             raise PolicyConfigurationError("; ".join(errors))
 
     def fingerprint(self) -> str:
+        document = asdict(self)
+        # Archived 0.1.2 canonical rows are replayed against the exact immutable r1
+        # document bytes. Compatibility loading injects safe runtime-only defaults,
+        # but those fields were not part of the original fingerprint contract.
+        if (
+            self.policy_id == "v1-read-only-2026-08-10"
+            and self.policy_schema_version == 1
+        ):
+            document.pop("policy_schema_version")
+            document.pop("max_reference_price_age_seconds")
+            document.pop("max_reference_price_deviation_from_median_bps")
         encoded = json.dumps(
-            asdict(self), sort_keys=True, separators=(",", ":"), allow_nan=False
+            document, sort_keys=True, separators=(",", ":"), allow_nan=False
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
+
+    @property
+    def max_pairwise_reference_price_divergence_bps(self) -> float:
+        """Effective two-source limit equivalent to deviation from the midpoint median."""
+
+        return min(
+            float(self.max_cross_source_divergence_bps),
+            2.0 * float(self.max_reference_price_deviation_from_median_bps),
+        )
 
 
 class RiskGate:
@@ -144,6 +227,10 @@ class RiskGate:
 
     def __init__(self, policy: RiskPolicy) -> None:
         policy.validate_v1_safety()
+        if policy.policy_schema_version != 2:
+            raise PolicyConfigurationError(
+                "Legacy risk policies are replay-only and cannot evaluate new decisions"
+            )
         self.policy = policy
 
     def evaluate(
@@ -153,6 +240,7 @@ class RiskGate:
         interval_minutes: int,
         quality: DataQualityReport,
         metrics: MarketMetrics | None,
+        reference_price: ReferencePriceSnapshot | None,
         as_of: datetime,
         expires_at: datetime,
         input_fingerprint_sha256: str,
@@ -160,13 +248,23 @@ class RiskGate:
         proposed_decision: Decision = Decision.NO_SIGNAL,
         proposal_reasons: tuple[str, ...] = (),
     ) -> RiskAssessment:
-        quality_is_structured = isinstance(quality, DataQualityReport)
-        flags = list(quality.flags) if quality_is_structured else []
+        quality_is_structured = type(quality) is DataQualityReport
+        quality_structurally_valid = quality_is_structured and _valid_quality_input(
+            quality, as_of
+        )
+        flags = list(quality.flags) if quality_structurally_valid else []
         reasons: list[str] = []
         invalid_input_reasons: list[str] = []
 
-        quality_valid = quality_is_structured and _valid_quality_input(quality, as_of)
-        metrics_valid = metrics is not None and _valid_metrics_input(metrics)
+        quality_valid = quality_structurally_valid
+        reference_flags, reference_reasons = _reference_price_failures(
+            reference_price,
+            symbol=symbol,
+            as_of=as_of,
+            policy=self.policy,
+        )
+        reference_price_valid = not reference_flags
+        metrics_valid = type(metrics) is MarketMetrics and _valid_metrics_input(metrics)
         time_valid = (
             _is_utc_datetime(as_of)
             and _is_utc_datetime(expires_at)
@@ -186,6 +284,8 @@ class RiskGate:
 
         if not quality_valid:
             invalid_input_reasons.append("DataQualityReport failed independent validation.")
+        flags.extend(reference_flags)
+        reasons.extend(reference_reasons)
         if metrics is not None and not metrics_valid:
             invalid_input_reasons.append("MarketMetrics contains invalid or non-finite values.")
         if not time_valid:
@@ -218,7 +318,7 @@ class RiskGate:
         if not quality_valid or quality.score < self.policy.min_data_quality:
             flags.append("LOW_DATA_QUALITY")
             reasons.append("Data quality score is below policy threshold.")
-        if quality_is_structured and quality.critical_flags:
+        if quality_structurally_valid and quality.critical_flags:
             reasons.append("Critical data-quality veto is active.")
 
         if not metrics_valid:
@@ -243,9 +343,13 @@ class RiskGate:
             "EXTREME_PERIOD_MOVE",
             "CONSENSUS_REQUIRED",
             "INVALID_RISK_INPUT",
-            *(quality.critical_flags if quality_is_structured else ()),
+            "REFERENCE_PRICE_INVALID",
+            "REFERENCE_PRICE_MISSING",
+            "STALE_DATA",
+            "DATA_CONFLICT",
+            *(quality.critical_flags if quality_structurally_valid else ()),
         }
-        vetoed = any(flag in veto_flags for flag in flags)
+        vetoed = not reference_price_valid or any(flag in veto_flags for flag in flags)
         decision = Decision.NO_SIGNAL if vetoed or not decision_valid else proposed_decision
         if not reasons:
             reasons.extend(
@@ -306,37 +410,142 @@ def _is_utc_datetime(value: Any) -> bool:
 
 
 def _valid_quality_input(quality: DataQualityReport, as_of: datetime) -> bool:
-    if (
-        isinstance(quality.score, bool)
-        or not isinstance(quality.score, (int, float))
-        or not math.isfinite(float(quality.score))
-        or not 0.0 <= float(quality.score) <= 1.0
-        or isinstance(quality.sample_count, bool)
-        or not isinstance(quality.sample_count, int)
-        or quality.sample_count < 0
-        or not all(isinstance(flag, str) and flag for flag in quality.flags)
-        or not all(isinstance(flag, str) and flag for flag in quality.critical_flags)
-        or not set(quality.critical_flags).issubset(quality.flags)
-        or not _is_utc_datetime(as_of)
-    ):
-        return False
-    if quality.sample_count > 0 and (
-        quality.newest_observed_at is None
-        or quality.newest_available_at is None
-    ):
-        return False
-    for timestamp in (quality.newest_observed_at, quality.newest_available_at):
-        if timestamp is not None and (
-            not _is_utc_datetime(timestamp) or timestamp > as_of
+    try:
+        if (
+            type(quality) is not DataQualityReport
+            or isinstance(quality.score, bool)
+            or not isinstance(quality.score, (int, float))
+            or not math.isfinite(float(quality.score))
+            or not 0.0 <= float(quality.score) <= 1.0
+            or isinstance(quality.sample_count, bool)
+            or not isinstance(quality.sample_count, int)
+            or quality.sample_count < 0
+            or type(quality.flags) is not tuple
+            or type(quality.critical_flags) is not tuple
+            or not all(type(flag) is str and flag for flag in quality.flags)
+            or not all(type(flag) is str and flag for flag in quality.critical_flags)
+            or not set(quality.critical_flags).issubset(quality.flags)
+            or not _is_utc_datetime(as_of)
         ):
             return False
-    if (
-        quality.newest_observed_at is not None
-        and quality.newest_available_at is not None
-        and quality.newest_observed_at > quality.newest_available_at
-    ):
+        if quality.sample_count > 0 and (
+            quality.newest_observed_at is None
+            or quality.newest_available_at is None
+        ):
+            return False
+        for timestamp in (quality.newest_observed_at, quality.newest_available_at):
+            if timestamp is not None and (
+                not _is_utc_datetime(timestamp) or timestamp > as_of
+            ):
+                return False
+        if (
+            quality.newest_observed_at is not None
+            and quality.newest_available_at is not None
+            and quality.newest_observed_at > quality.newest_available_at
+        ):
+            return False
+    except (AttributeError, TypeError, ValueError):
         return False
     return True
+
+
+def _reference_price_failures(
+    snapshot: ReferencePriceSnapshot | None,
+    *,
+    symbol: str,
+    as_of: datetime,
+    policy: RiskPolicy,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Recompute the complete two-venue reference-price safety contract."""
+
+    if snapshot is None:
+        return (
+            ("REFERENCE_PRICE_MISSING",),
+            ("Two-venue reference-price evidence is missing.",),
+        )
+    if not isinstance(snapshot, ReferencePriceSnapshot):
+        return (
+            ("REFERENCE_PRICE_INVALID",),
+            ("Reference-price evidence has an invalid structure.",),
+        )
+    try:
+        observations = snapshot.observations
+        structure_valid = bool(
+            type(snapshot) is ReferencePriceSnapshot
+            and type(snapshot.symbol) is str
+            and snapshot.symbol == symbol
+            and type(observations) is tuple
+            and len(observations) == 2
+            and all(
+                type(item) is ReferencePriceObservation
+                and type(item.source) is str
+                and type(item.symbol) is str
+                and item.symbol == symbol
+                and not isinstance(item.price, bool)
+                and isinstance(item.price, (int, float))
+                for item in observations
+            )
+            and {item.source for item in observations}
+            == set(_APPROVED_REFERENCE_SOURCE_VENUES)
+        )
+    except (AttributeError, TypeError, ValueError):
+        structure_valid = False
+    if not structure_valid:
+        return (
+            ("REFERENCE_PRICE_INVALID",),
+            ("Reference price does not have the exact approved two-venue provenance.",),
+        )
+    if not _is_utc_datetime(as_of):
+        return (
+            ("REFERENCE_PRICE_INVALID",),
+            ("Reference-price decision time is not normalized UTC.",),
+        )
+
+    try:
+        build_reference_price_snapshot(
+            tuple(
+                ReferencePriceInput(
+                    source_id=observation.source,
+                    venue_id=_APPROVED_REFERENCE_SOURCE_VENUES[observation.source],
+                    symbol=observation.symbol,
+                    open_time=observation.event_time - timedelta(minutes=1),
+                    close_time=observation.event_time,
+                    price=observation.price,
+                    available_at=observation.available_at,
+                    ingested_at=observation.ingested_at,
+                )
+                for observation in observations
+            ),
+            cutoff_as_of=as_of,
+            evaluated_at=as_of,
+            max_age_seconds=policy.max_reference_price_age_seconds,
+            max_deviation_from_median_bps=(
+                policy.max_reference_price_deviation_from_median_bps
+            ),
+            max_market_price=policy.max_market_price,
+            approved_source_venues=_APPROVED_REFERENCE_SOURCE_VENUES,
+        )
+    except ReferencePriceMathError as exc:
+        if exc.code == "REFERENCE_PRICE_STALE":
+            return (
+                ("STALE_DATA",),
+                ("Reference price is older than the V1 five-minute safety limit.",),
+            )
+        if exc.code == "REFERENCE_PRICE_DIVERGENCE":
+            return (
+                ("DATA_CONFLICT",),
+                ("Reference-price venues exceed the BTC/ETH 50-bps median limit.",),
+            )
+        return (
+            ("REFERENCE_PRICE_INVALID",),
+            ("Reference-price evidence failed deterministic validation.",),
+        )
+    except (AttributeError, KeyError, OverflowError, TypeError, ValueError):
+        return (
+            ("REFERENCE_PRICE_INVALID",),
+            ("Reference-price evidence failed deterministic validation.",),
+        )
+    return (), ()
 
 
 def _valid_metrics_input(metrics: MarketMetrics) -> bool:

@@ -31,6 +31,13 @@ from .postgres import (
 )
 from .providers.coinbase import CoinbaseExchangePublicProvider
 from .providers.kraken import KrakenPublicProvider
+from .reference_price import (
+    REFERENCE_PRICE_ALGORITHM_VERSION,
+    ReferencePriceInput,
+    ReferencePriceMathError,
+    ReferencePriceResult,
+    build_reference_price_snapshot,
+)
 
 
 SUPPORTED_CANONICAL_ALGORITHM = CONSENSUS_ALGORITHM_VERSION
@@ -39,6 +46,20 @@ APPROVED_SOURCE_VENUES = {
     KrakenPublicProvider.source_id: "kraken",
     CoinbaseExchangePublicProvider.source_id: "coinbase",
 }
+LEGACY_R1_POLICY_ID = "v1-read-only-2026-08-10"
+LEGACY_R1_POLICY_HASH = (
+    "9d01dff8aa6832222e0cb2c11cfb2d45d48a6e2d7885f41f4cfa0adf83c2e9ee"
+)
+_LEGACY_R1_POLICY_FIELDS = frozenset(
+    field
+    for field in RiskPolicy.__dataclass_fields__
+    if field
+    not in {
+        "policy_schema_version",
+        "max_reference_price_age_seconds",
+        "max_reference_price_deviation_from_median_bps",
+    }
+)
 
 
 class IngestError(RuntimeError):
@@ -59,6 +80,124 @@ class PersistedCandle:
     revision_no: int
     content_hash: str
     inserted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PersistedReferencePrice:
+    reference_price_id: int
+    content_hash: str
+    inserted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ReferencePriceDraft:
+    """Untrusted reference-price claim backed by exactly two raw one-minute rows."""
+
+    canonical_market_id: int
+    risk_policy_id: int
+    symbol: str
+    event_time: datetime
+    median_price: Decimal
+    pairwise_divergence_bps: Decimal
+    max_deviation_from_median_bps: Decimal
+    algorithm_version: str
+    policy_hash: str
+    source_candle_ids: tuple[int, int]
+
+    def __post_init__(self) -> None:
+        if self.canonical_market_id <= 0 or self.risk_policy_id <= 0:
+            raise IngestValidationError(
+                "Reference-price market and risk policy ids must be positive"
+            )
+        if not self.symbol.strip():
+            raise IngestValidationError("Reference-price symbol must not be empty")
+        _require_utc(self.event_time, "event_time")
+        if self.algorithm_version != REFERENCE_PRICE_ALGORITHM_VERSION:
+            raise IngestValidationError("Reference-price algorithm is unsupported")
+        if not _is_sha256(self.policy_hash):
+            raise IngestValidationError(
+                "Reference-price policy_hash must be a lowercase SHA-256 digest"
+            )
+        if (
+            len(self.source_candle_ids) != len(APPROVED_SOURCE_VENUES)
+            or len(set(self.source_candle_ids)) != len(APPROVED_SOURCE_VENUES)
+            or any(candle_id <= 0 for candle_id in self.source_candle_ids)
+        ):
+            raise IngestValidationError(
+                "Reference price requires exactly two distinct positive source candle ids"
+            )
+        numeric_values = (
+            self.median_price,
+            self.pairwise_divergence_bps,
+            self.max_deviation_from_median_bps,
+        )
+        if any(not isinstance(value, Decimal) for value in numeric_values):
+            raise IngestValidationError(
+                "Reference-price values must be Decimal instances"
+            )
+        if any(not value.is_finite() for value in numeric_values):
+            raise IngestValidationError("Reference-price values must be finite")
+        if self.median_price <= 0:
+            raise IngestValidationError("Reference-price median must be positive")
+        if self.pairwise_divergence_bps < 0 or self.max_deviation_from_median_bps < 0:
+            raise IngestValidationError("Reference-price divergence must be non-negative")
+
+    @classmethod
+    def from_numbers(
+        cls,
+        *,
+        canonical_market_id: int,
+        risk_policy_id: int,
+        symbol: str,
+        event_time: datetime,
+        median_price: int | float | Decimal,
+        pairwise_divergence_bps: int | float | Decimal,
+        max_deviation_from_median_bps: int | float | Decimal,
+        algorithm_version: str,
+        policy_hash: str,
+        source_candle_ids: Sequence[int],
+    ) -> ReferencePriceDraft:
+        return cls(
+            canonical_market_id=canonical_market_id,
+            risk_policy_id=risk_policy_id,
+            symbol=symbol,
+            event_time=event_time,
+            median_price=_decimal(median_price, "median_price"),
+            pairwise_divergence_bps=_decimal(
+                pairwise_divergence_bps,
+                "pairwise_divergence_bps",
+            ),
+            max_deviation_from_median_bps=_decimal(
+                max_deviation_from_median_bps,
+                "max_deviation_from_median_bps",
+            ),
+            algorithm_version=algorithm_version,
+            policy_hash=policy_hash,
+            source_candle_ids=cast(tuple[int, int], tuple(source_candle_ids)),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ReferencePriceRecord:
+    reference_price_id: int
+    canonical_market_id: int
+    risk_policy_id: int
+    symbol: str
+    event_time: datetime
+    cutoff_as_of: datetime
+    evaluated_at: datetime
+    median_price: Decimal
+    pairwise_divergence_bps: Decimal
+    max_deviation_from_median_bps: Decimal
+    algorithm_version: str
+    policy_hash: str
+    available_at: datetime
+    ingested_at: datetime
+    inputs_hash: str
+    evidence_hash: str
+    content_hash: str
+    source_candle_ids: tuple[int, int]
+    source_candle_receipt_ids: tuple[int, int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,6 +358,23 @@ class _CanonicalSeries:
 
 
 @dataclass(frozen=True, slots=True)
+class _ReferencePriceScope:
+    canonical_market_id: int
+    risk_policy_id: int
+    canonical_symbol: str
+    policy_hash: str
+    exchange_id: int
+    base_asset_id: int
+    quote_asset_id: int
+    instrument_type: str
+    policy_effective_from: datetime
+    policy_effective_to: datetime | None
+    registry_available_at: datetime
+    registry_ingested_at: datetime
+    risk_policy: RiskPolicy
+
+
+@dataclass(frozen=True, slots=True)
 class _RawCandleRow:
     candle_id: int
     market_id: int
@@ -248,6 +404,13 @@ class _RawCandleRow:
     source_key: str
     canonical_symbol: str
     venue_symbol: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ReferencePriceRawRow:
+    candle: _RawCandleRow
+    source_candle_receipt_id: int
+    provider_ingested_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -414,6 +577,284 @@ class PointInTimeCandleRepository:
             raise PostgresOperationError("PostgreSQL source candle ingest failed") from None
         return tuple(results)
 
+    def append_reference_price(
+        self,
+        draft: ReferencePriceDraft,
+        *,
+        cutoff_as_of: datetime,
+        evaluated_at: datetime,
+    ) -> PersistedReferencePrice:
+        """Derive and append one immutable two-venue reference-price manifest."""
+
+        _require_utc(cutoff_as_of, "cutoff_as_of")
+        _require_utc(evaluated_at, "evaluated_at")
+        captured_at = self._clock()
+        _require_utc(captured_at, "clock")
+        if not cutoff_as_of <= evaluated_at <= captured_at:
+            raise IngestValidationError(
+                "Reference-price lineage must satisfy cutoff<=evaluated<=captured"
+            )
+
+        try:
+            with transaction(self._connection_factory) as connection, cursor(
+                connection
+            ) as db_cursor:
+                scope = _load_reference_price_scope(
+                    db_cursor,
+                    canonical_market_id=draft.canonical_market_id,
+                    risk_policy_id=draft.risk_policy_id,
+                    policy_hash=draft.policy_hash,
+                    symbol=draft.symbol,
+                    evaluated_at=evaluated_at,
+                )
+                if scope is None:
+                    raise IngestValidationError(
+                        "Reference-price market or current policy is unavailable"
+                    )
+                reference_key = _reference_price_record_key(
+                    draft,
+                    cutoff_as_of=cutoff_as_of,
+                    evaluated_at=evaluated_at,
+                )
+                _advisory_lock(db_cursor, f"reference-price:{reference_key}")
+                db_cursor.execute(
+                    """
+                    SELECT reference_price_id, canonical_market_id, risk_policy_id,
+                           symbol, algorithm_version, policy_hash, event_time,
+                           cutoff_as_of, evaluated_at, median_price,
+                           pairwise_divergence_bps,
+                           max_deviation_from_median_bps, inputs_hash, evidence_hash,
+                           available_at, ingested_at, content_hash
+                    FROM crypto_agent.reference_price_manifests
+                    WHERE reference_key = %s
+                    """,
+                    (reference_key,),
+                )
+                existing = db_cursor.fetchone()
+                replay_captured_at = captured_at
+                if existing is not None:
+                    replay_captured_at = _datetime_value(
+                        existing,
+                        "ingested_at",
+                        15,
+                    )
+                    if not evaluated_at <= replay_captured_at <= captured_at:
+                        raise PersistenceInvariantError(
+                            "Existing reference-price capture time is invalid"
+                        )
+                raw_rows = _derive_reference_price_universe(
+                    db_cursor,
+                    scope=scope,
+                    event_time=draft.event_time,
+                    cutoff_as_of=cutoff_as_of,
+                    evaluated_at=evaluated_at,
+                    captured_at=replay_captured_at,
+                )
+                computed = _recompute_reference_price(
+                    raw_rows,
+                    scope=scope,
+                    cutoff_as_of=cutoff_as_of,
+                    evaluated_at=evaluated_at,
+                )
+                _verify_reference_price_draft(draft, scope, raw_rows, computed)
+
+                source_provenance = tuple(
+                    sorted(
+                        (
+                            item.candle.candle_id,
+                            item.source_candle_receipt_id,
+                        )
+                        for item in raw_rows
+                    )
+                )
+                inputs_hash = _reference_price_inputs_hash(
+                    raw_rows,
+                    scope=scope,
+                )
+                evidence_hash = _reference_price_evidence_hash(
+                    scope=scope,
+                    cutoff_as_of=cutoff_as_of,
+                    evaluated_at=evaluated_at,
+                    computed=computed,
+                    inputs_hash=inputs_hash,
+                )
+                content_hash = _reference_price_content_hash(
+                    reference_key=reference_key,
+                    scope=scope,
+                    computed=computed,
+                    inputs_hash=inputs_hash,
+                    evidence_hash=evidence_hash,
+                )
+                expected = _reference_manifest_values(
+                    reference_key=reference_key,
+                    scope=scope,
+                    computed=computed,
+                    cutoff_as_of=cutoff_as_of,
+                    evaluated_at=evaluated_at,
+                    inputs_hash=inputs_hash,
+                    evidence_hash=evidence_hash,
+                    captured_at=replay_captured_at,
+                    content_hash=content_hash,
+                )
+
+                if existing is None:
+                    db_cursor.execute(
+                        """
+                        INSERT INTO crypto_agent.reference_price_manifests (
+                            reference_key, canonical_market_id, risk_policy_id,
+                            symbol, algorithm_version, policy_hash, event_time,
+                            cutoff_as_of, evaluated_at, median_price,
+                            pairwise_divergence_bps,
+                            max_deviation_from_median_bps, inputs_hash, evidence_hash,
+                            available_at, ingested_at, content_hash
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, %s, %s,
+                            %s, %s, %s, %s, %s, %s, %s,
+                            %s, %s, %s
+                        )
+                        RETURNING reference_price_id
+                        """,
+                        expected,
+                    )
+                    inserted_row = db_cursor.fetchone()
+                    if inserted_row is None:
+                        raise PersistenceInvariantError(
+                            "Reference-price insert returned no identity"
+                        )
+                    reference_price_id = int(
+                        _row_value(inserted_row, "reference_price_id", 0)
+                    )
+                    inserted = True
+                else:
+                    reference_price_id = _verify_existing_reference_manifest(
+                        existing,
+                        expected=expected,
+                    )
+                    inserted = False
+
+                _ensure_reference_price_provenance(
+                    db_cursor,
+                    reference_price_id=reference_price_id,
+                    source_provenance=source_provenance,
+                    linked_at=replay_captured_at,
+                )
+                return PersistedReferencePrice(
+                    reference_price_id=reference_price_id,
+                    content_hash=content_hash,
+                    inserted=inserted,
+                )
+        except (IngestError, PostgresError):
+            raise
+        except Exception:
+            raise PostgresOperationError(
+                "PostgreSQL reference-price ingest failed"
+            ) from None
+
+    def load_reference_price(
+        self,
+        *,
+        reference_price_id: int,
+        as_of: datetime,
+    ) -> ReferencePriceRecord:
+        """Load and independently replay one persisted reference-price manifest."""
+
+        if reference_price_id <= 0:
+            raise IngestValidationError("reference_price_id must be positive")
+        _require_utc(as_of, "as_of")
+        try:
+            with transaction(self._connection_factory) as connection, cursor(
+                connection
+            ) as db_cursor:
+                db_cursor.execute(
+                    """
+                    SELECT reference_price_id, reference_key, canonical_market_id,
+                           risk_policy_id, symbol, algorithm_version, policy_hash,
+                           event_time, cutoff_as_of, evaluated_at, median_price,
+                           pairwise_divergence_bps,
+                           max_deviation_from_median_bps, inputs_hash, evidence_hash,
+                           available_at, ingested_at, content_hash
+                    FROM crypto_agent.reference_price_manifests
+                    WHERE reference_price_id = %s
+                      AND available_at <= %s
+                      AND ingested_at <= %s
+                    """,
+                    (reference_price_id, as_of, as_of),
+                )
+                manifest = db_cursor.fetchone()
+                if manifest is None:
+                    raise IngestValidationError(
+                        "Reference-price manifest is unavailable at as_of"
+                    )
+                evaluated_at = _datetime_value(manifest, "evaluated_at", 9)
+                scope = _load_reference_price_scope(
+                    db_cursor,
+                    canonical_market_id=int(
+                        _row_value(manifest, "canonical_market_id", 2)
+                    ),
+                    risk_policy_id=int(_row_value(manifest, "risk_policy_id", 3)),
+                    policy_hash=str(_row_value(manifest, "policy_hash", 6)),
+                    symbol=str(_row_value(manifest, "symbol", 4)),
+                    evaluated_at=evaluated_at,
+                    allow_legacy_replay=False,
+                )
+                if scope is None:
+                    raise PersistenceInvariantError(
+                        "Reference-price policy scope is unavailable at evaluation time"
+                    )
+                captured_at = _datetime_value(manifest, "ingested_at", 16)
+                cutoff_as_of = _datetime_value(manifest, "cutoff_as_of", 8)
+                eligible_rows = _derive_reference_price_universe(
+                    db_cursor,
+                    scope=scope,
+                    event_time=_datetime_value(manifest, "event_time", 7),
+                    cutoff_as_of=cutoff_as_of,
+                    evaluated_at=evaluated_at,
+                    captured_at=captured_at,
+                )
+                raw_rows = _load_reference_price_provenance(
+                    db_cursor,
+                    reference_price_id=reference_price_id,
+                    evaluated_at=evaluated_at,
+                    captured_at=captured_at,
+                )
+                eligible_identity = tuple(
+                    sorted(
+                        (
+                            item.candle.candle_id,
+                            item.candle.content_hash,
+                            item.source_candle_receipt_id,
+                            item.provider_ingested_at,
+                        )
+                        for item in eligible_rows
+                    )
+                )
+                linked_identity = tuple(
+                    sorted(
+                        (
+                            item.candle.candle_id,
+                            item.candle.content_hash,
+                            item.source_candle_receipt_id,
+                            item.provider_ingested_at,
+                        )
+                        for item in raw_rows
+                    )
+                )
+                if linked_identity != eligible_identity:
+                    raise PersistenceInvariantError(
+                        "Reference-price provenance differs from its DB-derived universe"
+                    )
+        except (IngestError, PostgresError):
+            raise
+        except Exception:
+            raise PostgresOperationError(
+                "PostgreSQL reference-price query failed"
+            ) from None
+        return _verify_loaded_reference_price_manifest(
+            manifest,
+            scope=scope,
+            raw_rows=raw_rows,
+        )
+
     def append_canonical_candle(
         self,
         draft: CanonicalCandleDraft,
@@ -441,6 +882,11 @@ class PointInTimeCandleRepository:
                 )
                 if series is None:
                     raise IngestValidationError("Canonical series is unavailable at as_of")
+                if series.risk_policy.policy_schema_version != 2:
+                    raise IngestValidationError(
+                        "Archived policy revisions are replay-only and cannot create "
+                        "canonical candles"
+                    )
                 raw_rows = _derive_raw_candle_universe(
                     db_cursor,
                     series=series,
@@ -1013,13 +1459,773 @@ def _load_canonical_series(
         risk_policy=policy,
         policy_parameters=ConsensusPolicyParameters(
             min_overlap=CONSENSUS_WINDOW_SIZE,
-            max_close_divergence_bps=policy.max_cross_source_divergence_bps,
+            max_close_divergence_bps=(
+                policy.max_pairwise_reference_price_divergence_bps
+            ),
             max_ohlc_divergence_bps=policy.max_cross_source_ohlc_divergence_bps,
             max_volume_zscore_delta=policy.max_cross_source_volume_zscore_delta,
             max_divergent_fraction=policy.max_divergent_candle_fraction,
             max_market_price=policy.max_market_price,
             max_base_volume=policy.max_base_volume,
         ),
+    )
+
+
+def _load_reference_price_scope(
+    db_cursor: DBCursor,
+    *,
+    canonical_market_id: int,
+    risk_policy_id: int,
+    policy_hash: str,
+    symbol: str,
+    evaluated_at: datetime,
+    allow_legacy_replay: bool = False,
+) -> _ReferencePriceScope | None:
+    db_cursor.execute(
+        """
+        SELECT market.market_id, policy.risk_policy_id,
+               base_version.canonical_symbol || '/' || quote_version.canonical_symbol
+                   AS canonical_symbol,
+               policy.content_hash, market.exchange_id,
+               market.base_asset_id, market.quote_asset_id, market.instrument_type,
+               policy.policy_document, policy.effective_from, policy.effective_to,
+               GREATEST(
+                   market.available_at, exchange.available_at, policy.available_at,
+                   base_version.available_at, quote_version.available_at
+               ) AS registry_available_at,
+               GREATEST(
+                   market.ingested_at, exchange.ingested_at, policy.ingested_at,
+                   base_version.ingested_at, quote_version.ingested_at
+               ) AS registry_ingested_at
+        FROM crypto_agent.markets market
+        JOIN crypto_agent.exchanges exchange
+          ON exchange.exchange_id = market.exchange_id
+        JOIN crypto_agent.risk_policies policy
+          ON policy.risk_policy_id = %s
+         AND policy.content_hash = %s
+        JOIN LATERAL (
+            SELECT canonical_symbol, available_at, ingested_at
+            FROM crypto_agent.asset_versions
+            WHERE asset_id = market.base_asset_id
+              AND available_at <= %s AND ingested_at <= %s
+            ORDER BY available_at DESC, ingested_at DESC, revision_no DESC
+            LIMIT 1
+        ) base_version ON true
+        JOIN LATERAL (
+            SELECT canonical_symbol, available_at, ingested_at
+            FROM crypto_agent.asset_versions
+            WHERE asset_id = market.quote_asset_id
+              AND available_at <= %s AND ingested_at <= %s
+            ORDER BY available_at DESC, ingested_at DESC, revision_no DESC
+            LIMIT 1
+        ) quote_version ON true
+        WHERE market.market_id = %s
+          AND market.available_at <= %s AND market.ingested_at <= %s
+          AND exchange.available_at <= %s AND exchange.ingested_at <= %s
+          AND policy.available_at <= %s AND policy.ingested_at <= %s
+          AND policy.effective_from <= %s
+          AND (policy.effective_to IS NULL OR policy.effective_to > %s)
+        """,
+        (
+            risk_policy_id,
+            policy_hash,
+            evaluated_at,
+            evaluated_at,
+            evaluated_at,
+            evaluated_at,
+            canonical_market_id,
+            *(evaluated_at for _ in range(8)),
+        ),
+    )
+    row = db_cursor.fetchone()
+    if row is None:
+        return None
+    policy = _risk_policy_from_document(_row_value(row, "policy_document", 8))
+    persisted_hash = str(_row_value(row, "content_hash", 3))
+    if policy.fingerprint() != persisted_hash or persisted_hash != policy_hash:
+        raise IngestValidationError(
+            "Reference-price policy hash does not match its immutable document"
+        )
+    if policy.policy_schema_version != 2 and not allow_legacy_replay:
+        raise IngestValidationError(
+            "Archived policy revisions are replay-only and cannot create reference prices"
+        )
+    canonical_symbol = str(_row_value(row, "canonical_symbol", 2))
+    if canonical_symbol != symbol or canonical_symbol not in policy.allowed_assets:
+        raise IngestValidationError(
+            "Reference-price symbol is outside the validated market policy scope"
+        )
+    return _ReferencePriceScope(
+        canonical_market_id=int(_row_value(row, "market_id", 0)),
+        risk_policy_id=int(_row_value(row, "risk_policy_id", 1)),
+        canonical_symbol=canonical_symbol,
+        policy_hash=persisted_hash,
+        exchange_id=int(_row_value(row, "exchange_id", 4)),
+        base_asset_id=int(_row_value(row, "base_asset_id", 5)),
+        quote_asset_id=int(_row_value(row, "quote_asset_id", 6)),
+        instrument_type=str(_row_value(row, "instrument_type", 7)),
+        policy_effective_from=_datetime_value(row, "effective_from", 9),
+        policy_effective_to=(
+            None
+            if _row_value(row, "effective_to", 10) is None
+            else _datetime_value(row, "effective_to", 10)
+        ),
+        registry_available_at=_datetime_value(row, "registry_available_at", 11),
+        registry_ingested_at=_datetime_value(row, "registry_ingested_at", 12),
+        risk_policy=policy,
+    )
+
+
+def _derive_reference_price_universe(
+    db_cursor: DBCursor,
+    *,
+    scope: _ReferencePriceScope,
+    event_time: datetime,
+    cutoff_as_of: datetime,
+    evaluated_at: datetime,
+    captured_at: datetime,
+) -> tuple[_ReferencePriceRawRow, ...]:
+    open_time = event_time - timedelta(seconds=60)
+    approved_pairs = tuple(APPROVED_SOURCE_VENUES.items())
+    db_cursor.execute(
+        """
+        WITH eligible_revisions AS (
+            SELECT DISTINCT ON (candle.source_id, candle.source_record_key)
+                   candle.candle_id, candle.market_id, candle.interval_seconds,
+                   candle.open_time, candle.close_time,
+                   candle.open_price, candle.high_price, candle.low_price,
+                   candle.close_price, candle.base_volume, candle.trade_count,
+                   candle.source_id, candle.source_record_key, candle.source_version,
+                   candle.revision_no, candle.content_hash, candle.observed_at,
+                   candle.available_at, candle.ingested_at, candle.is_final,
+                   market.exchange_id, exchange.exchange_key,
+                   market.base_asset_id, market.quote_asset_id,
+                   market.instrument_type, source.source_key,
+                   binding.canonical_symbol, binding.venue_symbol,
+                   receipt.source_candle_receipt_id,
+                   receipt.provider_ingested_at
+            FROM crypto_agent.candles candle
+            JOIN crypto_agent.markets market ON market.market_id = candle.market_id
+            JOIN crypto_agent.exchanges exchange
+              ON exchange.exchange_id = market.exchange_id
+            JOIN crypto_agent.data_sources source
+              ON source.source_id = candle.source_id
+            JOIN crypto_agent.market_data_source_bindings binding
+              ON binding.source_id = candle.source_id
+             AND binding.market_id = candle.market_id
+            JOIN LATERAL (
+                SELECT source_receipt.source_candle_receipt_id,
+                       source_receipt.provider_ingested_at
+                FROM crypto_agent.source_candle_receipts source_receipt
+                WHERE source_receipt.candle_id = candle.candle_id
+                  AND source_receipt.provider_ingested_at <= %s
+                  AND source_receipt.cutoff_as_of <= %s
+                  AND source_receipt.received_at <= %s
+                ORDER BY source_receipt.provider_ingested_at DESC,
+                         source_receipt.received_at DESC,
+                         source_receipt.source_candle_receipt_id DESC
+                LIMIT 1
+            ) receipt ON true
+            WHERE candle.interval_seconds = 60
+              AND candle.open_time = %s
+              AND candle.close_time = %s
+              AND candle.is_final
+              AND market.base_asset_id = %s
+              AND market.quote_asset_id = %s
+              AND market.instrument_type = %s
+              AND binding.canonical_symbol = %s
+              AND (
+                  (source.source_key = %s AND exchange.exchange_key = %s)
+                  OR (source.source_key = %s AND exchange.exchange_key = %s)
+              )
+              AND candle.available_at <= %s AND candle.ingested_at <= %s
+              AND binding.available_at <= %s AND binding.ingested_at <= %s
+              AND market.available_at <= %s AND market.ingested_at <= %s
+              AND exchange.available_at <= %s AND exchange.ingested_at <= %s
+              AND source.available_at <= %s AND source.ingested_at <= %s
+              AND EXISTS (
+                  SELECT 1 FROM crypto_agent.market_symbols symbol
+                  WHERE symbol.market_id = market.market_id
+                    AND symbol.symbol = binding.venue_symbol
+                    AND symbol.available_at <= %s AND symbol.ingested_at <= %s
+              )
+            ORDER BY candle.source_id, candle.source_record_key,
+                     candle.revision_no DESC, candle.available_at DESC,
+                     candle.ingested_at DESC, candle.candle_id DESC
+        )
+        SELECT * FROM eligible_revisions
+        ORDER BY source_key, candle_id
+        """,
+        (
+            evaluated_at,
+            evaluated_at,
+            captured_at,
+            open_time,
+            event_time,
+            scope.base_asset_id,
+            scope.quote_asset_id,
+            scope.instrument_type,
+            scope.canonical_symbol,
+            approved_pairs[0][0],
+            approved_pairs[0][1],
+            approved_pairs[1][0],
+            approved_pairs[1][1],
+            evaluated_at,
+            captured_at,
+            evaluated_at,
+            evaluated_at,
+            evaluated_at,
+            evaluated_at,
+            evaluated_at,
+            evaluated_at,
+            evaluated_at,
+            evaluated_at,
+            evaluated_at,
+            evaluated_at,
+        ),
+    )
+    rows = tuple(_reference_price_raw_row(row) for row in db_cursor.fetchall())
+    if event_time > cutoff_as_of:
+        raise IngestValidationError(
+            "Reference-price event is later than the selection cutoff"
+        )
+    return rows
+
+
+def _load_reference_price_provenance(
+    db_cursor: DBCursor,
+    *,
+    reference_price_id: int,
+    evaluated_at: datetime,
+    captured_at: datetime,
+) -> tuple[_ReferencePriceRawRow, ...]:
+    db_cursor.execute(
+        """
+        SELECT candle.candle_id, candle.market_id, candle.interval_seconds,
+               candle.open_time, candle.close_time,
+               candle.open_price, candle.high_price, candle.low_price,
+               candle.close_price, candle.base_volume, candle.trade_count,
+               candle.source_id, candle.source_record_key, candle.source_version,
+               candle.revision_no, candle.content_hash, candle.observed_at,
+               candle.available_at, candle.ingested_at, candle.is_final,
+               market.exchange_id, exchange.exchange_key,
+               market.base_asset_id, market.quote_asset_id,
+               market.instrument_type, source.source_key,
+               binding.canonical_symbol, binding.venue_symbol,
+               receipt.source_candle_receipt_id,
+               receipt.provider_ingested_at
+        FROM crypto_agent.reference_price_provenance provenance
+        JOIN crypto_agent.candles candle
+          ON candle.candle_id = provenance.source_candle_id
+        JOIN crypto_agent.markets market ON market.market_id = candle.market_id
+        JOIN crypto_agent.exchanges exchange
+          ON exchange.exchange_id = market.exchange_id
+        JOIN crypto_agent.data_sources source ON source.source_id = candle.source_id
+        JOIN crypto_agent.market_data_source_bindings binding
+          ON binding.source_id = candle.source_id
+         AND binding.market_id = candle.market_id
+        JOIN crypto_agent.source_candle_receipts receipt
+          ON receipt.source_candle_receipt_id
+             = provenance.source_candle_receipt_id
+         AND receipt.candle_id = candle.candle_id
+         AND receipt.provider_ingested_at <= %s
+         AND receipt.cutoff_as_of <= %s
+         AND receipt.received_at <= %s
+        WHERE provenance.reference_price_id = %s
+          AND provenance.linked_at <= %s
+        ORDER BY source.source_key, candle.candle_id
+        """,
+        (
+            evaluated_at,
+            evaluated_at,
+            captured_at,
+            reference_price_id,
+            captured_at,
+        ),
+    )
+    return tuple(_reference_price_raw_row(row) for row in db_cursor.fetchall())
+
+
+def _reference_price_raw_row(row: object) -> _ReferencePriceRawRow:
+    receipt_id = int(_row_value(row, "source_candle_receipt_id", 28))
+    if receipt_id <= 0:
+        raise PersistenceInvariantError(
+            "Reference-price source receipt id must be positive"
+        )
+    return _ReferencePriceRawRow(
+        candle=_raw_row(row),
+        source_candle_receipt_id=receipt_id,
+        provider_ingested_at=_datetime_value(row, "provider_ingested_at", 29),
+    )
+
+
+def _recompute_reference_price(
+    raw_rows: Sequence[_ReferencePriceRawRow],
+    *,
+    scope: _ReferencePriceScope,
+    cutoff_as_of: datetime,
+    evaluated_at: datetime,
+) -> ReferencePriceResult:
+    for item in raw_rows:
+        recomputed_hash = _raw_source_candle_content_hash(item.candle)
+        if not _is_sha256(item.candle.content_hash) or not hmac.compare_digest(
+            item.candle.content_hash,
+            recomputed_hash,
+        ):
+            raise PersistenceInvariantError(
+                "Reference-price source content hash does not match raw OHLCV"
+            )
+        if (
+            item.candle.base_asset_id != scope.base_asset_id
+            or item.candle.quote_asset_id != scope.quote_asset_id
+            or item.candle.instrument_type != scope.instrument_type
+            or item.candle.canonical_symbol != scope.canonical_symbol
+            or item.candle.exchange_id == scope.exchange_id
+        ):
+            raise IngestValidationError(
+                "Reference-price source is outside the canonical market scope"
+            )
+    try:
+        return build_reference_price_snapshot(
+            tuple(
+                ReferencePriceInput(
+                    source_id=item.candle.source_key,
+                    venue_id=item.candle.exchange_key,
+                    symbol=item.candle.canonical_symbol,
+                    open_time=item.candle.open_time,
+                    close_time=item.candle.close_time,
+                    price=item.candle.close_price,
+                    available_at=item.candle.available_at,
+                    ingested_at=item.provider_ingested_at,
+                )
+                for item in raw_rows
+            ),
+            cutoff_as_of=cutoff_as_of,
+            evaluated_at=evaluated_at,
+            max_age_seconds=scope.risk_policy.max_reference_price_age_seconds,
+            max_deviation_from_median_bps=(
+                scope.risk_policy.max_reference_price_deviation_from_median_bps
+            ),
+            max_market_price=scope.risk_policy.max_market_price,
+            approved_source_venues=APPROVED_SOURCE_VENUES,
+        )
+    except ReferencePriceMathError as exc:
+        raise IngestValidationError(f"{exc.code}: {exc}") from None
+
+
+def _verify_reference_price_draft(
+    draft: ReferencePriceDraft,
+    scope: _ReferencePriceScope,
+    raw_rows: Sequence[_ReferencePriceRawRow],
+    computed: ReferencePriceResult,
+) -> None:
+    derived_ids = tuple(sorted(item.candle.candle_id for item in raw_rows))
+    if (
+        draft.canonical_market_id != scope.canonical_market_id
+        or draft.risk_policy_id != scope.risk_policy_id
+        or draft.policy_hash != scope.policy_hash
+        or draft.symbol != scope.canonical_symbol
+        or draft.algorithm_version != computed.algorithm_version
+        or draft.event_time != computed.event_time
+        or tuple(sorted(draft.source_candle_ids)) != derived_ids
+    ):
+        raise IngestValidationError(
+            "Reference-price draft scope or DB-derived provenance does not match"
+        )
+    if (
+        draft.median_price != computed.median_price
+        or draft.pairwise_divergence_bps != computed.pairwise_divergence_bps
+        or draft.max_deviation_from_median_bps
+        != computed.max_deviation_from_median_bps
+    ):
+        raise IngestValidationError(
+            "REFERENCE_PRICE_VALUE_MISMATCH: claimed values differ from replay"
+        )
+
+
+def _reference_price_record_key(
+    draft: ReferencePriceDraft,
+    *,
+    cutoff_as_of: datetime,
+    evaluated_at: datetime,
+) -> str:
+    return (
+        f"reference:{draft.canonical_market_id}:{draft.symbol}:"
+        f"{_iso(draft.event_time)}:{_iso(cutoff_as_of)}:{_iso(evaluated_at)}:"
+        f"{draft.policy_hash}"
+    )
+
+
+def _reference_price_inputs_hash(
+    raw_rows: Sequence[_ReferencePriceRawRow],
+    *,
+    scope: _ReferencePriceScope,
+) -> str:
+    return _content_hash(
+        {
+            "algorithm_version": REFERENCE_PRICE_ALGORITHM_VERSION,
+            "canonical_market_id": scope.canonical_market_id,
+            "policy_hash": scope.policy_hash,
+            "inputs": [
+                {
+                    "candle_id": item.candle.candle_id,
+                    "market_id": item.candle.market_id,
+                    "exchange_id": item.candle.exchange_id,
+                    "exchange_key": item.candle.exchange_key,
+                    "source_id": item.candle.source_id,
+                    "source_key": item.candle.source_key,
+                    "source_record_key": item.candle.source_record_key,
+                    "source_version": item.candle.source_version,
+                    "revision_no": item.candle.revision_no,
+                    "content_hash": item.candle.content_hash,
+                    "source_candle_receipt_id": item.source_candle_receipt_id,
+                    "open_time": _iso(item.candle.open_time),
+                    "close_time": _iso(item.candle.close_time),
+                    "close_price": _decimal_text(item.candle.close_price),
+                    "available_at": _iso(item.candle.available_at),
+                    "provider_ingested_at": _iso(item.provider_ingested_at),
+                }
+                for item in sorted(
+                    raw_rows,
+                    key=lambda row: (
+                        row.candle.source_key,
+                        row.candle.candle_id,
+                    ),
+                )
+            ],
+        }
+    )
+
+
+def _reference_price_evidence_hash(
+    *,
+    scope: _ReferencePriceScope,
+    cutoff_as_of: datetime,
+    evaluated_at: datetime,
+    computed: ReferencePriceResult,
+    inputs_hash: str,
+) -> str:
+    return _content_hash(
+        {
+            "algorithm_version": computed.algorithm_version,
+            "canonical_market_id": scope.canonical_market_id,
+            "risk_policy_id": scope.risk_policy_id,
+            "policy_hash": scope.policy_hash,
+            "symbol": computed.symbol,
+            "event_time": _iso(computed.event_time),
+            "cutoff_as_of": _iso(cutoff_as_of),
+            "evaluated_at": _iso(evaluated_at),
+            "median_price": _decimal_text(computed.median_price),
+            "pairwise_divergence_bps": _decimal_text(
+                computed.pairwise_divergence_bps
+            ),
+            "max_deviation_from_median_bps": _decimal_text(
+                computed.max_deviation_from_median_bps
+            ),
+            "available_at": _iso(computed.available_at),
+            "provider_ingested_at": _iso(computed.ingested_at),
+            "source_ids": computed.source_ids,
+            "venue_ids": computed.venue_ids,
+            "inputs_hash": inputs_hash,
+        }
+    )
+
+
+def _reference_price_content_hash(
+    *,
+    reference_key: str,
+    scope: _ReferencePriceScope,
+    computed: ReferencePriceResult,
+    inputs_hash: str,
+    evidence_hash: str,
+) -> str:
+    return _content_hash(
+        {
+            "reference_key": reference_key,
+            "canonical_market_id": scope.canonical_market_id,
+            "risk_policy_id": scope.risk_policy_id,
+            "algorithm_version": computed.algorithm_version,
+            "policy_hash": scope.policy_hash,
+            "inputs_hash": inputs_hash,
+            "evidence_hash": evidence_hash,
+        }
+    )
+
+
+def _reference_manifest_values(
+    *,
+    reference_key: str,
+    scope: _ReferencePriceScope,
+    computed: ReferencePriceResult,
+    cutoff_as_of: datetime,
+    evaluated_at: datetime,
+    inputs_hash: str,
+    evidence_hash: str,
+    captured_at: datetime,
+    content_hash: str,
+) -> tuple[object, ...]:
+    return (
+        reference_key,
+        scope.canonical_market_id,
+        scope.risk_policy_id,
+        computed.symbol,
+        computed.algorithm_version,
+        scope.policy_hash,
+        computed.event_time,
+        cutoff_as_of,
+        evaluated_at,
+        computed.median_price,
+        computed.pairwise_divergence_bps,
+        computed.max_deviation_from_median_bps,
+        inputs_hash,
+        evidence_hash,
+        computed.available_at,
+        captured_at,
+        content_hash,
+    )
+
+
+def _verify_existing_reference_manifest(
+    row: object,
+    *,
+    expected: tuple[object, ...],
+) -> int:
+    reference_price_id = int(_row_value(row, "reference_price_id", 0))
+    keys = (
+        "canonical_market_id",
+        "risk_policy_id",
+        "symbol",
+        "algorithm_version",
+        "policy_hash",
+        "event_time",
+        "cutoff_as_of",
+        "evaluated_at",
+        "median_price",
+        "pairwise_divergence_bps",
+        "max_deviation_from_median_bps",
+        "inputs_hash",
+        "evidence_hash",
+        "available_at",
+        "ingested_at",
+        "content_hash",
+    )
+    values = [_row_value(row, key, index + 1) for index, key in enumerate(keys)]
+    for index in (8, 9, 10):
+        values[index] = _decimal(values[index], keys[index])
+    stored_ingested_at = _datetime_value(row, "ingested_at", 15)
+    expected_evaluated_at = cast(datetime, expected[8])
+    expected_available_at = cast(datetime, expected[14])
+    current_captured_at = cast(datetime, expected[15])
+    if not (
+        expected_available_at <= stored_ingested_at <= current_captured_at
+        and expected_evaluated_at <= stored_ingested_at
+    ):
+        raise PersistenceInvariantError(
+            "Existing reference-price manifest has invalid receipt lineage"
+        )
+    # ``ingested_at`` is the first durable capture time, not part of the
+    # semantic content hash. A later retry must retain the original timestamp.
+    semantic_values = (*values[:14], *values[15:])
+    semantic_expected = (*expected[1:15], *expected[16:])
+    if semantic_values != semantic_expected:
+        raise PersistenceInvariantError(
+            "Existing reference-price manifest differs from deterministic replay"
+        )
+    return reference_price_id
+
+
+def _ensure_reference_price_provenance(
+    db_cursor: DBCursor,
+    *,
+    reference_price_id: int,
+    source_provenance: Sequence[tuple[int, int]],
+    linked_at: datetime,
+) -> None:
+    _require_utc(linked_at, "linked_at")
+    expected = tuple(sorted(source_provenance))
+    if (
+        len(expected) != 2
+        or len({item[0] for item in expected}) != 2
+        or len({item[1] for item in expected}) != 2
+        or any(candle_id <= 0 or receipt_id <= 0 for candle_id, receipt_id in expected)
+    ):
+        raise PersistenceInvariantError(
+            "Reference-price provenance requires two distinct candles and receipts"
+        )
+    db_cursor.execute(
+        """
+        SELECT source_candle_id, source_candle_receipt_id
+        FROM crypto_agent.reference_price_provenance
+        WHERE reference_price_id = %s
+        ORDER BY source_candle_id, source_candle_receipt_id
+        """,
+        (reference_price_id,),
+    )
+    existing = tuple(
+        (
+            int(_row_value(row, "source_candle_id", 0)),
+            int(_row_value(row, "source_candle_receipt_id", 1)),
+        )
+        for row in db_cursor.fetchall()
+    )
+    if existing and existing != expected:
+        raise PersistenceInvariantError(
+            "Reference-price provenance does not match its manifest"
+        )
+    if existing == expected:
+        return
+    for source_candle_id, source_candle_receipt_id in expected:
+        db_cursor.execute(
+            """
+            INSERT INTO crypto_agent.reference_price_provenance (
+                reference_price_id, source_candle_id,
+                source_candle_receipt_id, linked_at
+            ) VALUES (%s, %s, %s, %s)
+            ON CONFLICT (reference_price_id, source_candle_id) DO NOTHING
+            """,
+            (
+                reference_price_id,
+                source_candle_id,
+                source_candle_receipt_id,
+                linked_at,
+            ),
+        )
+    db_cursor.execute(
+        """
+        SELECT source_candle_id, source_candle_receipt_id
+        FROM crypto_agent.reference_price_provenance
+        WHERE reference_price_id = %s
+        ORDER BY source_candle_id, source_candle_receipt_id
+        """,
+        (reference_price_id,),
+    )
+    persisted = tuple(
+        (
+            int(_row_value(row, "source_candle_id", 0)),
+            int(_row_value(row, "source_candle_receipt_id", 1)),
+        )
+        for row in db_cursor.fetchall()
+    )
+    if persisted != expected:
+        raise PersistenceInvariantError(
+            "Reference-price provenance insert did not persist the exact mapping"
+        )
+
+
+def _verify_loaded_reference_price_manifest(
+    row: object,
+    *,
+    scope: _ReferencePriceScope,
+    raw_rows: Sequence[_ReferencePriceRawRow],
+) -> ReferencePriceRecord:
+    reference_price_id = int(_row_value(row, "reference_price_id", 0))
+    reference_key = str(_row_value(row, "reference_key", 1))
+    cutoff_as_of = _datetime_value(row, "cutoff_as_of", 8)
+    evaluated_at = _datetime_value(row, "evaluated_at", 9)
+    captured_at = _datetime_value(row, "ingested_at", 16)
+    computed = _recompute_reference_price(
+        raw_rows,
+        scope=scope,
+        cutoff_as_of=cutoff_as_of,
+        evaluated_at=evaluated_at,
+    )
+    inputs_hash = _reference_price_inputs_hash(raw_rows, scope=scope)
+    evidence_hash = _reference_price_evidence_hash(
+        scope=scope,
+        cutoff_as_of=cutoff_as_of,
+        evaluated_at=evaluated_at,
+        computed=computed,
+        inputs_hash=inputs_hash,
+    )
+    content_hash = _reference_price_content_hash(
+        reference_key=reference_key,
+        scope=scope,
+        computed=computed,
+        inputs_hash=inputs_hash,
+        evidence_hash=evidence_hash,
+    )
+    expected = _reference_manifest_values(
+        reference_key=reference_key,
+        scope=scope,
+        computed=computed,
+        cutoff_as_of=cutoff_as_of,
+        evaluated_at=evaluated_at,
+        inputs_hash=inputs_hash,
+        evidence_hash=evidence_hash,
+        captured_at=captured_at,
+        content_hash=content_hash,
+    )
+    # The load query places reference_key after the identity; every remaining
+    # manifest field must equal the replayed canonical tuple byte-for-byte.
+    actual = (
+        reference_key,
+        int(_row_value(row, "canonical_market_id", 2)),
+        int(_row_value(row, "risk_policy_id", 3)),
+        str(_row_value(row, "symbol", 4)),
+        str(_row_value(row, "algorithm_version", 5)),
+        str(_row_value(row, "policy_hash", 6)),
+        _datetime_value(row, "event_time", 7),
+        cutoff_as_of,
+        evaluated_at,
+        _decimal(_row_value(row, "median_price", 10), "median_price"),
+        _decimal(
+            _row_value(row, "pairwise_divergence_bps", 11),
+            "pairwise_divergence_bps",
+        ),
+        _decimal(
+            _row_value(row, "max_deviation_from_median_bps", 12),
+            "max_deviation_from_median_bps",
+        ),
+        str(_row_value(row, "inputs_hash", 13)),
+        str(_row_value(row, "evidence_hash", 14)),
+        _datetime_value(row, "available_at", 15),
+        captured_at,
+        str(_row_value(row, "content_hash", 17)),
+    )
+    if actual != expected or reference_key != _reference_price_record_key(
+        ReferencePriceDraft(
+            canonical_market_id=scope.canonical_market_id,
+            risk_policy_id=scope.risk_policy_id,
+            symbol=computed.symbol,
+            event_time=computed.event_time,
+            median_price=computed.median_price,
+            pairwise_divergence_bps=computed.pairwise_divergence_bps,
+            max_deviation_from_median_bps=computed.max_deviation_from_median_bps,
+            algorithm_version=computed.algorithm_version,
+            policy_hash=scope.policy_hash,
+            source_candle_ids=cast(
+                tuple[int, int],
+                tuple(sorted(item.candle.candle_id for item in raw_rows)),
+            ),
+        ),
+        cutoff_as_of=cutoff_as_of,
+        evaluated_at=evaluated_at,
+    ):
+        raise PersistenceInvariantError(
+            "Reference-price manifest failed deterministic hash replay"
+        )
+    source_ids = tuple(sorted(item.candle.candle_id for item in raw_rows))
+    receipt_ids = tuple(sorted(item.source_candle_receipt_id for item in raw_rows))
+    return ReferencePriceRecord(
+        reference_price_id=reference_price_id,
+        canonical_market_id=scope.canonical_market_id,
+        risk_policy_id=scope.risk_policy_id,
+        symbol=computed.symbol,
+        event_time=computed.event_time,
+        cutoff_as_of=cutoff_as_of,
+        evaluated_at=evaluated_at,
+        median_price=computed.median_price,
+        pairwise_divergence_bps=computed.pairwise_divergence_bps,
+        max_deviation_from_median_bps=computed.max_deviation_from_median_bps,
+        algorithm_version=computed.algorithm_version,
+        policy_hash=scope.policy_hash,
+        available_at=computed.available_at,
+        ingested_at=captured_at,
+        inputs_hash=inputs_hash,
+        evidence_hash=evidence_hash,
+        content_hash=content_hash,
+        source_candle_ids=cast(tuple[int, int], source_ids),
+        source_candle_receipt_ids=cast(tuple[int, int], receipt_ids),
     )
 
 
@@ -1180,7 +2386,6 @@ def _validate_canonical_inputs(
         raise IngestValidationError("Canonical interval is outside the validated policy")
     if series.canonical_symbol not in series.risk_policy.allowed_assets:
         raise IngestValidationError("Canonical symbol is outside the validated policy")
-
     derived_context_ids = {item.candle_id for item in raw_rows}
     if derived_context_ids != set(draft.context_candle_ids):
         raise IngestValidationError(
@@ -2061,6 +3266,13 @@ def _policy_float(
 def _risk_policy_from_document(value: object) -> RiskPolicy:
     document = dict(_json_object(value, "policy_document"))
     try:
+        if (
+            set(document) == _LEGACY_R1_POLICY_FIELDS
+            and document.get("policy_id") == LEGACY_R1_POLICY_ID
+        ):
+            document["policy_schema_version"] = 1
+            document["max_reference_price_age_seconds"] = 300
+            document["max_reference_price_deviation_from_median_bps"] = 50.0
         for key in (
             "allowed_decisions",
             "allowed_assets",
@@ -2074,6 +3286,11 @@ def _risk_policy_from_document(value: object) -> RiskPolicy:
             document[key] = tuple(candidate)
         policy = RiskPolicy(**document)
         policy.validate_v1_safety()
+        if policy.policy_schema_version == 1 and (
+            policy.policy_id != LEGACY_R1_POLICY_ID
+            or policy.fingerprint() != LEGACY_R1_POLICY_HASH
+        ):
+            raise PolicyConfigurationError("Archived policy fingerprint is not approved")
     except (KeyError, TypeError, PolicyConfigurationError):
         raise IngestValidationError(
             "Canonical series policy document fails V1 safety validation"

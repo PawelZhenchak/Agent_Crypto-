@@ -2,9 +2,10 @@
 
 Ten model jest zaprojektowany tak, aby agent potrafił odtworzyć nie tylko **co było prawdą o rynku**, lecz przede wszystkim **co system mógł rzeczywiście wiedzieć w chwili decyzji**. To rozróżnienie jest podstawą uczciwego backtestu, forward testu, audytu i bezpiecznego paper tradingu.
 
-Implementacja bazowa znajduje się w `db/schema.sql`, a checkpoint V1.1 dodaje migrację
-`db/migrations/0011_canonical_candle_provenance.sql`. Projekt wymaga PostgreSQL i nie
-zakłada żadnego rozszerzenia. Schemat, migracja i repozytorium zostały sprawdzone
+Implementacja bazowa znajduje się w `db/schema.sql`, a checkpoint V1.1 dodaje migracje
+`0011_canonical_candle_provenance.sql` i
+`0012_reference_price_policy_contract.sql`. Projekt wymaga dokładnie PostgreSQL 16 i
+nie zakłada żadnego rozszerzenia. Schemat, migracje i repozytorium zostały sprawdzone
 statycznie i na fake cursorach. Nie wykonano jeszcze testu akceptacyjnego na prawdziwym
 PostgreSQL, ponieważ środowisko checkpointu nie miało Dockera, `psql`, serwera ani
 `psycopg`.
@@ -79,6 +80,8 @@ Hash jest obliczany w aplikacji. Przed hashowaniem należy stosować jedną wers
 | `source_candle_receipts` | Potwierdzenie przyjęcia raw candle przez wersjonowany extractor |
 | `canonical_candle_manifests` | Niezmienny manifest algorytmu, pełnego fingerprintu polityki, okna, evidence digest, normalized volume i diagnostyki |
 | `canonical_candle_provenance` | Uporządkowane powiązanie canonical candle z dokładnymi raw revisions, source/venue i rolą `context|observation` |
+| `reference_price_manifests` | Niezmienny wynik 2×1m: policy/hash, cutoff, evaluation, median, divergence i evidence hash |
+| `reference_price_provenance` | Dokładne dwa powiązania `(source_candle_id, source_candle_receipt_id)` użyte przez referencję |
 
 Constrainty i triggery migracji pilnują bindingów, receipts, zgodności aktywów, cutoffów,
 fingerprintu polityki, ról `context|observation` i wieloźródłowego provenance.
@@ -87,8 +90,7 @@ latest eligible revision dla każdego source/window według cutoffu, wymaga sour
 `kraken_spot_rest_v1` + `coinbase_exchange_spot_rest_v1` i dwóch różnych venue oraz
 buduje dokładnie 120 ciągłych, wspólnie zakończonych okien na źródło. Lista IDs
 przekazana przez callera może jedynie potwierdzić równość z wyprowadzonym zbiorem;
-nie może wybrać starszej
-rewizji, skrócić okna ani pominąć luki.
+nie może wybrać starszej rewizji, skrócić okna ani pominąć luki.
 
 Po walidacji pełnego fingerprintu `RiskPolicy` repozytorium uruchamia tę samą wersję
 `cross_exchange_spot_consensus_v1`, której używa provider runtime: te same progi
@@ -107,6 +109,19 @@ Wolumen po cross-source normalizacji jest liczbą bezwymiarową, nie wolumenem b
 Kraken ani Coinbase. Jego wartość, diagnostyka, evidence digest, algorytm, fingerprint
 polityki, granice okna oraz uporządkowane role wszystkich `2 × 120` wejść są częścią
 manifestu i jego deterministycznego hasha.
+
+Cena referencyjna ma osobny kontrakt, ponieważ close historycznej świecy 4h/1d/1w
+nie jest świeżą ceną decyzyjną. Repozytorium wybiera dokładnie ostatnią kwalifikującą
+się, zamkniętą świecę 1m Kraken oraz Coinbase z tego samego okna UTC, a następnie
+przelicza `cross_exchange_reference_price_v1`. Wiek od `event_time` do `evaluated_at`
+nie może przekroczyć 300 s; każde źródło musi pozostać najwyżej 50 pb od midpoint
+mediany. Wartości bps są wersjonowane jako `ROUND_HALF_UP` do 12 miejsc.
+
+Deferred trigger `0012` przy COMMIT ponownie wyprowadza exact eligible revisions,
+sprawdza przypięte receipts i liczy wynik bez zaufania do wartości manifestu. Loader
+robi ten sam replay przy odczycie. Dokładny dokument polityki schema-r1 zachowuje
+historyczny fingerprint, lecz jest replay-only; nowe canonical/reference manifests
+wymagają schema-r2.
 
 Ten parytet nie czyni jeszcze PostgreSQL źródłem runtime analizy: factory nie ma jeszcze
 external-ingest/replay joba, raw payload capture, kwarantanny, seedów registry ani

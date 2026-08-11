@@ -11,8 +11,17 @@ from crypto_agent.consensus_math import (
     CONSENSUS_ALGORITHM_VERSION,
     CONSENSUS_WINDOW_SIZE,
 )
-from crypto_agent.domain import Decision
-from crypto_agent.orchestrator import ResearchOrchestrator, _consensus_attested
+from crypto_agent.domain import (
+    Decision,
+    ReferencePriceObservation,
+    ReferencePriceSnapshot,
+)
+from crypto_agent.orchestrator import (
+    ResearchOrchestrator,
+    _canonical_evidence,
+    _consensus_attested,
+    _input_fingerprint,
+)
 from crypto_agent.providers.base import ProviderBatch, ProviderError
 from crypto_agent.providers.coinbase import CoinbaseExchangePublicProvider
 from crypto_agent.providers.consensus import CrossExchangeConsensusProvider
@@ -51,21 +60,78 @@ def _fixture_fetch(source_id: str, *, price_multiplier: float = 1.0):
     return fetch_candles
 
 
+class _FixtureProvider:
+    """Explicitly unapproved offline seam for consensus-shape tests."""
+
+    def __init__(self, source_id: str, *, price_multiplier: float = 1.0) -> None:
+        self.source_id = source_id
+        self._fetch = _fixture_fetch(
+            source_id,
+            price_multiplier=price_multiplier,
+        )
+
+    def fetch_candles(self, **kwargs):
+        return self._fetch(**kwargs)
+
+
 def _approved_consensus_fixture():
     loaded_policy = policy()
-    kraken = KrakenPublicProvider()
-    coinbase = CoinbaseExchangePublicProvider()
-    kraken.fetch_candles = _fixture_fetch(kraken.source_id)  # type: ignore[method-assign]
-    coinbase.fetch_candles = _fixture_fetch(  # type: ignore[method-assign]
-        coinbase.source_id,
-        price_multiplier=1.0005,
+    fixture_provider = CrossExchangeConsensusProvider(
+        (
+            _FixtureProvider(KrakenPublicProvider.source_id),
+            _FixtureProvider(
+                CoinbaseExchangePublicProvider.source_id,
+                price_multiplier=1.0005,
+            ),
+        ),
+        loaded_policy,
+        allow_unapproved_for_testing=True,
     )
-    provider = CrossExchangeConsensusProvider((kraken, coinbase), loaded_policy)
-    batch = provider.fetch_batch(
+    batch = fixture_provider.fetch_batch(
         symbol="BTC/USD",
         interval_minutes=1440,
         as_of=AS_OF,
         limit=CONSENSUS_WINDOW_SIZE,
+    )
+    reference_price = ReferencePriceSnapshot(
+        symbol="BTC/USD",
+        observations=(
+            ReferencePriceObservation(
+                symbol="BTC/USD",
+                price=100.0,
+                event_time=AS_OF,
+                available_at=AS_OF,
+                ingested_at=AS_OF,
+                source=KrakenPublicProvider.source_id,
+            ),
+            ReferencePriceObservation(
+                symbol="BTC/USD",
+                price=100.2,
+                event_time=AS_OF,
+                available_at=AS_OF,
+                ingested_at=AS_OF,
+                source=CoinbaseExchangePublicProvider.source_id,
+            ),
+        ),
+    )
+    batch = replace(
+        batch,
+        reference_price=reference_price,
+        metadata={
+            **batch.metadata,
+            "reference_price_present": True,
+            "reference_price_version": "cross_exchange_reference_price_v1",
+            "reference_price_source_ids": sorted(
+                (
+                    KrakenPublicProvider.source_id,
+                    CoinbaseExchangePublicProvider.source_id,
+                )
+            ),
+        },
+    )
+    provider = CrossExchangeConsensusProvider(
+        (KrakenPublicProvider(), CoinbaseExchangePublicProvider()),
+        loaded_policy,
     )
     return provider, batch, loaded_policy
 
@@ -92,6 +158,155 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(
             len(batch.input_candles),
             loaded_policy.min_consensus_sources * CONSENSUS_WINDOW_SIZE,
+        )
+
+    def test_consensus_class_method_substitution_invalidates_attestation(self) -> None:
+        provider, batch, loaded_policy = _approved_consensus_fixture()
+        self.assertTrue(_attested(provider, batch, loaded_policy))
+
+        with patch.object(
+            CrossExchangeConsensusProvider,
+            "fetch_batch",
+            return_value=batch,
+        ):
+            self.assertFalse(_attested(provider, batch, loaded_policy))
+
+    def test_missing_reference_snapshot_cannot_attest_or_alert(self) -> None:
+        provider, batch, loaded_policy = _approved_consensus_fixture()
+        missing = replace(
+            batch,
+            reference_price=None,
+            metadata={
+                **batch.metadata,
+                "reference_price_present": False,
+            },
+        )
+
+        self.assertFalse(_attested(provider, missing, loaded_policy))
+        with patch.object(
+            CrossExchangeConsensusProvider,
+            "fetch_batch",
+            return_value=missing,
+        ):
+            report = ResearchOrchestrator(
+                provider=provider,
+                policy=loaded_policy,
+            ).analyze(
+                symbol="BTC/USD",
+                interval_minutes=1440,
+                as_of=AS_OF,
+            )
+
+        self.assertEqual(report.decision, Decision.NO_SIGNAL)
+        self.assertTrue(report.risk.vetoed)
+        self.assertIn("REFERENCE_PRICE_MISSING", report.risk.flags)
+        self.assertFalse(report.metadata["v1_1_consensus_passed"])
+
+    def test_reference_snapshot_must_match_sealed_sources_and_symbol(self) -> None:
+        provider, batch, loaded_policy = _approved_consensus_fixture()
+        assert batch.reference_price is not None
+        first, second = batch.reference_price.observations
+        forged_snapshots = (
+            replace(
+                batch.reference_price,
+                observations=(replace(first, source="spoofed"), second),
+            ),
+            replace(batch.reference_price, symbol="ETH/USD"),
+            replace(
+                batch.reference_price,
+                observations=(replace(first, symbol="ETH/USD"), second),
+            ),
+        )
+
+        for forged_snapshot in forged_snapshots:
+            with self.subTest(snapshot=forged_snapshot):
+                self.assertFalse(
+                    _attested(
+                        provider,
+                        replace(batch, reference_price=forged_snapshot),
+                        loaded_policy,
+                    )
+                )
+
+    def test_reference_price_and_time_are_bound_into_the_input_fingerprint(self) -> None:
+        base = ReferencePriceSnapshot(
+            symbol="BTC/USD",
+            observations=(
+                ReferencePriceObservation(
+                    symbol="BTC/USD",
+                    price=100.0,
+                    event_time=AS_OF,
+                    available_at=AS_OF,
+                    ingested_at=AS_OF,
+                    source=KrakenPublicProvider.source_id,
+                ),
+                ReferencePriceObservation(
+                    symbol="BTC/USD",
+                    price=100.2,
+                    event_time=AS_OF,
+                    available_at=AS_OF,
+                    ingested_at=AS_OF,
+                    source=CoinbaseExchangePublicProvider.source_id,
+                ),
+            ),
+        )
+        changed_price = replace(
+            base,
+            observations=(
+                replace(base.observations[0], price=100.1),
+                base.observations[1],
+            ),
+        )
+        earlier = AS_OF - timedelta(minutes=1)
+        changed_time = replace(
+            base,
+            observations=tuple(
+                replace(
+                    item,
+                    event_time=earlier,
+                    available_at=earlier,
+                    ingested_at=earlier,
+                )
+                for item in base.observations
+            ),
+        )
+
+        fingerprints = {
+            _input_fingerprint(_canonical_evidence([], snapshot))
+            for snapshot in (base, changed_price, changed_time)
+        }
+
+        self.assertEqual(len(fingerprints), 3)
+
+    def test_reference_price_evidence_is_persisted_under_the_report_fingerprint(self) -> None:
+        provider, batch, loaded_policy = _approved_consensus_fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            repository = ReportRepository(Path(directory) / "reports.db")
+            with patch.object(
+                CrossExchangeConsensusProvider,
+                "fetch_batch",
+                return_value=batch,
+            ):
+                report = ResearchOrchestrator(
+                    provider=provider,
+                    policy=loaded_policy,
+                    repository=repository,
+                ).analyze(
+                    symbol="BTC/USD",
+                    interval_minutes=1440,
+                    as_of=AS_OF,
+                )
+            persisted = repository.read_snapshot(report.data_snapshot_id)
+
+        self.assertIsNotNone(persisted)
+        assert persisted is not None
+        self.assertEqual(
+            persisted[-1]["record_type"],
+            "reference_price_snapshot",
+        )
+        self.assertEqual(
+            _input_fingerprint(persisted),
+            report.data_snapshot_id.removeprefix("sha256:"),
         )
 
     def test_forged_consensus_metadata_cannot_attest(self) -> None:

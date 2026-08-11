@@ -1,4 +1,4 @@
--- Crypto Agent: point-in-time data model (PostgreSQL 15+)
+-- Crypto Agent: point-in-time data model (PostgreSQL 16.x)
 -- No extension is required. All timestamps use TIMESTAMPTZ and are interpreted in UTC.
 
 BEGIN;

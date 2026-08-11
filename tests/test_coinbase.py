@@ -60,6 +60,60 @@ class CoinbaseExchangeProviderTests(unittest.TestCase):
     def setUp(self) -> None:
         self.provider = CoinbaseExchangePublicProvider()
 
+    def test_reference_price_is_separate_from_the_daily_series_at_noon(self) -> None:
+        noon = datetime(2026, 8, 10, 12, tzinfo=UTC)
+        reference = self.provider.parse_reference_price_payload(
+            [_row(noon - timedelta(minutes=1), close_price="117")],
+            symbol="BTC/USD",
+            as_of=noon,
+        )
+        daily = self.provider.parse_payload(
+            [_row(datetime(2026, 8, 9, tzinfo=UTC), close_price="101")],
+            symbol="BTC/USD",
+            interval_minutes=1_440,
+            as_of=noon,
+            limit=1,
+        )
+
+        self.assertEqual(reference.price, 117.0)
+        self.assertEqual(reference.event_time, noon)
+        self.assertEqual(daily[-1].close, 101.0)
+        self.assertEqual(daily[-1].close_time, datetime(2026, 8, 10, tzinfo=UTC))
+
+    def test_reference_price_request_uses_one_minute_granularity(self) -> None:
+        noon = datetime(2026, 8, 10, 12, tzinfo=UTC)
+        requests: list[str] = []
+
+        def fake_urlopen(request: object, timeout: float) -> _Response:
+            del timeout
+            requests.append(request.full_url)  # type: ignore[attr-defined]
+            return _Response([_row(noon - timedelta(minutes=1), close_price="117")])
+
+        with patch("crypto_agent.providers.coinbase.urlopen", side_effect=fake_urlopen):
+            observation = self.provider.fetch_reference_price(
+                symbol="BTC/USD",
+                as_of=noon,
+            )
+
+        self.assertEqual(observation.event_time, noon)
+        self.assertEqual(len(requests), 1)
+        query = parse_qs(urlsplit(requests[0]).query)
+        self.assertEqual(query["granularity"], ["60"])
+        self.assertEqual(query["start"], ["2026-08-10T11:59:00Z"])
+        self.assertEqual(query["end"], ["2026-08-10T12:00:00Z"])
+
+    def test_reference_price_does_not_fall_back_to_an_older_closed_minute(self) -> None:
+        noon = datetime(2026, 8, 10, 12, tzinfo=UTC)
+
+        with self.assertRaises(ProviderError) as raised:
+            self.provider.parse_reference_price_payload(
+                [_row(noon - timedelta(minutes=2), close_price="117")],
+                symbol="BTC/USD",
+                as_of=noon,
+            )
+
+        self.assertEqual(raised.exception.code, "REFERENCE_PRICE_UNAVAILABLE")
+
     def test_daily_parser_sorts_rows_and_drops_current_incomplete_bucket(self) -> None:
         payload = [
             _row(datetime(2026, 8, 10, tzinfo=UTC), high="140", close_price="130"),

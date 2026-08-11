@@ -5,6 +5,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from crypto_agent.quality import assess_data_quality
+from crypto_agent.providers.synthetic import SyntheticProvider
 
 from tests.helpers import candles, policy
 
@@ -35,9 +36,36 @@ class DataQualityTests(unittest.TestCase):
         self.assertFalse(result.passed)
 
     def test_stale_data_is_vetoed(self) -> None:
-        as_of = datetime(2026, 8, 12, tzinfo=timezone.utc)
+        as_of = datetime(2026, 8, 11, 6, 0, 0, 1, tzinfo=timezone.utc)
         result = self.assess(candles(), as_of)
         self.assertIn("STALE_DATA", result.critical_flags)
+
+    def test_ohlc_history_is_not_mistaken_for_the_reference_price(self) -> None:
+        base_as_of = datetime(2026, 8, 10, tzinfo=timezone.utc)
+        for interval_minutes in (240, 1_440, 10_080):
+            data = SyntheticProvider().fetch_candles(
+                symbol="BTC/USD",
+                interval_minutes=interval_minutes,
+                as_of=base_as_of,
+                limit=120,
+            )
+            for age in (
+                timedelta(seconds=300),
+                timedelta(seconds=300, microseconds=1),
+            ):
+                with self.subTest(
+                    interval_minutes=interval_minutes,
+                    age=age,
+                ):
+                    result = assess_data_quality(
+                        data,
+                        as_of=base_as_of + age,
+                        interval_minutes=interval_minutes,
+                        expected_symbol="BTC/USD",
+                        expected_source=SyntheticProvider.source_id,
+                        policy=policy(),
+                    )
+                    self.assertNotIn("STALE_DATA", result.critical_flags)
 
     def test_post_cutoff_ingestion_is_vetoed(self) -> None:
         as_of = datetime(2026, 8, 10, tzinfo=timezone.utc)

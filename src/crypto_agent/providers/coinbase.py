@@ -11,7 +11,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .. import __version__
 from ..deadline import bounded_analysis_timeout, ensure_analysis_deadline
-from ..domain import Candle
+from ..domain import Candle, ReferencePriceObservation
 from .base import ProviderError
 
 
@@ -57,6 +57,8 @@ class CoinbaseExchangePublicProvider:
     Missing source buckets are never filled or interpolated.
     """
 
+    __slots__ = ("_base_url", "_timeout_seconds", "_configuration_sealed")
+
     source_id = "coinbase_exchange_spot_rest_v1"
     _immutable_configuration_attributes = frozenset(
         {
@@ -86,20 +88,14 @@ class CoinbaseExchangePublicProvider:
     _utc_epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
     def __setattr__(self, name: str, value: object) -> None:
-        if (
-            getattr(self, "_configuration_sealed", False)
-            and name in type(self)._immutable_configuration_attributes
-        ):
+        if getattr(self, "_configuration_sealed", False):
             raise AttributeError(
                 "Coinbase Exchange provider origin and configuration are immutable"
             )
         object.__setattr__(self, name, value)
 
     def __delattr__(self, name: str) -> None:
-        if (
-            getattr(self, "_configuration_sealed", False)
-            and name in type(self)._immutable_configuration_attributes
-        ):
+        if getattr(self, "_configuration_sealed", False):
             raise AttributeError(
                 "Coinbase Exchange provider origin and configuration are immutable"
             )
@@ -192,6 +188,30 @@ class CoinbaseExchangePublicProvider:
             limit=limit,
         )
 
+    def fetch_reference_price(
+        self,
+        *,
+        symbol: str,
+        as_of: datetime,
+    ) -> ReferencePriceObservation:
+        product = self._products.get(symbol)
+        if product is None:
+            raise ProviderError(f"Unsupported Coinbase Exchange V1 symbol: {symbol}")
+        self._validate_reference_request(as_of=as_of)
+        target_end = self._floor_target_boundary(as_of, 1)
+        target_open = target_end - timedelta(minutes=1)
+        rows = self._request_page(
+            product=product,
+            granularity_seconds=60,
+            start=target_open,
+            end=target_end,
+        )
+        return self.parse_reference_price_payload(
+            rows,
+            symbol=symbol,
+            as_of=as_of,
+        )
+
     def _request_page(
         self,
         *,
@@ -208,7 +228,7 @@ class CoinbaseExchangePublicProvider:
             }
         )
         request = Request(
-            f"{self.base_url}/products/{product}/candles?{query}",
+            f"https://api.exchange.coinbase.com/products/{product}/candles?{query}",
             headers={
                 "Accept": "application/json",
                 "User-Agent": f"crypto-research-agent/{__version__} read-only",
@@ -312,6 +332,42 @@ class CoinbaseExchangePublicProvider:
             bucket_start += target_step
         return candles
 
+    def parse_reference_price_payload(
+        self,
+        payload: list[Any],
+        *,
+        symbol: str,
+        as_of: datetime,
+    ) -> ReferencePriceObservation:
+        if symbol not in self._products:
+            raise ProviderError(f"Unsupported Coinbase Exchange V1 symbol: {symbol}")
+        self._validate_reference_request(as_of=as_of)
+        if not isinstance(payload, list):
+            raise ProviderError("Coinbase Exchange candle response root must be an array")
+        target_end = self._floor_target_boundary(as_of, 1)
+        target_open = target_end - timedelta(minutes=1)
+        matches: list[_BaseCandle] = []
+        for row in payload:
+            candle = self._parse_row(row, 60)
+            if candle.open_time == target_open:
+                matches.append(candle)
+        if not matches:
+            raise ProviderError(
+                "Coinbase Exchange returned no completed one-minute reference candle",
+                code="REFERENCE_PRICE_UNAVAILABLE",
+            )
+        if any(item != matches[0] for item in matches[1:]):
+            raise ProviderError("Conflicting duplicate Coinbase Exchange reference candle")
+        ingested_at = datetime.now(timezone.utc)
+        return ReferencePriceObservation(
+            symbol=symbol,
+            price=matches[0].close,
+            event_time=target_end,
+            available_at=ingested_at,
+            ingested_at=ingested_at,
+            source=self.source_id,
+        )
+
     def _parse_row(self, row: Any, source_granularity_seconds: int) -> _BaseCandle:
         # Coinbase documents [time, low, high, open, close, volume].
         if not isinstance(row, list) or len(row) != 6:
@@ -364,6 +420,11 @@ class CoinbaseExchangePublicProvider:
                 f"Coinbase Exchange limit must be between 1 and {self._max_target_candles}"
             )
         return spec
+
+    @staticmethod
+    def _validate_reference_request(*, as_of: datetime) -> None:
+        if as_of.tzinfo is None or as_of.utcoffset() != timedelta(0):
+            raise ProviderError("as_of must be timezone-aware and normalized to UTC")
 
     def _floor_target_boundary(self, value: datetime, interval_minutes: int) -> datetime:
         step_seconds = interval_minutes * 60
