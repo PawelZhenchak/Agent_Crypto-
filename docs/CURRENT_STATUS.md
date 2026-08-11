@@ -1,8 +1,8 @@
 # Bieżący status
 
 Data checkpointu: **2026-08-10**  
-Pakiet: **0.1.3**  
-System: **0.1.3-v1.1**  
+Pakiet: **0.1.4**  
+System: **0.1.4-v1.1**  
 Stan: **V1.1 development checkpoint — Gate V1 niezaliczony**
 
 ## Ukończone w tym checkpointcie
@@ -63,7 +63,7 @@ Stan: **V1.1 development checkpoint — Gate V1 niezaliczony**
 - narrator normalizuje Unicode/Markdown i blokuje znane bezpośrednie oraz pośrednie
   rekomendacje PL/EN także wtedy, gdy model błędnie oznaczy tekst jako bezpieczny.
 
-Lokalny dowód regresyjny: **213/213 testów standard-library** i pełny
+Lokalny dowód regresyjny: **215/215 testów standard-library** i pełny
 `compileall` dla `src` oraz `tests`. Nie zastępuje to live contract testów ani
 akceptacji na prawdziwym PostgreSQL.
 
@@ -84,20 +84,18 @@ ukrytych evali z 100% recall. Te ograniczenia nadal blokują formalny Gate V1.
 
 ### PostgreSQL
 
-Runner migracji, health-check, migracja i repozytorium zostały sprawdzone statycznie
-oraz na kontrolowanych połączeniach/fakes. Środowisko checkpointu nie posiadało Dockera,
-`psql`, lokalnego serwera PostgreSQL ani opcjonalnego `psycopg`, więc nie ma jeszcze
-dowodu wykonania `schema.sql + 0011 + 0012` na prawdziwym PostgreSQL. Repo nie ma
-jeszcze operacyjnego pakietu seedów, dlatego health ma poprawnie pozostać w
-`SEEDS_MISSING` po samym wykonaniu migracji.
+Repo zawiera operacyjne, idempotentne seedy registry oraz workflow akceptacyjny dla
+czystego PostgreSQL 16. Workflow wykonuje `schema.sql + 0011 + 0012`, dwukrotnie
+uruchamia seeding, wymaga `READY`, sprawdza constrainty, append-only triggery i
+rollback, restartuje kontener oraz ponownie potwierdza trwałość danych i `READY`.
 
 ### Trwały ingest
 
 Gotowa jest fail-closed warstwa append-only persistence z DB-derived selection,
 point-in-time lineage i parytetem algorytmu konsensusu. Nie jest jeszcze kompletnym
 operacyjnym pipeline'em external ingest. Brakuje atomowego zapisu raw HTTP payload/body,
-finalnego batch manifestu transportowego, automatycznej kwarantanny i replayu, seedów
-source registry oraz idempotentnego harmonogramu. Orchestrator nie używa jeszcze
+finalnego batch manifestu transportowego, automatycznej kwarantanny i replayu oraz
+idempotentnego harmonogramu. Orchestrator nie używa jeszcze
 canonical PostgreSQL jako live wejścia analizy.
 
 ### Obserwowalność i pokrycie rynku
@@ -110,19 +108,17 @@ zaakceptowanych live API contracts.
 
 ## Najbliższa kolejność prac
 
-1. Uruchomić czystą bazę PostgreSQL 16 w CI i wykonać `schema.sql`, `0011`, `0012`,
-   seedy oraz transakcyjne testy wszystkich constraintów i triggerów.
-2. Wydzielić minimalny ingest worker do przypiętego, immutable obrazu z osobną rolą
+1. Wydzielić minimalny ingest worker do przypiętego, immutable obrazu z osobną rolą
    bazy i allowlistą egress.
-3. Dodać atomowy external-ingest batch: request URI, raw response bytes/hash,
+2. Dodać atomowy external-ingest batch: request URI, raw response bytes/hash,
    extractor/source-registry versions, wynik `completed|failed|quarantined` i replay.
-4. Dodać idempotentny `ingest-once` przeznaczony do uruchamiania przez scheduler.
-5. Powiązać failed-consensus evidence z trwałym batch/quarantine registry.
-6. Uruchomić live contract tests dla publicznych API Kraken i Coinbase.
-7. Przeprowadzić ukryte evale narratora PL/EN z 100% recall dla rekomendacji.
-8. Zbudować dwusource trades/order book, spread, depth i price impact.
-9. Dodać specjalistów V1, Sceptyka, evidence service, trace evals i dashboard.
-10. Przeprowadzić 4–8 tygodni forward observation i formalny Gate V1.
+3. Dodać idempotentny `ingest-once` przeznaczony do uruchamiania przez scheduler.
+4. Powiązać failed-consensus evidence z trwałym batch/quarantine registry.
+5. Uruchomić live contract tests dla publicznych API Kraken i Coinbase.
+6. Przeprowadzić ukryte evale narratora PL/EN z 100% recall dla rekomendacji.
+7. Zbudować dwusource trades/order book, spread, depth i price impact.
+8. Dodać specjalistów V1, Sceptyka, evidence service, trace evals i dashboard.
+9. Przeprowadzić 4–8 tygodni forward observation i formalny Gate V1.
 
 Do wykonania wszystkich punktów `metadata.v1_gate_passed=false`, środowisko
 `production` jest blokowane, a V2 nie może się rozpocząć.

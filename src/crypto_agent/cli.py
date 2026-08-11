@@ -9,7 +9,7 @@ from typing import Sequence
 
 from .factory import build_orchestrator
 from .narrator import OpenAINarrator
-from .resource_paths import default_migration_directory
+from .resource_paths import default_migration_directory, default_v1_seed_path
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -35,7 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     database.add_argument(
         "action",
-        choices=("plan", "migrate", "health"),
+        choices=("plan", "migrate", "seed", "health"),
         help="Database operation to run",
     )
     database.add_argument(
@@ -69,6 +69,7 @@ def _run_database_command(action: str, migration_directory: str | None) -> int:
         PostgresSettings,
         PsycopgConnectionFactory,
         apply_migrations,
+        apply_v1_seeds,
         check_postgres_health,
         discover_migrations,
         plan_migrations,
@@ -91,6 +92,19 @@ def _run_database_command(action: str, migration_directory: str | None) -> int:
             applied = apply_migrations(connection_factory, migrations)
             payload = {"status": "ok", "applied_now": list(applied)}
             exit_code = 0
+        elif action == "seed":
+            apply_v1_seeds(connection_factory, default_v1_seed_path())
+            health = check_postgres_health(
+                connection_factory,
+                expected_migrations=migrations,
+            )
+            payload = {
+                "status": health.status_code,
+                "healthy": health.healthy,
+                "seeds_ready": health.seeds_ready,
+                "missing_seeds": list(health.missing_seeds),
+            }
+            exit_code = 0 if health.healthy else 1
         else:
             health = check_postgres_health(
                 connection_factory,

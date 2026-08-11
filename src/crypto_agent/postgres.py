@@ -669,6 +669,25 @@ def apply_migrations(
     return tuple(applied_now)
 
 
+def apply_v1_seeds(
+    connection_factory: ConnectionFactory,
+    seed_path: str | Path,
+) -> None:
+    """Apply the idempotent operational V1 registry bundle atomically."""
+
+    try:
+        sql = Path(seed_path).read_text(encoding="utf-8")
+        with transaction(connection_factory) as connection, cursor(connection) as db_cursor:
+            _require_base_schema(db_cursor)
+            db_cursor.execute(sql)
+    except PostgresError:
+        raise
+    except (OSError, UnicodeError):
+        raise MigrationError("PostgreSQL V1 seed bundle could not be read") from None
+    except Exception:
+        raise PostgresOperationError("PostgreSQL V1 seed bundle failed") from None
+
+
 def check_postgres_health(
     connection_factory: ConnectionFactory,
     *,

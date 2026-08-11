@@ -27,6 +27,16 @@ def default_migration_directory() -> Path:
     )
 
 
+def default_v1_seed_path() -> Path:
+    """Locate the immutable operational V1 registry seed bundle."""
+
+    return _first_existing(
+        _PACKAGE_DIRECTORY / "resources" / "db" / "seeds" / "v1_registry.sql",
+        _SOURCE_PROJECT_DIRECTORY / "db" / "seeds" / "v1_registry.sql",
+        description="packaged PostgreSQL V1 registry seeds",
+    )
+
+
 def _first_existing(*candidates: Path, description: str) -> Path:
     for candidate in candidates:
         if candidate.exists():

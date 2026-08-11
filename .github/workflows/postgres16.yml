@@ -1,0 +1,56 @@
+name: PostgreSQL 16 acceptance
+
+on:
+  pull_request:
+  push:
+    branches: [main, "agent/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  postgres16:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: crypto_agent
+          POSTGRES_USER: crypto_agent
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U crypto_agent -d crypto_agent"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+    env:
+      CRYPTO_AGENT_POSTGRES_DSN: postgresql://crypto_agent@127.0.0.1:5432/crypto_agent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install project
+        run: python -m pip install -e ".[dev,postgres]"
+      - name: Bootstrap and test PostgreSQL 16
+        run: python tests/postgres16_acceptance.py bootstrap
+      - name: Run complete Python suite
+        run: python -m pytest
+      - name: Restart PostgreSQL service container
+        run: |
+          POSTGRES_CONTAINER_ID=$(docker ps --filter ancestor=postgres:16-alpine --format '{{.ID}}')
+          test -n "$POSTGRES_CONTAINER_ID"
+          docker restart "$POSTGRES_CONTAINER_ID"
+          for attempt in $(seq 1 30); do
+            if docker exec "$POSTGRES_CONTAINER_ID" pg_isready -U crypto_agent -d crypto_agent; then
+              exit 0
+            fi
+            sleep 2
+          done
+          exit 1
+      - name: Verify persistence and readiness after restart
+        run: python tests/postgres16_acceptance.py verify

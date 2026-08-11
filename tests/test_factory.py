@@ -55,6 +55,10 @@ class FactorySafetyTests(unittest.TestCase):
             '"db/migrations" = "crypto_agent/resources/db/migrations"',
             contents,
         )
+        self.assertIn(
+            '"db/seeds" = "crypto_agent/resources/db/seeds"',
+            contents,
+        )
 
 
 if __name__ == "__main__":
