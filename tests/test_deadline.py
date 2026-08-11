@@ -57,7 +57,9 @@ class AnalysisDeadlineTests(unittest.TestCase):
             with self.assertRaises(AnalysisDeadlineExceeded):
                 with analysis_deadline_scope(time.monotonic() + 0.001):
                     time.sleep(0.01)
-                    Plus500T4Provider().fetch_candles(
+                    Plus500T4Provider(
+                        bridge_token="t" * 32
+                    ).fetch_candles(
                         symbol="BTC/USD",
                         interval_minutes=1_440,
                         as_of=datetime(2026, 8, 10, tzinfo=timezone.utc),

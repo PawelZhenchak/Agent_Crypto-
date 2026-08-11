@@ -9,6 +9,19 @@ permissions:
   contents: read
 
 jobs:
+  t4_bridge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - name: Build read-only T4 bridge
+        run: dotnet build t4-bridge/CryptoAgent.T4Bridge.csproj --configuration Release
+      - name: Run T4 bridge contract tests
+        run: dotnet run --project t4-bridge-tests/CryptoAgent.T4Bridge.ContractTests.csproj --configuration Release
+
   postgres16:
     runs-on: ubuntu-latest
     timeout-minutes: 15

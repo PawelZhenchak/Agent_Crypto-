@@ -40,6 +40,21 @@ Załóż konto Simulator zgodnie z oficjalną stroną Plus500 Futures. Login i h
 zapisz wyłącznie w prywatnej konfiguracji workera .NET. Nie wpisuj ich do `.env`
 agenta Python i nie wysyłaj ich do repozytorium.
 
+Samo konto Simulator nie wystarcza do API. Zgodnie z oficjalną dokumentacją
+trzeba poprosić CTS o zarejestrowanie aplikacji. Po otrzymaniu aktualnego pakietu
+i przykładów podłączamy adapter klienta do interfejsu `IT4MarketDataReader`.
+
+Wygeneruj losowy token minimum 32 znaki i ustaw tę samą wartość prywatnie jako:
+
+- `T4_BRIDGE_TOKEN` w procesie .NET;
+- `CRYPTO_AGENT_T4_BRIDGE_TOKEN` w procesie Python.
+
+Następnie uruchom granicę bezpieczeństwa:
+
+```bash
+dotnet run --project t4-bridge/CryptoAgent.T4Bridge.csproj
+```
+
 Po uruchomieniu mostu na `127.0.0.1:8784`:
 
 ```bash
@@ -47,4 +62,5 @@ crypto-agent analyze --provider t4 --symbol BTC/USD --interval 1440
 ```
 
 Most musi potwierdzić `read_only=true`, `order_routes_exposed=false`, właściwe
-source/venue ID, 120 świec i świeżą cenę. Każda niezgodność kończy się `NO_SIGNAL`.
+source/venue ID, rzeczywisty i niewygasły contract ID, 120 świec oraz świeżą cenę.
+Każda niezgodność kończy się `NO_SIGNAL`.

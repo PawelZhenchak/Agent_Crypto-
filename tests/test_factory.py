@@ -25,6 +25,15 @@ class FactorySafetyTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 build_orchestrator("t4")
 
+    def test_t4_provider_requires_bridge_token(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"CRYPTO_AGENT_ENV": "development", "CRYPTO_AGENT_T4_BRIDGE_TOKEN": ""},
+            clear=False,
+        ):
+            with self.assertRaises(ValueError):
+                build_orchestrator("t4")
+
     def test_default_policy_is_not_relative_to_the_process_cwd(self) -> None:
         with TemporaryDirectory() as directory:
             database_path = Path(directory) / "reports.db"

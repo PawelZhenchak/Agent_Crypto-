@@ -1,6 +1,6 @@
 # Plus500 Futures T4 Research Agent
 
-Wersja `0.2.0` analizuje wyłącznie dane futures z **Plus500 Futures / T4**.
+Wersja `0.3.0` analizuje wyłącznie dane futures z **Plus500 Futures / T4**.
 System działa tylko w trybie odczytu i może zwrócić `ALERT` lub `NO_SIGNAL`.
 Nie loguje się do innych platform i nie składa, nie zmienia ani nie anuluje zleceń.
 
@@ -9,6 +9,7 @@ Nie loguje się do innych platform i nie składa, nie zmienia ani nie anuluje zl
 Proces analityczny łączy się wyłącznie z lokalnym mostem T4 pod
 `http://127.0.0.1:8784`. Most .NET utrzymuje sesję oficjalnego T4 API i wystawia
 tylko dane rynkowe. Dane logowania T4 nigdy nie trafiają do procesu Python.
+Połączenie loopback wymaga dodatkowo wspólnego, losowego tokenu bridge.
 
 Obsługiwany zakres V1:
 
@@ -32,16 +33,19 @@ Tryb `synthetic` służy wyłącznie testom i zawsze pozostaje diagnostyczny.
 ## Uruchomienie z T4
 
 1. Skopiuj `.env.example` do `.env`.
-2. Uruchom odizolowany worker T4 .NET na loopback `127.0.0.1:8784`.
-3. Ustaw `CRYPTO_AGENT_DATA_PROVIDER=t4`.
-4. Uruchom:
+2. Ustaw ten sam, losowy `T4_BRIDGE_TOKEN` w workerze i
+   `CRYPTO_AGENT_T4_BRIDGE_TOKEN` w procesie Python.
+3. Uruchom odizolowany worker T4 .NET na loopback `127.0.0.1:8784`.
+4. Ustaw `CRYPTO_AGENT_DATA_PROVIDER=t4`.
+5. Uruchom:
 
 ```bash
 crypto-agent analyze --provider t4 --symbol BTC/USD --interval 1440
 ```
 
-Do czasu zbudowania i podłączenia workera T4 polecenie bezpiecznie zwróci
-`NO_SIGNAL` z kodem `T4_BRIDGE_UNAVAILABLE`.
+Host bridge jest już zbudowany. Do czasu zarejestrowania aplikacji T4 i
+podłączenia oficjalnego klienta polecenie bezpiecznie zwróci `NO_SIGNAL` z kodem
+`T4_BRIDGE_UNAVAILABLE`.
 
 ## PostgreSQL 16
 

@@ -28,11 +28,13 @@ class Plus500T4Provider:
     _allowed_intervals = frozenset({240, 1440, 10080})
     _allowed_symbols = frozenset({"BTC/USD", "ETH/USD"})
     _max_response_bytes = 4_000_000
+    _bridge_schema_version = 1
 
     def __init__(
         self,
         *,
         bridge_url: str = "http://127.0.0.1:8784",
+        bridge_token: str,
         timeout_seconds: float = 10.0,
     ) -> None:
         parsed = urlsplit(bridge_url)
@@ -53,7 +55,14 @@ class Plus500T4Provider:
             raise ValueError("T4 bridge timeout is invalid")
         if not 1 <= float(timeout_seconds) <= 30:
             raise ValueError("T4 bridge timeout must be in [1, 30] seconds")
+        if (
+            not isinstance(bridge_token, str)
+            or not 32 <= len(bridge_token) <= 256
+            or any(character.isspace() for character in bridge_token)
+        ):
+            raise ValueError("T4 bridge token must contain 32-256 non-whitespace characters")
         self._bridge_url = bridge_url.rstrip("/")
+        self._bridge_token = bridge_token
         self._timeout_seconds = float(timeout_seconds)
 
     def fetch_candles(
@@ -100,7 +109,10 @@ class Plus500T4Provider:
         )
         request = Request(
             f"{self._bridge_url}/v1/market-data?{query}",
-            headers={"Accept": "application/json"},
+            headers={
+                "Accept": "application/json",
+                "X-Crypto-Agent-Bridge-Token": self._bridge_token,
+            },
             method="GET",
         )
         ensure_analysis_deadline()
@@ -108,6 +120,10 @@ class Plus500T4Provider:
             response = build_opener(_NoRedirectHandler()).open(
                 request, timeout=self._timeout_seconds
             )
+            status = getattr(response, "status", 200)
+            content_type = response.headers.get_content_type()
+            if status != 200 or content_type != "application/json":
+                raise ValueError("unexpected bridge response")
             payload_bytes = response.read(self._max_response_bytes + 1)
         except Exception as exc:
             raise ProviderError(
@@ -117,15 +133,35 @@ class Plus500T4Provider:
             raise ProviderError("T4 response is too large", code="T4_RESPONSE_TOO_LARGE")
         try:
             payload = json.loads(payload_bytes)
+            if not isinstance(payload, dict):
+                raise ValueError("payload is not an object")
+            contract_expires_at = _utc(payload["contract_expires_at"])
+            if (
+                type(payload.get("schema_version")) is not int
+                or payload.get("schema_version") != self._bridge_schema_version
+                or payload.get("source_id") != self.source_id
+                or payload.get("venue_id") != self.venue_id
+                or payload.get("read_only") is not True
+                or payload.get("order_routes_exposed") is not False
+                or payload.get("logical_symbol") != symbol
+                or type(payload.get("interval_minutes")) is not int
+                or payload.get("interval_minutes") != interval_minutes
+                or not isinstance(payload.get("contract_id"), str)
+                or not payload["contract_id"].strip()
+                or contract_expires_at <= as_of
+            ):
+                raise ValueError("bridge attestation mismatch")
             candles = tuple(
                 self._parse_candle(item, symbol, interval_minutes)
                 for item in payload["candles"]
             )
             reference = self._parse_reference(payload["reference_price"], symbol)
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ProviderError("T4 payload is invalid", code="T4_PAYLOAD_INVALID") from exc
         if len(candles) < limit:
             raise ProviderError("T4 history is incomplete", code="T4_HISTORY_INCOMPLETE")
+        if any(candle.close_time > as_of for candle in candles):
+            raise ProviderError("T4 returned future data", code="T4_FUTURE_DATA")
         return ProviderBatch(
             candles=candles[-limit:],
             input_candles=candles[-limit:],
@@ -142,6 +178,9 @@ class Plus500T4Provider:
                 "t4_venue_id": payload.get("venue_id"),
                 "t4_order_routes_exposed": payload.get("order_routes_exposed"),
                 "t4_volume_zscore": payload.get("volume_zscore"),
+                "t4_bridge_schema_version": payload.get("schema_version"),
+                "t4_contract_id": payload.get("contract_id"),
+                "t4_contract_expires_at": contract_expires_at.isoformat(),
             },
             reference_price=ReferencePriceSnapshot(
                 symbol=symbol, observations=(reference,)
@@ -177,6 +216,8 @@ class Plus500T4Provider:
     ) -> ReferencePriceObservation:
         if not isinstance(item, dict) or item.get("source") != self.source_id:
             raise ValueError("reference-price source mismatch")
+        if item.get("symbol") != symbol:
+            raise ValueError("reference-price symbol mismatch")
         return ReferencePriceObservation(
             symbol=symbol,
             price=_number(item["price"]),
