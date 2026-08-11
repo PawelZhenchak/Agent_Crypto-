@@ -1,4 +1,4 @@
-# Aktualny stan — 0.2.0
+# Aktualny stan — 0.3.0
 
 ## Gotowe
 
@@ -9,7 +9,11 @@
 - proces analityczny odrzuca dane logowania T4;
 - PostgreSQL ma migrację `0013`, dwa bindingi futures i immutable runtime config;
 - polityka schema v3 wymaga jednej atestowanej proweniencji T4;
-- lokalne testy jednostkowe: 68/68.
+- host bridge .NET 8 nasłuchuje wyłącznie na loopback;
+- każde żądanie bridge wymaga tokenu o długości minimum 32 znaków;
+- kontrakt odrzuca nieznany, nieważny lub wygasły rzeczywisty contract ID;
+- bridge nie zawiera endpointów zleceń i domyślnie działa fail-closed;
+- CI buduje bridge i uruchamia osobne testy kontraktowe .NET.
 
 ## Świadomie zachowana historia
 
@@ -19,7 +23,8 @@ Nie są aktywną konfiguracją ani źródłami runtime.
 
 ## Jeszcze niegotowe
 
-- właściwy worker .NET korzystający z oficjalnych bibliotek T4;
+- rejestracja aplikacji T4 u Plus500 Futures Technologies/CTS;
+- adapter oficjalnego klienta T4 po otrzymaniu aktualnego pakietu i przykładów API;
 - konto T4 Simulator i test live contract;
 - rozwiązywanie rzeczywistego kontraktu front-month oraz kontrolowany roll;
 - operacyjny zapis danych T4 i replay w PostgreSQL;

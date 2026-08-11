@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import unittest
 from datetime import datetime, timedelta, timezone
+from email.message import Message
 from unittest.mock import patch
 
 from crypto_agent.orchestrator import _source_attested
@@ -10,9 +11,15 @@ from crypto_agent.providers.base import ProviderError
 from crypto_agent.providers.t4 import Plus500T4Provider
 
 
+_BRIDGE_TOKEN = "t" * 32
+
+
 class _Response:
     def __init__(self, payload: object) -> None:
         self.payload = json.dumps(payload).encode("utf-8")
+        self.status = 200
+        self.headers = Message()
+        self.headers["Content-Type"] = "application/json"
 
     def read(self, size: int) -> bytes:
         return self.payload[:size]
@@ -23,7 +30,8 @@ class _Opener:
         self.payload = payload
 
     def open(self, request, timeout):  # type: ignore[no-untyped-def]
-        del request, timeout
+        self.request = request
+        del timeout
         return _Response(self.payload)
 
 
@@ -49,13 +57,19 @@ def _payload() -> dict[str, object]:
             }
         )
     return {
+        "schema_version": 1,
         "source_id": "plus500_t4_futures_v1",
         "venue_id": "plus500_t4",
         "read_only": True,
         "order_routes_exposed": False,
+        "logical_symbol": "BTC/USD",
+        "interval_minutes": 1440,
+        "contract_id": "CME:MBT:202609",
+        "contract_expires_at": (as_of + timedelta(days=30)).isoformat(),
         "volume_zscore": 3.5,
         "candles": candles,
         "reference_price": {
+            "symbol": "BTC/USD",
             "source": "plus500_t4_futures_v1",
             "price": 220.0,
             "event_time": (as_of - timedelta(minutes=1)).isoformat(),
@@ -74,14 +88,20 @@ class Plus500T4ProviderTests(unittest.TestCase):
             "http://127.0.0.1",
         ):
             with self.subTest(url=url), self.assertRaises(ValueError):
-                Plus500T4Provider(bridge_url=url)
+                Plus500T4Provider(bridge_url=url, bridge_token=_BRIDGE_TOKEN)
+
+    def test_bridge_requires_a_strong_local_token(self) -> None:
+        for token in ("", "short", "contains whitespace " + "x" * 32):
+            with self.subTest(token=token), self.assertRaises(ValueError):
+                Plus500T4Provider(bridge_token=token)
 
     def test_valid_read_only_payload_is_parsed(self) -> None:
+        opener = _Opener(_payload())
         with patch(
             "crypto_agent.providers.t4.build_opener",
-            return_value=_Opener(_payload()),
+            return_value=opener,
         ):
-            batch = Plus500T4Provider().fetch_batch(
+            batch = Plus500T4Provider(bridge_token=_BRIDGE_TOKEN).fetch_batch(
                 symbol="BTC/USD",
                 interval_minutes=1440,
                 as_of=datetime(2026, 8, 11, tzinfo=timezone.utc),
@@ -91,6 +111,10 @@ class Plus500T4ProviderTests(unittest.TestCase):
         self.assertEqual(batch.sources[0]["id"], "plus500_t4_futures_v1")
         self.assertTrue(batch.metadata["t4_read_only_attested"])
         self.assertFalse(batch.metadata["t4_order_routes_exposed"])
+        self.assertEqual(
+            opener.request.get_header("X-crypto-agent-bridge-token"),
+            _BRIDGE_TOKEN,
+        )
         self.assertEqual(len(batch.reference_price.observations), 1)  # type: ignore[union-attr]
 
     def test_wrong_source_fails_closed(self) -> None:
@@ -100,21 +124,47 @@ class Plus500T4ProviderTests(unittest.TestCase):
             "crypto_agent.providers.t4.build_opener",
             return_value=_Opener(payload),
         ):
-            batch = Plus500T4Provider().fetch_batch(
+            with self.assertRaises(ProviderError) as raised:
+                Plus500T4Provider(bridge_token=_BRIDGE_TOKEN).fetch_batch(
+                    symbol="BTC/USD",
+                    interval_minutes=1440,
+                    as_of=datetime(2026, 8, 11, tzinfo=timezone.utc),
+                    limit=120,
+                )
+        self.assertEqual(raised.exception.code, "T4_PAYLOAD_INVALID")
+
+    def test_order_routes_attestation_fails_closed(self) -> None:
+        payload = _payload()
+        payload["order_routes_exposed"] = True
+        with patch(
+            "crypto_agent.providers.t4.build_opener",
+            return_value=_Opener(payload),
+        ), self.assertRaises(ProviderError) as raised:
+            Plus500T4Provider(bridge_token=_BRIDGE_TOKEN).fetch_batch(
                 symbol="BTC/USD",
                 interval_minutes=1440,
                 as_of=datetime(2026, 8, 11, tzinfo=timezone.utc),
                 limit=120,
             )
-        self.assertEqual(batch.metadata["t4_source_id"], "forged")
-        self.assertFalse(
-            _source_attested(
-                provider=Plus500T4Provider(), batch=batch, required_sources=1
+        self.assertEqual(raised.exception.code, "T4_PAYLOAD_INVALID")
+
+    def test_expired_contract_fails_closed(self) -> None:
+        payload = _payload()
+        payload["contract_expires_at"] = "2026-08-11T00:00:00+00:00"
+        with patch(
+            "crypto_agent.providers.t4.build_opener",
+            return_value=_Opener(payload),
+        ), self.assertRaises(ProviderError) as raised:
+            Plus500T4Provider(bridge_token=_BRIDGE_TOKEN).fetch_batch(
+                symbol="BTC/USD",
+                interval_minutes=1440,
+                as_of=datetime(2026, 8, 11, tzinfo=timezone.utc),
+                limit=120,
             )
-        )
+        self.assertEqual(raised.exception.code, "T4_PAYLOAD_INVALID")
 
     def test_exact_read_only_t4_batch_is_attested(self) -> None:
-        provider = Plus500T4Provider()
+        provider = Plus500T4Provider(bridge_token=_BRIDGE_TOKEN)
         with patch(
             "crypto_agent.providers.t4.build_opener",
             return_value=_Opener(_payload()),
@@ -136,7 +186,7 @@ class Plus500T4ProviderTests(unittest.TestCase):
             "crypto_agent.providers.t4.build_opener",
             return_value=_Opener(payload),
         ), self.assertRaises(ProviderError) as raised:
-            Plus500T4Provider().fetch_batch(
+            Plus500T4Provider(bridge_token=_BRIDGE_TOKEN).fetch_batch(
                 symbol="BTC/USD",
                 interval_minutes=1440,
                 as_of=datetime(2026, 8, 11, tzinfo=timezone.utc),

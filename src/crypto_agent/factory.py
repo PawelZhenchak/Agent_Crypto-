@@ -58,6 +58,7 @@ def build_orchestrator(provider_name: str | None = None) -> ResearchOrchestrator
             bridge_url=os.getenv(
                 "CRYPTO_AGENT_T4_BRIDGE_URL", "http://127.0.0.1:8784"
             ),
+            bridge_token=os.getenv("CRYPTO_AGENT_T4_BRIDGE_TOKEN", ""),
             timeout_seconds=float(os.getenv("CRYPTO_AGENT_T4_TIMEOUT_SECONDS", "10")),
         )
     else:

@@ -9,7 +9,8 @@ __pycache__/
 htmlcov/
 dist/
 build/
+bin/
+obj/
 *.egg-info/
 var/*.db
 var/*.sqlite*
-
