@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from .consensus_math import CONSENSUS_WINDOW_SIZE
 from .domain import (
     DataQualityReport,
     Decision,
@@ -20,17 +19,7 @@ from .domain import (
     Regime,
     RiskAssessment,
 )
-from .reference_price import (
-    ReferencePriceInput,
-    ReferencePriceMathError,
-    build_reference_price_snapshot,
-)
-
-
-_APPROVED_REFERENCE_SOURCE_VENUES = {
-    "kraken_spot_rest_v1": "kraken",
-    "coinbase_exchange_spot_rest_v1": "coinbase",
-}
+_APPROVED_REFERENCE_SOURCE = "plus500_t4_futures_v1"
 
 
 class PolicyConfigurationError(ValueError):
@@ -55,13 +44,8 @@ class RiskPolicy:
     max_absolute_period_return: float
     report_ttl_seconds: int
     max_clock_skew_seconds: int
-    min_consensus_sources: int
-    min_consensus_overlap: int
-    max_reference_price_deviation_from_median_bps: float
-    max_cross_source_divergence_bps: float
-    max_cross_source_ohlc_divergence_bps: float
-    max_cross_source_volume_zscore_delta: float
-    max_divergent_candle_fraction: float
+    required_source_count: int
+    required_history_candles: int
     max_market_price: float
     max_base_volume: float
     leverage_allowed: bool
@@ -77,29 +61,17 @@ class RiskPolicy:
         )
         policy = cls(**_normalize(payload))
         policy.validate_v1_safety()
-        if policy.policy_schema_version != 2:
+        if policy.policy_schema_version != 3:
             raise PolicyConfigurationError(
-                "Legacy policies are replay-only and cannot be loaded for a current run"
+                "Only the Plus500 T4 policy schema version 3 can start a current run"
             )
         return policy
 
     def validate_v1_safety(self) -> None:
         errors: list[str] = []
         min_samples_valid = _strict_integer_between(self.min_samples, 60, 720)
-        min_consensus_overlap_valid = bool(
-            type(self.min_consensus_overlap) is int
-            and self.min_consensus_overlap == CONSENSUS_WINDOW_SIZE
-        )
-        legacy_replay_policy = bool(
-            self.policy_id == "v1-read-only-2026-08-10"
-            and type(self.policy_schema_version) is int
-            and self.policy_schema_version == 1
-        )
-        if not legacy_replay_policy and (
-            type(self.policy_schema_version) is not int
-            or self.policy_schema_version != 2
-        ):
-            errors.append("V1 policy_schema_version must be 2 (or archived replay v1)")
+        if type(self.policy_schema_version) is not int or self.policy_schema_version != 3:
+            errors.append("Plus500 T4 V1 policy_schema_version must be 3")
         if self.mode != "V1_READ_ONLY":
             errors.append("V1 requires mode=V1_READ_ONLY")
         if self.execution_enabled is not False:
@@ -140,52 +112,13 @@ class RiskPolicy:
             errors.append("report_ttl_seconds must be an integer in [60, 86400]")
         if not _strict_integer_between(self.max_clock_skew_seconds, 0, 300):
             errors.append("max_clock_skew_seconds must be an integer in [0, 300]")
+        if type(self.required_source_count) is not int or self.required_source_count != 1:
+            errors.append("Plus500 T4 V1 requires exactly one approved source")
         if (
-            type(self.min_consensus_sources) is not int
-            or self.min_consensus_sources != 2
+            type(self.required_history_candles) is not int
+            or self.required_history_candles != 120
         ):
-            errors.append("V1.1 requires exactly two independent consensus sources")
-        if not min_consensus_overlap_valid:
-            errors.append(
-                f"V1.1 min_consensus_overlap must equal the versioned "
-                f"{CONSENSUS_WINDOW_SIZE}-candle window"
-            )
-        if not _finite_between(
-            self.max_reference_price_deviation_from_median_bps,
-            1.0,
-            50.0,
-        ):
-            errors.append(
-                "BTC/ETH reference-price deviation from the median must be finite "
-                "and in [1.0, 50.0] bps"
-            )
-        if not _finite_between(self.max_cross_source_divergence_bps, 1.0, 100.0):
-            errors.append(
-                "max_cross_source_divergence_bps must be finite and in [1.0, 100.0]"
-            )
-        elif (
-            _finite_between(
-                self.max_reference_price_deviation_from_median_bps,
-                1.0,
-                50.0,
-            )
-            and self.max_cross_source_divergence_bps
-            > 2.0 * self.max_reference_price_deviation_from_median_bps
-        ):
-            errors.append(
-                "pairwise reference-price divergence cannot exceed twice the "
-                "per-source deviation from the two-source median"
-            )
-        if not _finite_between(self.max_cross_source_ohlc_divergence_bps, 1.0, 500.0):
-            errors.append(
-                "max_cross_source_ohlc_divergence_bps must be finite and in [1.0, 500.0]"
-            )
-        if not _finite_between(self.max_cross_source_volume_zscore_delta, 0.1, 3.0):
-            errors.append(
-                "max_cross_source_volume_zscore_delta must be finite and in [0.1, 3.0]"
-            )
-        if not _finite_between(self.max_divergent_candle_fraction, 0.0, 0.0):
-            errors.append("V1.1 requires max_divergent_candle_fraction=0.0")
+            errors.append("Plus500 T4 V1 requires exactly 120 history candles")
         if not _finite_between(self.max_market_price, 1_000_000.0, 1_000_000_000.0):
             errors.append("max_market_price must be finite and in [1e6, 1e9]")
         if not _finite_between(self.max_base_volume, 10_000_000.0, 1_000_000_000_000.0):
@@ -197,39 +130,19 @@ class RiskPolicy:
 
     def fingerprint(self) -> str:
         document = asdict(self)
-        # Archived 0.1.2 canonical rows are replayed against the exact immutable r1
-        # document bytes. Compatibility loading injects safe runtime-only defaults,
-        # but those fields were not part of the original fingerprint contract.
-        if (
-            self.policy_id == "v1-read-only-2026-08-10"
-            and self.policy_schema_version == 1
-        ):
-            document.pop("policy_schema_version")
-            document.pop("max_reference_price_age_seconds")
-            document.pop("max_reference_price_deviation_from_median_bps")
         encoded = json.dumps(
             document, sort_keys=True, separators=(",", ":"), allow_nan=False
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
-
-    @property
-    def max_pairwise_reference_price_divergence_bps(self) -> float:
-        """Effective two-source limit equivalent to deviation from the midpoint median."""
-
-        return min(
-            float(self.max_cross_source_divergence_bps),
-            2.0 * float(self.max_reference_price_deviation_from_median_bps),
-        )
-
 
 class RiskGate:
     """Deterministic veto boundary. No model can bypass it."""
 
     def __init__(self, policy: RiskPolicy) -> None:
         policy.validate_v1_safety()
-        if policy.policy_schema_version != 2:
+        if policy.policy_schema_version != 3:
             raise PolicyConfigurationError(
-                "Legacy risk policies are replay-only and cannot evaluate new decisions"
+                "Only the Plus500 T4 policy can evaluate new decisions"
             )
         self.policy = policy
 
@@ -244,7 +157,7 @@ class RiskGate:
         as_of: datetime,
         expires_at: datetime,
         input_fingerprint_sha256: str,
-        consensus_passed: bool,
+        source_attested: bool,
         proposed_decision: Decision = Decision.NO_SIGNAL,
         proposal_reasons: tuple[str, ...] = (),
     ) -> RiskAssessment:
@@ -280,7 +193,7 @@ class RiskGate:
             isinstance(proposed_decision, Decision)
             and proposed_decision.value in self.policy.allowed_decisions
         )
-        consensus_input_valid = isinstance(consensus_passed, bool)
+        source_attestation_valid = isinstance(source_attested, bool)
 
         if not quality_valid:
             invalid_input_reasons.append("DataQualityReport failed independent validation.")
@@ -294,16 +207,16 @@ class RiskGate:
             invalid_input_reasons.append("Input fingerprint is not a lowercase SHA-256 value.")
         if not decision_valid:
             invalid_input_reasons.append("Proposed decision is outside the V1 allowlist.")
-        if not consensus_input_valid:
-            invalid_input_reasons.append("Consensus proof must be a strict boolean.")
+        if not source_attestation_valid:
+            invalid_input_reasons.append("Source attestation must be a strict boolean.")
         if invalid_input_reasons:
             flags.append("INVALID_RISK_INPUT")
             reasons.extend(invalid_input_reasons)
 
-        if consensus_passed is not True:
-            flags.append("CONSENSUS_REQUIRED")
+        if source_attested is not True:
+            flags.append("SOURCE_ATTESTATION_REQUIRED")
             reasons.append(
-                "Two independent market-data sources did not pass deterministic consensus."
+                "The read-only Plus500 T4 market-data source was not attested."
             )
 
         if symbol not in self.policy.allowed_assets:
@@ -341,7 +254,7 @@ class RiskGate:
             "METRICS_UNAVAILABLE",
             "EXTREME_VOLATILITY",
             "EXTREME_PERIOD_MOVE",
-            "CONSENSUS_REQUIRED",
+            "SOURCE_ATTESTATION_REQUIRED",
             "INVALID_RISK_INPUT",
             "REFERENCE_PRICE_INVALID",
             "REFERENCE_PRICE_MISSING",
@@ -456,12 +369,12 @@ def _reference_price_failures(
     as_of: datetime,
     policy: RiskPolicy,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Recompute the complete two-venue reference-price safety contract."""
+    """Validate one fresh, point-in-time T4 reference-price observation."""
 
     if snapshot is None:
         return (
             ("REFERENCE_PRICE_MISSING",),
-            ("Two-venue reference-price evidence is missing.",),
+            ("Plus500 T4 reference-price evidence is missing.",),
         )
     if not isinstance(snapshot, ReferencePriceSnapshot):
         return (
@@ -475,7 +388,7 @@ def _reference_price_failures(
             and type(snapshot.symbol) is str
             and snapshot.symbol == symbol
             and type(observations) is tuple
-            and len(observations) == 2
+            and len(observations) == 1
             and all(
                 type(item) is ReferencePriceObservation
                 and type(item.source) is str
@@ -485,15 +398,14 @@ def _reference_price_failures(
                 and isinstance(item.price, (int, float))
                 for item in observations
             )
-            and {item.source for item in observations}
-            == set(_APPROVED_REFERENCE_SOURCE_VENUES)
+            and observations[0].source == _APPROVED_REFERENCE_SOURCE
         )
     except (AttributeError, TypeError, ValueError):
         structure_valid = False
     if not structure_valid:
         return (
             ("REFERENCE_PRICE_INVALID",),
-            ("Reference price does not have the exact approved two-venue provenance.",),
+            ("Reference price does not have the approved Plus500 T4 provenance.",),
         )
     if not _is_utc_datetime(as_of):
         return (
@@ -502,48 +414,36 @@ def _reference_price_failures(
         )
 
     try:
-        build_reference_price_snapshot(
-            tuple(
-                ReferencePriceInput(
-                    source_id=observation.source,
-                    venue_id=_APPROVED_REFERENCE_SOURCE_VENUES[observation.source],
-                    symbol=observation.symbol,
-                    open_time=observation.event_time - timedelta(minutes=1),
-                    close_time=observation.event_time,
-                    price=observation.price,
-                    available_at=observation.available_at,
-                    ingested_at=observation.ingested_at,
-                )
-                for observation in observations
-            ),
-            cutoff_as_of=as_of,
-            evaluated_at=as_of,
-            max_age_seconds=policy.max_reference_price_age_seconds,
-            max_deviation_from_median_bps=(
-                policy.max_reference_price_deviation_from_median_bps
-            ),
-            max_market_price=policy.max_market_price,
-            approved_source_venues=_APPROVED_REFERENCE_SOURCE_VENUES,
+        observation = observations[0]
+        timestamps_valid = bool(
+            _is_utc_datetime(observation.event_time)
+            and _is_utc_datetime(observation.available_at)
+            and _is_utc_datetime(observation.ingested_at)
+            and observation.event_time
+            <= observation.available_at
+            <= observation.ingested_at
+            <= as_of
         )
-    except ReferencePriceMathError as exc:
-        if exc.code == "REFERENCE_PRICE_STALE":
-            return (
-                ("STALE_DATA",),
-                ("Reference price is older than the V1 five-minute safety limit.",),
-            )
-        if exc.code == "REFERENCE_PRICE_DIVERGENCE":
-            return (
-                ("DATA_CONFLICT",),
-                ("Reference-price venues exceed the BTC/ETH 50-bps median limit.",),
-            )
+        price_valid = bool(
+            not isinstance(observation.price, bool)
+            and isinstance(observation.price, (int, float))
+            and math.isfinite(float(observation.price))
+            and 0 < float(observation.price) <= policy.max_market_price
+        )
+    except (AttributeError, OverflowError, TypeError, ValueError):
+        timestamps_valid = False
+        price_valid = False
+    if not timestamps_valid or not price_valid:
         return (
             ("REFERENCE_PRICE_INVALID",),
             ("Reference-price evidence failed deterministic validation.",),
         )
-    except (AttributeError, KeyError, OverflowError, TypeError, ValueError):
+    if as_of - observations[0].event_time > timedelta(
+        seconds=policy.max_reference_price_age_seconds
+    ):
         return (
-            ("REFERENCE_PRICE_INVALID",),
-            ("Reference-price evidence failed deterministic validation.",),
+            ("STALE_DATA",),
+            ("Plus500 T4 reference price is older than the five-minute limit.",),
         )
     return (), ()
 

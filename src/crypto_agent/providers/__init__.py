@@ -1,14 +1,10 @@
 from .base import CandleProvider, ProviderError
-from .coinbase import CoinbaseExchangePublicProvider
-from .consensus import CrossExchangeConsensusProvider
-from .kraken import KrakenPublicProvider
 from .synthetic import SyntheticProvider
+from .t4 import Plus500T4Provider
 
 __all__ = [
     "CandleProvider",
-    "CoinbaseExchangePublicProvider",
-    "CrossExchangeConsensusProvider",
-    "KrakenPublicProvider",
+    "Plus500T4Provider",
     "ProviderError",
     "SyntheticProvider",
 ]

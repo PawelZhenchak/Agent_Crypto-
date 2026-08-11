@@ -18,7 +18,7 @@ from crypto_agent.deadline import (
 from crypto_agent.factory import build_orchestrator
 from crypto_agent.orchestrator import ResearchOrchestrator, _canonical_input
 from crypto_agent.policy import RiskPolicy
-from crypto_agent.providers.kraken import KrakenPublicProvider
+from crypto_agent.providers.t4 import Plus500T4Provider
 from crypto_agent.providers.synthetic import SyntheticProvider
 from crypto_agent.storage import ReportRepository
 
@@ -52,18 +52,18 @@ class AnalysisDeadlineTests(unittest.TestCase):
             with analysis_deadline_scope(time.monotonic() - 1.0):
                 ensure_analysis_deadline()
 
-    def test_kraken_does_not_open_socket_after_budget_expires(self) -> None:
-        with patch("crypto_agent.providers.kraken.urlopen") as mocked_open:
+    def test_t4_does_not_open_socket_after_budget_expires(self) -> None:
+        with patch("crypto_agent.providers.t4.build_opener") as mocked_opener:
             with self.assertRaises(AnalysisDeadlineExceeded):
                 with analysis_deadline_scope(time.monotonic() + 0.001):
                     time.sleep(0.01)
-                    KrakenPublicProvider().fetch_candles(
+                    Plus500T4Provider().fetch_candles(
                         symbol="BTC/USD",
                         interval_minutes=1_440,
                         as_of=datetime(2026, 8, 10, tzinfo=timezone.utc),
-                        limit=1,
+                        limit=120,
                     )
-        mocked_open.assert_not_called()
+        mocked_opener.assert_not_called()
 
     def test_expired_worker_cannot_persist_a_late_sqlite_report(self) -> None:
         repository = _RecordingRepository()

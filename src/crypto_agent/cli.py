@@ -13,7 +13,7 @@ from .resource_paths import default_migration_directory, default_v1_seed_path
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Crypto Research Agent V1.1 (read-only)")
+    parser = argparse.ArgumentParser(description="Plus500 T4 Research Agent V1 (read-only)")
     subparsers = parser.add_subparsers(dest="command", required=True)
     analyze = subparsers.add_parser("analyze", help="Create a read-only research report")
     analyze.add_argument("--symbol", default="BTC/USD", choices=("BTC/USD", "ETH/USD"))
@@ -21,11 +21,8 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument(
         "--provider",
         default="synthetic",
-        choices=("synthetic", "kraken", "coinbase", "consensus"),
-        help=(
-            "Standalone feeds are diagnostic-only and always veto ALERT; "
-            "use consensus for two-source analysis"
-        ),
+        choices=("synthetic", "t4"),
+        help="Use t4 for the isolated Plus500 Futures market-data bridge",
     )
     analyze.add_argument("--narrate", action="store_true")
 

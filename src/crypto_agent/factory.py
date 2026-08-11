@@ -6,9 +6,7 @@ from pathlib import Path
 from .orchestrator import ResearchOrchestrator
 from .policy import RiskPolicy
 from .providers import (
-    CoinbaseExchangePublicProvider,
-    CrossExchangeConsensusProvider,
-    KrakenPublicProvider,
+    Plus500T4Provider,
     SyntheticProvider,
 )
 from .resource_paths import default_risk_policy_path
@@ -18,12 +16,9 @@ from .storage import ReportRepository
 FORBIDDEN_EXCHANGE_SECRET_NAMES = {
     "BINANCE_API_KEY",
     "BINANCE_API_SECRET",
-    "COINBASE_API_KEY",
-    "COINBASE_API_PASSPHRASE",
-    "COINBASE_API_PRIVATE_KEY",
-    "COINBASE_API_SECRET",
-    "KRAKEN_API_KEY",
-    "KRAKEN_API_SECRET",
+    "T4_USERNAME",
+    "T4_PASSWORD",
+    "T4_API_KEY",
 }
 
 
@@ -39,12 +34,12 @@ def build_orchestrator(provider_name: str | None = None) -> ResearchOrchestrator
     environment = os.getenv("CRYPTO_AGENT_ENV", "development").lower()
     if environment not in {"development", "test"}:
         raise RuntimeError(
-            "V1.1 remains development/test-only until the complete Gate V1 is passed"
+            "Plus500 T4 V1 remains development/test-only until the complete gate passes"
         )
     selected = provider_name or os.getenv("CRYPTO_AGENT_DATA_PROVIDER")
     if selected is None:
         raise ValueError(
-            "Choose an explicit read-only provider: synthetic, kraken, coinbase or consensus"
+            "Choose an explicit read-only provider: synthetic or t4"
         )
     configured_policy_path = os.getenv("CRYPTO_AGENT_RISK_POLICY_PATH")
     policy_path = (
@@ -53,38 +48,17 @@ def build_orchestrator(provider_name: str | None = None) -> ResearchOrchestrator
         else default_risk_policy_path()
     )
     database_path = Path(
-        os.getenv("CRYPTO_AGENT_DATABASE_PATH", "var/crypto_agent_v1_1.db")
+        os.getenv("CRYPTO_AGENT_DATABASE_PATH", "var/crypto_agent_plus500_t4.db")
     )
     policy = RiskPolicy.load(policy_path)
     if selected == "synthetic":
         provider = SyntheticProvider()
-    elif selected == "kraken":
-        provider = KrakenPublicProvider(
-            base_url=os.getenv("CRYPTO_AGENT_KRAKEN_BASE_URL", "https://api.kraken.com")
-        )
-    elif selected == "coinbase":
-        provider = CoinbaseExchangePublicProvider(
-            base_url=os.getenv(
-                "CRYPTO_AGENT_COINBASE_BASE_URL",
-                "https://api.exchange.coinbase.com",
-            )
-        )
-    elif selected == "consensus":
-        provider = CrossExchangeConsensusProvider(
-            (
-                KrakenPublicProvider(
-                    base_url=os.getenv(
-                        "CRYPTO_AGENT_KRAKEN_BASE_URL", "https://api.kraken.com"
-                    )
-                ),
-                CoinbaseExchangePublicProvider(
-                    base_url=os.getenv(
-                        "CRYPTO_AGENT_COINBASE_BASE_URL",
-                        "https://api.exchange.coinbase.com",
-                    )
-                ),
+    elif selected == "t4":
+        provider = Plus500T4Provider(
+            bridge_url=os.getenv(
+                "CRYPTO_AGENT_T4_BRIDGE_URL", "http://127.0.0.1:8784"
             ),
-            policy,
+            timeout_seconds=float(os.getenv("CRYPTO_AGENT_T4_TIMEOUT_SECONDS", "10")),
         )
     else:
         raise ValueError(f"Unknown read-only provider: {selected}")

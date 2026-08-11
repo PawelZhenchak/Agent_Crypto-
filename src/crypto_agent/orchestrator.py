@@ -8,7 +8,6 @@ from uuid import uuid4
 
 from . import __version__
 from .analytics import calculate_metrics
-from .consensus_math import CONSENSUS_ALGORITHM_VERSION, CONSENSUS_WINDOW_SIZE
 from .deadline import ensure_analysis_deadline
 from .domain import (
     Candle,
@@ -22,14 +21,13 @@ from .domain import (
 )
 from .policy import RiskGate, RiskPolicy
 from .providers.base import CandleProvider, ProviderBatch, ProviderError, fetch_provider_batch
-from .providers.consensus import CrossExchangeConsensusProvider
+from .providers.t4 import Plus500T4Provider
 from .quality import assess_data_quality, deduplicate_exact_candles
-from .reference_price import REFERENCE_PRICE_ALGORITHM_VERSION
 from .signals import VOLUME_ALERT_ZSCORE, propose_research_alert
 from .storage import ReportRepository
 
 
-SYSTEM_VERSION = f"{__version__}-v1.1"
+SYSTEM_VERSION = f"{__version__}-plus500-t4-v1"
 MODEL_VERSION = "deterministic-research-v1"
 
 
@@ -42,13 +40,6 @@ class ResearchOrchestrator:
         repository: ReportRepository | None = None,
     ) -> None:
         policy.validate_v1_safety()
-        if (
-            isinstance(provider, CrossExchangeConsensusProvider)
-            and provider.policy.fingerprint() != policy.fingerprint()
-        ):
-            raise ValueError(
-                "Consensus provider and orchestrator must use the same risk policy"
-            )
         self.provider = provider
         self.policy = policy
         self.risk_gate = RiskGate(policy)
@@ -103,7 +94,7 @@ class ResearchOrchestrator:
                         sources=exc.evidence.sources,
                         metadata={
                             **exc.evidence.metadata,
-                            "consensus_failure_code": exc.code,
+                            "provider_failure_code": exc.code,
                         },
                         reference_price=exc.evidence.reference_price,
                     )
@@ -134,16 +125,14 @@ class ResearchOrchestrator:
         metrics_allowed = quality.passed and quality.score >= self.policy.min_data_quality
         analytics_candles = deduplicate_exact_candles(candles) if metrics_allowed else []
         metrics = self._safe_metrics(analytics_candles, metrics_allowed)
-        consensus_passed = _consensus_attested(
+        source_attested = _source_attested(
             provider=self.provider,
             batch=provider_batch,
-            required_sources=self.policy.min_consensus_sources,
-            required_policy_hash=self.policy.fingerprint(),
+            required_sources=self.policy.required_source_count,
         )
         volume_anomaly_attested = _volume_anomaly_attested(
             provider_batch,
-            required_sources=self.policy.min_consensus_sources,
-            consensus_attested=consensus_passed,
+            source_attested=source_attested,
         )
         proposal = propose_research_alert(
             metrics,
@@ -159,7 +148,7 @@ class ResearchOrchestrator:
             as_of=analysis_time,
             expires_at=expires_at,
             input_fingerprint_sha256=input_fingerprint,
-            consensus_passed=consensus_passed,
+            source_attested=source_attested,
             proposed_decision=proposal.decision,
             proposal_reasons=proposal.reasons,
         )
@@ -207,8 +196,8 @@ class ResearchOrchestrator:
                 "execution_enabled": False,
                 "not_financial_advice": True,
                 "v1_gate_passed": False,
-                "v1_1_consensus_passed": consensus_passed,
-                "v1_1_volume_anomaly_attested": volume_anomaly_attested,
+                "plus500_t4_source_attested": source_attested,
+                "plus500_t4_volume_anomaly_attested": volume_anomaly_attested,
                 "market": instrument_id,
                 "requested_as_of": requested_cutoff.isoformat(),
                 "input_fingerprint_sha256": input_fingerprint,
@@ -346,125 +335,35 @@ def _canonical_reference_price(
     }
 
 
-def _consensus_attested(
+def _source_attested(
     *,
     provider: CandleProvider,
     batch: ProviderBatch | None,
     required_sources: int,
-    required_policy_hash: str,
 ) -> bool:
-    if type(provider) is not CrossExchangeConsensusProvider or batch is None:
+    if type(provider) is not Plus500T4Provider or batch is None:
         return False
     try:
-        sealed_source_ids = tuple(item.source_id for item in provider.providers)
-        if not all(
-            isinstance(item, dict) and isinstance(item.get("id"), str)
-            for item in batch.sources
-        ):
-            return False
-        source_ids = tuple(item["id"] for item in batch.sources)
-        diagnostic_ids = batch.metadata.get("consensus_source_ids")
-        source_counts = batch.metadata.get("consensus_source_counts")
-        overlap = batch.metadata.get("consensus_overlap_count")
-        window_size = batch.metadata.get("consensus_window_size")
-        reference_price = batch.reference_price
-        reference_source_ids = batch.metadata.get("reference_price_source_ids")
-
-        if not (
-            provider.approved_venue_pair is True
-            and provider.source_id == CONSENSUS_ALGORITHM_VERSION
-            and batch.metadata.get("consensus_passed") is True
-            and batch.metadata.get("consensus_version")
-            == CONSENSUS_ALGORITHM_VERSION
-            and batch.metadata.get("consensus_policy_hash") == required_policy_hash
-            and type(required_sources) is int
-            and required_sources == 2
-            and len(source_ids) == required_sources
-            and source_ids == sealed_source_ids
-            and len(set(source_ids)) == required_sources
-            and all(source_ids)
-            and isinstance(diagnostic_ids, list)
-            and tuple(diagnostic_ids) == sealed_source_ids
-            and type(overlap) is int
-            and overlap == CONSENSUS_WINDOW_SIZE
-            and type(window_size) is int
-            and window_size == CONSENSUS_WINDOW_SIZE
-            and isinstance(source_counts, dict)
-            and set(source_counts) == set(sealed_source_ids)
+        source_ids = tuple(item.get("id") for item in batch.sources)
+        reference = batch.reference_price
+        return bool(
+            type(required_sources) is int
+            and required_sources == 1
+            and source_ids == (Plus500T4Provider.source_id,)
+            and len(batch.candles) >= 120
+            and batch.candles == batch.input_candles
             and all(
-                type(source_counts[source_id]) is int
-                and source_counts[source_id] >= CONSENSUS_WINDOW_SIZE
-                for source_id in sealed_source_ids
+                type(item) is Candle and item.source == Plus500T4Provider.source_id
+                for item in batch.candles
             )
-            and type(reference_price) is ReferencePriceSnapshot
-            and type(reference_price.observations) is tuple
-            and len(reference_price.observations) == required_sources
-            and all(
-                type(item) is ReferencePriceObservation
-                for item in reference_price.observations
-            )
-            and tuple(
-                item.source for item in reference_price.observations
-            )
-            == sealed_source_ids
-            and batch.metadata.get("reference_price_present") is True
-            and batch.metadata.get("reference_price_version")
-            == REFERENCE_PRICE_ALGORITHM_VERSION
-            and isinstance(reference_source_ids, list)
-            and tuple(reference_source_ids) == tuple(sorted(sealed_source_ids))
-        ):
-            return False
-
-        canonical_candles = batch.candles
-        raw_candles = batch.input_candles
-        if (
-            len(canonical_candles) != CONSENSUS_WINDOW_SIZE
-            or len(raw_candles) != required_sources * CONSENSUS_WINDOW_SIZE
-            or not all(isinstance(item, Candle) for item in canonical_candles)
-            or not all(isinstance(item, Candle) for item in raw_candles)
-        ):
-            return False
-
-        canonical_windows = {
-            (item.open_time, item.close_time) for item in canonical_candles
-        }
-        canonical_scopes = {
-            (item.symbol, item.interval_minutes) for item in canonical_candles
-        }
-        if (
-            len(canonical_windows) != CONSENSUS_WINDOW_SIZE
-            or len(canonical_scopes) != 1
-            or any(
-                item.source != CONSENSUS_ALGORITHM_VERSION
-                for item in canonical_candles
-            )
-        ):
-            return False
-
-        expected_scope = next(iter(canonical_scopes))
-        if (
-            reference_price.symbol != expected_scope[0]
-            or any(
-                item.symbol != expected_scope[0]
-                for item in reference_price.observations
-            )
-        ):
-            return False
-        raw_by_source: dict[str, list[Candle]] = {
-            source_id: [] for source_id in sealed_source_ids
-        }
-        for item in raw_candles:
-            if (
-                item.source not in raw_by_source
-                or (item.symbol, item.interval_minutes) != expected_scope
-            ):
-                return False
-            raw_by_source[item.source].append(item)
-        return all(
-            len(items) == CONSENSUS_WINDOW_SIZE
-            and {(item.open_time, item.close_time) for item in items}
-            == canonical_windows
-            for items in raw_by_source.values()
+            and type(reference) is ReferencePriceSnapshot
+            and len(reference.observations) == 1
+            and type(reference.observations[0]) is ReferencePriceObservation
+            and reference.observations[0].source == Plus500T4Provider.source_id
+            and batch.metadata.get("t4_read_only_attested") is True
+            and batch.metadata.get("t4_source_id") == Plus500T4Provider.source_id
+            and batch.metadata.get("t4_venue_id") == Plus500T4Provider.venue_id
+            and batch.metadata.get("t4_order_routes_exposed") is False
         )
     except (AttributeError, KeyError, TypeError, ValueError):
         return False
@@ -484,35 +383,19 @@ def _input_fingerprint(snapshot: list[dict[str, object]]) -> str:
 def _volume_anomaly_attested(
     batch: ProviderBatch | None,
     *,
-    required_sources: int,
-    consensus_attested: bool,
+    source_attested: bool,
 ) -> bool:
     if (
-        consensus_attested is not True
+        source_attested is not True
         or batch is None
-        or batch.metadata.get("consensus_passed") is not True
     ):
         return False
-    raw = batch.metadata.get("consensus_volume_zscores")
-    if not isinstance(raw, dict) or len(raw) != required_sources:
-        return False
-    source_ids = {
-        item.get("id") for item in batch.sources if isinstance(item, dict)
-    }
-    if set(raw) != source_ids:
-        return False
-    values = tuple(raw.values())
-    if not all(
+    value = batch.metadata.get("t4_volume_zscore")
+    return bool(
         not isinstance(value, bool)
         and isinstance(value, (int, float))
         and math.isfinite(float(value))
-        for value in values
-    ):
-        return False
-    numeric = tuple(float(value) for value in values)
-    return bool(
-        all(value >= VOLUME_ALERT_ZSCORE for value in numeric)
-        or all(value <= -VOLUME_ALERT_ZSCORE for value in numeric)
+        and abs(float(value)) >= VOLUME_ALERT_ZSCORE
     )
 
 

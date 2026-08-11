@@ -96,7 +96,7 @@ class NarratorGuardTests(unittest.TestCase):
             "System zwrócił NO_SIGNAL z powodu starych danych.",
             "Raport ma status ALERT badawczy; decyzja pochodzi z RiskGate.",
             "Źródła różnią się o 42 pb i mieszczą się w progu polityki.",
-            "Dane obejmują 120 zamkniętych świec z Kraken i Coinbase.",
+            "Dane obejmują 120 zamkniętych świec z Plus500 Futures T4.",
             "System nie otwiera pozycji ani nie wykonuje transakcji.",
             "Raport nie zaleca zwiększenia ekspozycji.",
             "Nie jest to rekomendacja kupna ani sprzedaży.",

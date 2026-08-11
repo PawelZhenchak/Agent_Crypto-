@@ -75,24 +75,24 @@ def _assert_ready() -> None:
         raise AssertionError(f"PostgreSQL health is not READY: {health!r}")
     if health.server_version is None or not health.server_version.startswith("16."):
         raise AssertionError(f"unexpected PostgreSQL server version: {health.server_version}")
-    if _scalar("SELECT COUNT(*) FROM crypto_agent.market_data_source_bindings") != 4:
-        raise AssertionError("expected exactly four venue bindings")
-    if _scalar("SELECT COUNT(*) FROM crypto_agent.canonical_candle_series") != 6:
-        raise AssertionError("expected exactly six canonical series")
+    if _scalar("SELECT COUNT(*) FROM crypto_agent.market_data_source_bindings") != 2:
+        raise AssertionError("expected exactly two Plus500 T4 instrument bindings")
+    if _scalar("SELECT COUNT(*) FROM crypto_agent.t4_runtime_config") != 1:
+        raise AssertionError("expected exactly one read-only T4 runtime config")
 
 
 def bootstrap_and_test() -> None:
     _execute_file(PROJECT_ROOT / "db" / "schema.sql")
     migrations = discover_migrations(PROJECT_ROOT / "db" / "migrations")
-    if apply_migrations(_factory(), migrations) != ("0011", "0012"):
-        raise AssertionError("clean PostgreSQL 16 did not apply migrations 0011 and 0012")
+    if apply_migrations(_factory(), migrations) != ("0011", "0012", "0013"):
+        raise AssertionError("clean PostgreSQL 16 did not apply migrations 0011-0013")
     apply_v1_seeds(_factory(), default_v1_seed_path())
     apply_v1_seeds(_factory(), default_v1_seed_path())
     _assert_ready()
 
     _expect_sqlstate(
         "UPDATE crypto_agent.data_sources SET display_name = 'tampered' "
-        "WHERE source_key = 'kraken_spot_rest_v1'",
+        "WHERE source_key = 'plus500_t4_futures_v1'",
         "55000",
     )
     _expect_sqlstate(

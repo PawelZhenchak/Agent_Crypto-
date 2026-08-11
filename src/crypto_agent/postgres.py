@@ -266,6 +266,7 @@ _MIGRATED_TABLES = (
     "canonical_candle_provenance",
     "reference_price_manifests",
     "reference_price_provenance",
+    "t4_runtime_config",
 )
 _BASE_TRIGGER_FUNCTIONS = (
     "forbid_append_only_change",
@@ -410,6 +411,22 @@ _MIGRATED_COLUMN_REQUIREMENTS = (
             ("linked_at", "timestamptz"),
         ),
     )
+    + _column_requirements(
+        "t4_runtime_config",
+        (
+            ("runtime_config_id", "int8"),
+            ("source_id", "int8"),
+            ("provider_key", "text"),
+            ("venue_key", "text"),
+            ("bridge_protocol", "text"),
+            ("read_only", "bool"),
+            ("order_routes_enabled", "bool"),
+            ("observed_at", "timestamptz"),
+            ("available_at", "timestamptz"),
+            ("ingested_at", "timestamptz"),
+            ("content_hash", "sha256_hex"),
+        ),
+    )
 )
 
 
@@ -542,16 +559,10 @@ _MIGRATED_TRIGGER_REQUIREMENTS = _append_only_trigger_requirements(_MIGRATED_TAB
     ),
 )
 _EXPECTED_BINDINGS = (
-    ("kraken_spot_rest_v1", "kraken", "BTC/USD", "XBTUSD"),
-    ("kraken_spot_rest_v1", "kraken", "ETH/USD", "ETHUSD"),
-    ("coinbase_exchange_spot_rest_v1", "coinbase", "BTC/USD", "BTC-USD"),
-    ("coinbase_exchange_spot_rest_v1", "coinbase", "ETH/USD", "ETH-USD"),
+    ("plus500_t4_futures_v1", "plus500_t4", "BTC/USD", "BTC-FUTURES-FRONT"),
+    ("plus500_t4_futures_v1", "plus500_t4", "ETH/USD", "ETH-FUTURES-FRONT"),
 )
-_EXPECTED_CANONICAL_SERIES = tuple(
-    (symbol, interval_seconds)
-    for symbol in ("BTC/USD", "ETH/USD")
-    for interval_seconds in (14_400, 86_400, 604_800)
-)
+_EXPECTED_CANONICAL_SERIES: tuple[tuple[str, int], ...] = ()
 
 
 def discover_migrations(directory: str | Path) -> tuple[Migration, ...]:
@@ -1136,6 +1147,7 @@ def _missing_seed_requirements(
           AND market.ingested_at <= CURRENT_TIMESTAMP
           AND binding.available_at <= CURRENT_TIMESTAMP
           AND binding.ingested_at <= CURRENT_TIMESTAMP
+          AND source.source_key = 'plus500_t4_futures_v1'
         """,
     )
     binding_counts = Counter(
@@ -1171,7 +1183,7 @@ def _missing_seed_requirements(
         JOIN crypto_agent.risk_policies policy
           ON policy.risk_policy_id = series.risk_policy_id
          AND policy.content_hash = series.policy_hash
-        WHERE series.algorithm_version = 'cross_exchange_spot_consensus_v1'
+        WHERE series.algorithm_version = 'plus500_t4_direct_v1'
           AND series.policy_hash = %s
           AND policy.content_hash = %s
           AND policy.policy_document->>'policy_id' = %s
@@ -1181,16 +1193,14 @@ def _missing_seed_requirements(
           AND series.ingested_at <= CURRENT_TIMESTAMP
           AND policy.available_at <= CURRENT_TIMESTAMP
           AND policy.ingested_at <= CURRENT_TIMESTAMP
-          AND market.instrument_type = 'spot'
-          AND source.source_key <> ALL(%s)
-          AND exchange.exchange_key <> ALL(%s)
+          AND market.instrument_type = 'future'
+          AND source.source_key = 'plus500_t4_futures_v1'
+          AND exchange.exchange_key = 'plus500_t4'
         """,
         (
             policy_hash,
             policy_hash,
             policy_id,
-            ["kraken_spot_rest_v1", "coinbase_exchange_spot_rest_v1"],
-            ["kraken", "coinbase"],
         ),
     )
     series_counts = Counter(
