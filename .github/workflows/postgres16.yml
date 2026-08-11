@@ -28,7 +28,6 @@ jobs:
           --health-retries 12
     env:
       CRYPTO_AGENT_POSTGRES_DSN: postgresql://crypto_agent@127.0.0.1:5432/crypto_agent
-      POSTGRES_CONTAINER_ID: ${{ job.services.postgres.id }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -43,6 +42,8 @@ jobs:
         run: python -m pytest
       - name: Restart PostgreSQL service container
         run: |
+          POSTGRES_CONTAINER_ID=$(docker ps --filter ancestor=postgres:16-alpine --format '{{.ID}}')
+          test -n "$POSTGRES_CONTAINER_ID"
           docker restart "$POSTGRES_CONTAINER_ID"
           for attempt in $(seq 1 30); do
             if docker exec "$POSTGRES_CONTAINER_ID" pg_isready -U crypto_agent -d crypto_agent; then
