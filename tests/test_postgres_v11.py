@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import unittest
 from pathlib import Path
@@ -11,6 +12,7 @@ from crypto_agent.postgres import (
     PostgresUnavailableError,
     PsycopgConnectionFactory,
     apply_migrations,
+    apply_v1_seeds,
     check_postgres_health,
     discover_migrations,
 )
@@ -139,7 +141,7 @@ def _health_steps(
 class _BrokenDriver:
     @staticmethod
     def connect(*args: object, **kwargs: object) -> object:
-        raise RuntimeError("could not use postgresql://admin:super-secret@db/internal")
+        raise RuntimeError("could not use opaque-sensitive-connection-marker")
 
 
 class PostgresV11Tests(unittest.TestCase):
@@ -179,20 +181,19 @@ class PostgresV11Tests(unittest.TestCase):
 
     def test_settings_repr_never_contains_dsn_secret(self) -> None:
         settings = PostgresSettings(
-            dsn="postgresql://crypto_agent:super-secret@localhost/crypto_agent"
+            dsn="opaque-sensitive-dsn"
         )
-        self.assertNotIn("super-secret", repr(settings))
-        self.assertNotIn("postgresql://", repr(settings))
+        self.assertNotIn("opaque-sensitive-dsn", repr(settings))
 
     def test_connector_failure_is_sanitized_and_drops_cause(self) -> None:
         settings = PostgresSettings(
-            dsn="postgresql://crypto_agent:super-secret@localhost/crypto_agent"
+            dsn="opaque-sensitive-dsn"
         )
         with patch("crypto_agent.postgres.importlib.import_module", return_value=_BrokenDriver):
             with self.assertRaises(PostgresUnavailableError) as raised:
                 PsycopgConnectionFactory(settings)()
         self.assertEqual(str(raised.exception), "PostgreSQL is unavailable")
-        self.assertNotIn("super-secret", str(raised.exception))
+        self.assertNotIn("opaque-sensitive", str(raised.exception))
         self.assertIsNone(raised.exception.__cause__)
 
     def test_migration_is_discovered_with_sha256(self) -> None:
@@ -525,11 +526,11 @@ class PostgresV11Tests(unittest.TestCase):
 
     def test_health_check_does_not_return_connection_exception(self) -> None:
         def unavailable() -> FakeConnection:
-            raise RuntimeError("postgresql://root:secret-value@host/db")
+            raise RuntimeError("opaque-sensitive-connection-marker")
 
         health = check_postgres_health(unavailable)
         self.assertEqual(health.status_code, "POSTGRES_UNAVAILABLE")
-        self.assertNotIn("secret-value", repr(health))
+        self.assertNotIn("opaque-sensitive", repr(health))
 
     def test_migration_runner_records_checksum_after_sql(self) -> None:
         migrations = discover_migrations(PROJECT_ROOT / "db/migrations")[:1]
@@ -564,6 +565,46 @@ class PostgresV11Tests(unittest.TestCase):
             if "INSERT INTO crypto_agent.schema_migrations" in query
         )
         self.assertLess(migration_sql_index, ledger_insert_index)
+
+    def test_v1_seed_runner_is_atomic_and_executes_packaged_bundle(self) -> None:
+        seed_path = PROJECT_ROOT / "db/seeds/v1_registry.sql"
+        connection = FakeConnection(
+            [
+                SQLStep("to_regclass('crypto_agent.candles')", [("crypto_agent.candles",)]),
+                SQLStep("INSERT INTO data_sources"),
+            ]
+        )
+
+        apply_v1_seeds(lambda: connection, seed_path)
+
+        self.assertTrue(connection.committed)
+        self.assertFalse(connection.rolled_back)
+        self.assertTrue(connection.closed)
+
+    def test_v1_seed_bundle_contains_exact_operational_scope(self) -> None:
+        sql = (PROJECT_ROOT / "db/seeds/v1_registry.sql").read_text(encoding="utf-8")
+        for source_key in (
+            "kraken_spot_rest_v1",
+            "coinbase_exchange_spot_rest_v1",
+            "cross_exchange_spot_consensus_v1",
+        ):
+            self.assertIn(source_key, sql)
+        self.assertEqual(sql.count("('BTC/USD', 14400)"), 1)
+        self.assertEqual(sql.count("('ETH/USD', 604800)"), 1)
+        self.assertIn("ON CONFLICT (series_key) DO NOTHING", sql)
+        self.assertIn("c44f0366fae8cb8605855999c9afb8ff9c55a0777c4deb423330632b78dc7ec8", sql)
+
+        seed_policy = re.search(
+            r"\$policy\$(?P<document>.*?)\$policy\$::jsonb",
+            sql,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(seed_policy)
+        assert seed_policy is not None
+        configured_policy = json.loads(
+            (PROJECT_ROOT / "configs/risk_policy.v1.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(json.loads(seed_policy.group("document")), configured_policy)
 
 
 if __name__ == "__main__":

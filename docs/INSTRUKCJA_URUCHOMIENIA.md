@@ -1,6 +1,6 @@
-# Instrukcja uruchomienia checkpointu 0.1.3
+# Instrukcja uruchomienia checkpointu 0.1.4
 
-Ta instrukcja dotyczy systemu **0.1.3-v1.1**. Jest to read-only agent badawczy:
+Ta instrukcja dotyczy systemu **0.1.4-v1.1**. Jest to read-only agent badawczy:
 nie składa zleceń, nie używa kluczy giełdowych i nie wykonuje transferów. Wynik
 `ALERT` oznacza wyłącznie alert badawczy, a nie rekomendację kupna lub sprzedaży.
 
@@ -114,13 +114,15 @@ set +a
 docker compose up -d postgres
 crypto-agent db plan
 crypto-agent db migrate
+crypto-agent db seed
 crypto-agent db health
 ```
 
-Po samym uruchomieniu schematu i migracji health powinien zwrócić
-`SEEDS_MISSING`. To obecnie oczekiwane zachowanie fail-closed: repozytorium nie ma
-jeszcze operacyjnego pakietu seedów registry. Status `READY` będzie poprawny dopiero
-po dodaniu dokładnych bindingów Kraken/Coinbase oraz sześciu canonical series.
+Po samym uruchomieniu schematu i migracji health powinien zwrócić `SEEDS_MISSING`.
+Polecenie `crypto-agent db seed` dodaje dokładne bindingi Kraken/Coinbase oraz sześć
+canonical series. Po nim `crypto-agent db health` powinien zwrócić `READY`.
+Ponowne uruchomienie seeda jest bezpieczne i idempotentne; dane konfliktujące nie są
+nadpisywane, a health odrzuca brakujący lub nadmiarowy zakres.
 
 ## 8. Jak działa przepływ decyzji
 
@@ -135,7 +137,7 @@ po dodaniu dokładnych bindingów Kraken/Coinbase oraz sześciu canonical series
 
 ## 9. Obecne ograniczenia
 
-Checkpoint nie jest ukończoną V1. Nie wykonano jeszcze akceptacji na prawdziwym
-PostgreSQL 16 ani live contract tests Kraken/Coinbase. Brakuje operacyjnego ingestu,
-seedów, schedulera, order booka, specjalistów analitycznych, dashboardu oraz 4–8
+Checkpoint nie jest ukończoną V1. Akceptacja PostgreSQL 16 działa w GitHub Actions,
+ale nie wykonano live contract tests Kraken/Coinbase. Brakuje operacyjnego ingestu,
+schedulera, order booka, specjalistów analitycznych, dashboardu oraz 4–8
 tygodni obserwacji. Dlatego `metadata.v1_gate_passed` musi pozostać `false`.

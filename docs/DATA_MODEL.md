@@ -124,7 +124,7 @@ historyczny fingerprint, lecz jest replay-only; nowe canonical/reference manifes
 wymagają schema-r2.
 
 Ten parytet nie czyni jeszcze PostgreSQL źródłem runtime analizy: factory nie ma jeszcze
-external-ingest/replay joba, raw payload capture, kwarantanny, seedów registry ani
+external-ingest/replay joba, raw payload capture, kwarantanny ani
 schedulera. Warstwa persistence jest gotowym fundamentem, lecz operacyjna integracja i
 akceptacja na prawdziwym PostgreSQL pozostają otwarte.
 

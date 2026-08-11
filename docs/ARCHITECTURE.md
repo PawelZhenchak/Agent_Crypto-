@@ -1,7 +1,7 @@
 # Architektura Crypto Agent
 
 > **Status implementacji:** dokument opisuje architekturę docelową V1–V4. Kod jest
-> checkpointem `0.1.3 / V1.1`: dwa publiczne feedy spot, cross-source consensus i
+> checkpointem `0.1.4 / V1.1`: dwa publiczne feedy spot, cross-source consensus i
 > osobny dwuźródłowy snapshot ceny referencyjnej są zaimplementowane oraz testowane
 > na fixture'ach. Research i risk pozostają logicznymi modułami jednego procesu, nie
 > osobnymi usługami. Gate V1 jest niezaliczony, live contract tests i integracja z
@@ -297,7 +297,7 @@ manifesty wymagają schema-r2.
 
 Ta ścieżka została sprawdzona na fakes i statycznie. Nie wykonano jej jeszcze na
 prawdziwym PostgreSQL 16; nie ma też operacyjnego raw-payload ingestu, quarantine,
-seedów registry ani schedulera. Health pozostaje fail-closed jako `SEEDS_MISSING`,
+operacyjnego schedulera. Health pozostaje fail-closed jako `SEEDS_MISSING`,
 dopóki wymagany registry footprint nie zostanie jawnie utworzony.
 
 ```mermaid

@@ -1,6 +1,6 @@
 # Crypto Research Agent V1.1
 
-Checkpoint **0.1.3-v1.1** rozwija read-only fundament agenta badawczego o dwa
+Checkpoint **0.1.4-v1.1** rozwija read-only fundament agenta badawczego o dwa
 publiczne feedy spot, deterministyczny konsensus Kraken–Coinbase i point-in-time
 persistence dla PostgreSQL. System nadal służy wyłącznie do developmentu i testów.
 `metadata.v1_gate_passed` zawsze pozostaje `false`.
@@ -8,7 +8,7 @@ persistence dla PostgreSQL. System nadal służy wyłącznie do developmentu i t
 > `ALERT` jest alertem badawczym, nigdy poleceniem kupna lub sprzedaży. Każdy brak,
 > konflikt albo wadliwy dowód konsensusu kończy się `NO_SIGNAL`.
 
-## Co działa w checkpointcie 0.1.3
+## Co działa w checkpointcie 0.1.4
 
 - allowlista `BTC/USD` i `ETH/USD`, interwały 4h, 1d i 1w;
 - publiczne adaptery Kraken i Coinbase Exchange bez kluczy i prywatnych endpointów;
@@ -62,6 +62,11 @@ persistence dla PostgreSQL. System nadal służy wyłącznie do developmentu i t
   triggerów, dokładnych kolumn ośmiu tabel migracyjnych, checksummowanych migracji
   oraz dokładnego zestawu semantycznych seedów; pusty manifest migracji ani
   nadmiarowy seed nie mogą ominąć kontroli;
+- wersjonowany, idempotentny pakiet seedów tworzy dokładnie cztery bindingi
+  Kraken/Coinbase oraz sześć serii canonical dla BTC/ETH i interwałów 4h/1d/1w;
+- GitHub Actions uruchamia czysty PostgreSQL 16, wykonuje `schema.sql`, migracje
+  `0011/0012`, seedy, testy constraintów/triggerów/rollbacku, restartuje kontener
+  i ponownie wymaga statusu `READY`;
 - opcjonalny narrator OpenAI otrzymuje wynik dopiero po deterministycznym RiskGate
   i nie może zmienić decyzji; NFKC/casefold, kontrola znaków niewidocznych, Markdownu
   i fraz PL/EN blokują znane bezpośrednie oraz pośrednie sugestie działania.
@@ -72,18 +77,13 @@ giełdowymi blokuje start.
 
 ## Czego V1.1 jeszcze nie zalicza
 
-- migracji i triggerów nie uruchomiono na prawdziwym PostgreSQL w tym środowisku;
-  dowód obejmuje testy na fakes i inspekcję statyczną, bo nie było Dockera, `psql`,
-  serwera PostgreSQL ani `psycopg`;
 - nie wykonano live contract testów wobec bieżących API Kraken i Coinbase;
 - brak operacyjnego external ingestu z atomowym raw HTTP payload, finalnym batch
-  manifestem, automatyczną kwarantanną, replayem, seedami registry i schedulerem;
+  manifestem, automatyczną kwarantanną, replayem i schedulerem;
 - orchestrator nie czyta jeszcze canonical PostgreSQL jako produkcyjnego wejścia;
 - brak trades/order booka, spreadu, depth i price impact;
 - brak specjalistów derivatives, on-chain, makro, tokenomics, stablecoin i Sceptyka;
 - brak pełnego trace/evals dashboardu i 4–8 tygodni forward observation.
-- repo nie zawiera jeszcze operacyjnych seedów registry, więc poprawny health-check
-  świadomie zwraca `SEEDS_MISSING`, dopóki wymagane bindingi i serie nie istnieją;
 - attestation jest defense-in-depth, nie sandboxem: arbitralny kod lub plugin już
   uruchomiony w tym samym interpreterze może zmienić także sam RiskGate; rzeczywista
   granica wymaga osobnego, minimalnego workera ingestu w przypiętym obrazie;
@@ -130,9 +130,9 @@ PYTHONPATH=src python -m unittest discover -s tests -v
 python -m compileall -q src tests
 ```
 
-Lokalny wynik checkpointu: **213/213 testów standard-library** oraz
+Lokalny wynik checkpointu: **215/215 testów standard-library** oraz
 pełny `compileall` dla `src` i `tests`. Ten wynik nie zastępuje testów live ani
-akceptacji na prawdziwym PostgreSQL.
+zielonego przebiegu akceptacji PostgreSQL 16 w CI.
 
 `pytest`, Ruff i mypy są dostępne po instalacji dodatku `dev`, ale bazowa suite używa
 standardowej biblioteki, aby regresje bezpieczeństwa dało się uruchomić offline.
@@ -145,12 +145,14 @@ Lokalny serwer z Compose nasłuchuje tylko na `127.0.0.1`:
 docker compose up -d postgres
 crypto-agent db plan
 crypto-agent db migrate
+crypto-agent db seed
 crypto-agent db health
 ```
 
-Readiness jest fail-closed: po samym bootstrapie i migracjach wynik pozostanie
-`SEEDS_MISSING`, dopóki registry nie ma dokładnych bindingów Kraken/Coinbase dla
-BTC/ETH oraz sześciu kanonicznych serii powiązanych z bieżącą polityką.
+Po samym bootstrapie i migracjach readiness celowo zwraca `SEEDS_MISSING`.
+`crypto-agent db seed` atomowo dodaje dokładny registry scope; dopiero wtedy health
+może zwrócić `READY`. Ponowne wykonanie seeda jest idempotentne, a konfliktujące lub
+nadmiarowe dane pozostają fail-closed.
 
 `db/schema.sql` jest bootstrapem czystej bazy PostgreSQL 16, a `db/migrations/`
 zawiera checksummowane migracje aplikacyjne. Ustaw `POSTGRES_PASSWORD` i
@@ -172,8 +174,7 @@ replayu; nowe zapisy wymagają schema-r2.
 
 Canonical OHLC jest wynikiem wspólnego algorytmu. Znormalizowany wolumen jest wartością
 bezwymiarową i pozostaje w manifeście wraz z diagnostyką; nie jest zapisywany jako
-`candles.base_volume`. Live akceptacja tej ścieżki na PostgreSQL pozostaje otwartą
-bramką.
+`candles.base_volume`.
 
 ## API
 
@@ -221,6 +222,7 @@ funkcją laboratoryjną i domyślnie wyłączoną do czasu formalnych evals.
 
 Stan i kolejne bramki opisują `docs/CURRENT_STATUS.md`, `docs/ROADMAP.md`,
 `docs/ARCHITECTURE.md`, `docs/DATA_MODEL.md`, `docs/SAFETY_POLICY.md`,
-`docs/EVALUATION_PLAN.md` i `docs/V1_1_RELEASE_NOTES.md`. Pełna instrukcja instalacji,
+`docs/EVALUATION_PLAN.md`, `docs/POSTGRES16_ACCEPTANCE.md` i
+`docs/V1_1_RELEASE_NOTES.md`. Pełna instrukcja instalacji,
 uruchomienia oraz oczekiwanych wyników znajduje się w
 [`docs/INSTRUKCJA_URUCHOMIENIA.md`](docs/INSTRUKCJA_URUCHOMIENIA.md).

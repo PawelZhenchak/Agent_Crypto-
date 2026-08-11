@@ -4,7 +4,7 @@
 **Zakres:** V1–V4  
 **Zasada nadrzędna:** `deny by default` — brak jednoznacznego spełnienia warunku oznacza odmowę działania, a nie zgodę warunkową.
 
-Checkpoint `0.1.3-v1.1` pozostaje read-only i ma `metadata.v1_gate_passed=false`.
+Checkpoint `0.1.4-v1.1` pozostaje read-only i ma `metadata.v1_gate_passed=false`.
 Zielona suite lokalna nie jest sama w sobie formalnym dowodem przejścia Gate V1.
 
 ## 1. Cel i granice systemu
