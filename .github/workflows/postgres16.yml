@@ -3,7 +3,7 @@ name: PostgreSQL 16 acceptance
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, "agent/**"]
 
 permissions:
   contents: read
