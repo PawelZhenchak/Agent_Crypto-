@@ -152,6 +152,7 @@ class PostgresV11Tests(unittest.TestCase):
             for name in (
                 "0011_canonical_candle_provenance.sql",
                 "0012_reference_price_policy_contract.sql",
+                "0013_plus500_t4_runtime.sql",
             )
         )
         base_tables = set(re.findall(r"^CREATE TABLE ([a-z0-9_]+)", base_sql, re.MULTILINE))
@@ -165,11 +166,11 @@ class PostgresV11Tests(unittest.TestCase):
         self.assertEqual(set(postgres_module._BASE_TABLES), base_tables)
         self.assertEqual(set(postgres_module._MIGRATED_TABLES), migrated_tables)
         self.assertEqual(len(postgres_module._BASE_TABLES), 42)
-        self.assertEqual(len(postgres_module._MIGRATED_TABLES), 8)
+        self.assertEqual(len(postgres_module._MIGRATED_TABLES), 9)
         self.assertEqual(
             len(postgres_module._BASE_TRIGGER_REQUIREMENTS)
             + len(postgres_module._MIGRATED_TRIGGER_REQUIREMENTS),
-            115,
+            117,
         )
         for requirement in (
             *postgres_module._BASE_TRIGGER_REQUIREMENTS,
@@ -198,7 +199,9 @@ class PostgresV11Tests(unittest.TestCase):
 
     def test_migration_is_discovered_with_sha256(self) -> None:
         migrations = discover_migrations(PROJECT_ROOT / "db/migrations")
-        self.assertEqual([item.version for item in migrations], ["0011", "0012"])
+        self.assertEqual(
+            [item.version for item in migrations], ["0011", "0012", "0013"]
+        )
         for migration in migrations:
             self.assertRegex(migration.checksum_sha256, r"^[0-9a-f]{64}$")
 
@@ -336,7 +339,7 @@ class PostgresV11Tests(unittest.TestCase):
         self.assertTrue(health.database_reachable)
         self.assertTrue(health.base_schema_ready)
         self.assertEqual(health.status_code, "MIGRATIONS_PENDING")
-        self.assertEqual(health.missing_migrations, ("0011", "0012"))
+        self.assertEqual(health.missing_migrations, ("0011", "0012", "0013"))
         self.assertTrue(connection.committed)
         self.assertTrue(connection.closed)
         self.assertTrue(
@@ -370,7 +373,7 @@ class PostgresV11Tests(unittest.TestCase):
         health = check_postgres_health(lambda: connection, expected_migrations=())
         self.assertFalse(health.healthy)
         self.assertEqual(health.status_code, "MIGRATIONS_PENDING")
-        self.assertEqual(health.missing_migrations, ("0011", "0012"))
+        self.assertEqual(health.missing_migrations, ("0011", "0012", "0013"))
 
     def test_caller_cannot_replace_packaged_migration_manifest_with_subset(self) -> None:
         migrations = discover_migrations(PROJECT_ROOT / "db/migrations")
@@ -449,15 +452,14 @@ class PostgresV11Tests(unittest.TestCase):
         self.assertTrue(health.triggers_ready)
         self.assertEqual(health.status_code, "SEEDS_MISSING")
         self.assertIn(
-            "binding:kraken_spot_rest_v1:kraken:BTC/USD:XBTUSD",
+            "binding:plus500_t4_futures_v1:plus500_t4:BTC/USD:BTC-FUTURES-FRONT",
             health.missing_seeds,
         )
-        self.assertIn("series:ETH/USD:604800", health.missing_seeds)
 
     def test_health_check_rejects_unexpected_semantic_seeds(self) -> None:
         bindings = (
             *postgres_module._EXPECTED_BINDINGS,
-            ("kraken_spot_rest_v1", "kraken", "LTC/USD", "LTCUSD"),
+            ("plus500_t4_futures_v1", "plus500_t4", "LTC/USD", "LTC-FUTURES-FRONT"),
         )
         series = (*postgres_module._EXPECTED_CANONICAL_SERIES, ("BTC/USD", 3_600))
         connection = FakeConnection(_health_steps(bindings=bindings, series=series))
@@ -467,7 +469,8 @@ class PostgresV11Tests(unittest.TestCase):
         self.assertFalse(health.healthy)
         self.assertEqual(health.status_code, "SEEDS_MISSING")
         self.assertIn(
-            "unexpected_binding:kraken_spot_rest_v1:kraken:LTC/USD:LTCUSD",
+            "unexpected_binding:plus500_t4_futures_v1:plus500_t4:"
+            "LTC/USD:LTC-FUTURES-FRONT",
             health.missing_seeds,
         )
         self.assertIn("unexpected_series:BTC/USD:3600", health.missing_seeds)
@@ -583,16 +586,15 @@ class PostgresV11Tests(unittest.TestCase):
 
     def test_v1_seed_bundle_contains_exact_operational_scope(self) -> None:
         sql = (PROJECT_ROOT / "db/seeds/v1_registry.sql").read_text(encoding="utf-8")
-        for source_key in (
-            "kraken_spot_rest_v1",
-            "coinbase_exchange_spot_rest_v1",
-            "cross_exchange_spot_consensus_v1",
-        ):
-            self.assertIn(source_key, sql)
-        self.assertEqual(sql.count("('BTC/USD', 14400)"), 1)
-        self.assertEqual(sql.count("('ETH/USD', 604800)"), 1)
-        self.assertIn("ON CONFLICT (series_key) DO NOTHING", sql)
-        self.assertIn("c44f0366fae8cb8605855999c9afb8ff9c55a0777c4deb423330632b78dc7ec8", sql)
+        self.assertIn("plus500_t4_futures_v1", sql)
+        self.assertIn("plus500_t4", sql)
+        self.assertIn("BTC-FUTURES-FRONT", sql)
+        self.assertIn("ETH-FUTURES-FRONT", sql)
+        self.assertNotIn("kraken_spot_rest_v1", sql)
+        self.assertNotIn("coinbase_exchange_spot_rest_v1", sql)
+        self.assertIn("order_routes_enabled", sql)
+        self.assertIn("FALSE", sql)
+        self.assertIn("589a39880a7bff780e510864525817dd890764e85b43ffdd6419cabc80a62d7d", sql)
 
         seed_policy = re.search(
             r"\$policy\$(?P<document>.*?)\$policy\$::jsonb",

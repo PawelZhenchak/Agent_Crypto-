@@ -1,7 +1,5 @@
--- Crypto Agent V1 operational registry seeds.
--- Apply only after schema.sql and migrations 0011/0012.
--- The statements are idempotent for the exact immutable registry keys. Any
--- conflicting pre-existing data remains visible to the fail-closed health check.
+-- Plus500 Futures / T4-only operational registry.
+-- Apply after schema.sql and migrations 0011, 0012 and 0013.
 
 SET LOCAL search_path TO crypto_agent, public;
 SET LOCAL TIME ZONE 'UTC';
@@ -10,40 +8,26 @@ INSERT INTO data_sources (
     source_key, display_name, source_kind, trust_tier, homepage_url,
     registry_version, config_hash, observed_at, available_at, ingested_at
 ) VALUES
-    ('kraken_spot_rest_v1', 'Kraken Spot REST', 'market_data', 2,
-     'https://docs.kraken.com/api/', 'v1', repeat('1', 64),
-     '2026-01-01 00:00:00+00', '2026-01-01 00:00:00+00', '2026-01-01 00:00:00+00'),
-    ('coinbase_exchange_spot_rest_v1', 'Coinbase Exchange Spot REST', 'market_data', 2,
-     'https://docs.cdp.coinbase.com/exchange/', 'v1', repeat('2', 64),
-     '2026-01-01 00:00:00+00', '2026-01-01 00:00:00+00', '2026-01-01 00:00:00+00'),
+    ('plus500_t4_futures_v1', 'Plus500 Futures T4', 'futures_market_data', 2,
+     'https://futures-technologies.plus500.com/api/', 'v1', repeat('1', 64),
+     '2026-08-11 00:00:00+00', '2026-08-11 00:00:00+00',
+     '2026-08-11 00:00:00+00'),
     ('crypto_agent_registry_v1', 'Crypto Agent Registry', 'internal_registry', 1,
-     NULL, 'v1', repeat('3', 64),
-     '2026-01-01 00:00:00+00', '2026-01-01 00:00:00+00', '2026-01-01 00:00:00+00'),
-    ('cross_exchange_spot_consensus_v1', 'Cross-exchange Spot Consensus',
-     'derived_market_data', 1, NULL, 'v1', repeat('4', 64),
-     '2026-01-01 00:00:00+00', '2026-01-01 00:00:00+00', '2026-01-01 00:00:00+00')
+     NULL, 'v1', repeat('2', 64),
+     '2026-08-11 00:00:00+00', '2026-08-11 00:00:00+00',
+     '2026-08-11 00:00:00+00')
 ON CONFLICT (source_key) DO NOTHING;
 
 INSERT INTO exchanges (
     exchange_key, venue_kind, source_id, source_record_key, source_version,
     revision_no, observed_at, available_at, ingested_at, content_hash
-) VALUES
-    ('kraken', 'centralized_exchange',
-     (SELECT source_id FROM data_sources WHERE source_key = 'kraken_spot_rest_v1'),
-     'exchange:kraken', 'v1', 1,
-     '2026-01-01 00:00:00+00', '2026-01-01 00:00:00+00',
-     '2026-01-01 00:00:00+00', repeat('5', 64)),
-    ('coinbase', 'centralized_exchange',
-     (SELECT source_id FROM data_sources
-      WHERE source_key = 'coinbase_exchange_spot_rest_v1'),
-     'exchange:coinbase', 'v1', 1,
-     '2026-01-01 00:00:00+00', '2026-01-01 00:00:00+00',
-     '2026-01-01 00:00:00+00', repeat('6', 64)),
-    ('crypto_agent_consensus', 'derived_venue',
-     (SELECT source_id FROM data_sources WHERE source_key = 'crypto_agent_registry_v1'),
-     'exchange:crypto_agent_consensus', 'v1', 1,
-     '2026-01-01 00:00:00+00', '2026-01-01 00:00:00+00',
-     '2026-01-01 00:00:00+00', repeat('7', 64))
+) VALUES (
+    'plus500_t4', 'futures_platform',
+    (SELECT source_id FROM data_sources WHERE source_key = 'plus500_t4_futures_v1'),
+    'venue:plus500-t4', 'v1', 1,
+    '2026-08-11 00:00:00+00', '2026-08-11 00:00:00+00',
+    '2026-08-11 00:00:00+00', repeat('3', 64)
+)
 ON CONFLICT (exchange_key) DO NOTHING;
 
 INSERT INTO assets (
@@ -52,19 +36,16 @@ INSERT INTO assets (
 ) VALUES
     ('btc', 'crypto_asset',
      (SELECT source_id FROM data_sources WHERE source_key = 'crypto_agent_registry_v1'),
-     'asset:btc', 'v1', 1,
-     '2026-01-01 00:00:00+00', '2026-01-01 00:00:00+00',
-     '2026-01-01 00:00:00+00', repeat('8', 64)),
+     'asset:btc', 'v1', 1, '2026-08-11 00:00:00+00', '2026-08-11 00:00:00+00',
+     '2026-08-11 00:00:00+00', repeat('4', 64)),
     ('eth', 'crypto_asset',
      (SELECT source_id FROM data_sources WHERE source_key = 'crypto_agent_registry_v1'),
-     'asset:eth', 'v1', 1,
-     '2026-01-01 00:00:00+00', '2026-01-01 00:00:00+00',
-     '2026-01-01 00:00:00+00', repeat('9', 64)),
+     'asset:eth', 'v1', 1, '2026-08-11 00:00:00+00', '2026-08-11 00:00:00+00',
+     '2026-08-11 00:00:00+00', repeat('5', 64)),
     ('usd', 'fiat_currency',
      (SELECT source_id FROM data_sources WHERE source_key = 'crypto_agent_registry_v1'),
-     'asset:usd', 'v1', 1,
-     '2026-01-01 00:00:00+00', '2026-01-01 00:00:00+00',
-     '2026-01-01 00:00:00+00', repeat('a', 64))
+     'asset:usd', 'v1', 1, '2026-08-11 00:00:00+00', '2026-08-11 00:00:00+00',
+     '2026-08-11 00:00:00+00', repeat('6', 64))
 ON CONFLICT (asset_key) DO NOTHING;
 
 INSERT INTO asset_versions (
@@ -75,21 +56,21 @@ INSERT INTO asset_versions (
     ((SELECT asset_id FROM assets WHERE asset_key = 'btc'), 'Bitcoin', 'BTC',
      'active', '{}'::jsonb,
      (SELECT source_id FROM data_sources WHERE source_key = 'crypto_agent_registry_v1'),
-     'asset-version:btc:v1', 'v1', 1,
-     '2026-01-01 00:00:00+00', '2026-01-01 00:00:00+00',
-     '2026-01-01 00:00:00+00', repeat('b', 64)),
+     'asset-version:btc:t4-v1', 'v1', 1,
+     '2026-08-11 00:00:00+00', '2026-08-11 00:00:00+00',
+     '2026-08-11 00:00:00+00', repeat('7', 64)),
     ((SELECT asset_id FROM assets WHERE asset_key = 'eth'), 'Ethereum', 'ETH',
      'active', '{}'::jsonb,
      (SELECT source_id FROM data_sources WHERE source_key = 'crypto_agent_registry_v1'),
-     'asset-version:eth:v1', 'v1', 1,
-     '2026-01-01 00:00:00+00', '2026-01-01 00:00:00+00',
-     '2026-01-01 00:00:00+00', repeat('c', 64)),
+     'asset-version:eth:t4-v1', 'v1', 1,
+     '2026-08-11 00:00:00+00', '2026-08-11 00:00:00+00',
+     '2026-08-11 00:00:00+00', repeat('8', 64)),
     ((SELECT asset_id FROM assets WHERE asset_key = 'usd'), 'US Dollar', 'USD',
      'active', '{}'::jsonb,
      (SELECT source_id FROM data_sources WHERE source_key = 'crypto_agent_registry_v1'),
-     'asset-version:usd:v1', 'v1', 1,
-     '2026-01-01 00:00:00+00', '2026-01-01 00:00:00+00',
-     '2026-01-01 00:00:00+00', repeat('d', 64))
+     'asset-version:usd:t4-v1', 'v1', 1,
+     '2026-08-11 00:00:00+00', '2026-08-11 00:00:00+00',
+     '2026-08-11 00:00:00+00', repeat('9', 64))
 ON CONFLICT (source_id, source_record_key, revision_no) DO NOTHING;
 
 INSERT INTO markets (
@@ -97,80 +78,33 @@ INSERT INTO markets (
     source_id, source_record_key, source_version, revision_no,
     observed_at, available_at, ingested_at, content_hash
 )
-SELECT venue || ':' || lower(symbol) || '-usd', exchange_id, asset_id,
-       (SELECT asset_id FROM assets WHERE asset_key = 'usd'), 'spot', source_id,
-       'market:' || venue || ':' || lower(symbol) || '-usd', 'v1', 1,
-       '2026-01-01 00:00:00+00', '2026-01-01 00:00:00+00',
-       '2026-01-01 00:00:00+00', content_hash
-FROM (
-    VALUES
-        ('kraken', 'BTC',
-         (SELECT exchange_id FROM exchanges WHERE exchange_key = 'kraken'),
-         (SELECT asset_id FROM assets WHERE asset_key = 'btc'),
-         (SELECT source_id FROM data_sources WHERE source_key = 'kraken_spot_rest_v1'),
-         repeat('e', 64)),
-        ('kraken', 'ETH',
-         (SELECT exchange_id FROM exchanges WHERE exchange_key = 'kraken'),
-         (SELECT asset_id FROM assets WHERE asset_key = 'eth'),
-         (SELECT source_id FROM data_sources WHERE source_key = 'kraken_spot_rest_v1'),
-         repeat('f', 64)),
-        ('coinbase', 'BTC',
-         (SELECT exchange_id FROM exchanges WHERE exchange_key = 'coinbase'),
-         (SELECT asset_id FROM assets WHERE asset_key = 'btc'),
-         (SELECT source_id FROM data_sources
-          WHERE source_key = 'coinbase_exchange_spot_rest_v1'),
-         repeat('0', 64)),
-        ('coinbase', 'ETH',
-         (SELECT exchange_id FROM exchanges WHERE exchange_key = 'coinbase'),
-         (SELECT asset_id FROM assets WHERE asset_key = 'eth'),
-         (SELECT source_id FROM data_sources
-          WHERE source_key = 'coinbase_exchange_spot_rest_v1'),
-         repeat('1', 64)),
-        ('crypto_agent_consensus', 'BTC',
-         (SELECT exchange_id FROM exchanges WHERE exchange_key = 'crypto_agent_consensus'),
-         (SELECT asset_id FROM assets WHERE asset_key = 'btc'),
-         (SELECT source_id FROM data_sources
-          WHERE source_key = 'cross_exchange_spot_consensus_v1'),
-         repeat('2', 64)),
-        ('crypto_agent_consensus', 'ETH',
-         (SELECT exchange_id FROM exchanges WHERE exchange_key = 'crypto_agent_consensus'),
-         (SELECT asset_id FROM assets WHERE asset_key = 'eth'),
-         (SELECT source_id FROM data_sources
-          WHERE source_key = 'cross_exchange_spot_consensus_v1'),
-         repeat('3', 64))
-) AS registry(venue, symbol, exchange_id, asset_id, source_id, content_hash)
+SELECT 'plus500_t4:' || lower(symbol) || '-usd-front',
+       (SELECT exchange_id FROM exchanges WHERE exchange_key = 'plus500_t4'),
+       (SELECT asset_id FROM assets WHERE asset_key = lower(symbol)),
+       (SELECT asset_id FROM assets WHERE asset_key = 'usd'),
+       'future',
+       (SELECT source_id FROM data_sources WHERE source_key = 'plus500_t4_futures_v1'),
+       'market:plus500-t4:' || lower(symbol) || '-usd-front', 'v1', 1,
+       '2026-08-11 00:00:00+00', '2026-08-11 00:00:00+00',
+       '2026-08-11 00:00:00+00', content_hash
+FROM (VALUES ('BTC', repeat('a', 64)), ('ETH', repeat('b', 64))) AS item(symbol, content_hash)
 ON CONFLICT (market_key) DO NOTHING;
 
 INSERT INTO market_symbols (
     market_id, symbol_namespace, symbol, source_id, source_record_key,
     source_version, revision_no, observed_at, available_at, ingested_at, content_hash
-) VALUES
-    ((SELECT market_id FROM markets WHERE market_key = 'kraken:btc-usd'),
-     'kraken', 'XBTUSD',
-     (SELECT source_id FROM data_sources WHERE source_key = 'kraken_spot_rest_v1'),
-     'market-symbol:kraken:XBTUSD', 'v1', 1,
-     '2026-01-01 00:00:00+00', '2026-01-01 00:00:00+00',
-     '2026-01-01 00:00:00+00', repeat('4', 64)),
-    ((SELECT market_id FROM markets WHERE market_key = 'kraken:eth-usd'),
-     'kraken', 'ETHUSD',
-     (SELECT source_id FROM data_sources WHERE source_key = 'kraken_spot_rest_v1'),
-     'market-symbol:kraken:ETHUSD', 'v1', 1,
-     '2026-01-01 00:00:00+00', '2026-01-01 00:00:00+00',
-     '2026-01-01 00:00:00+00', repeat('5', 64)),
-    ((SELECT market_id FROM markets WHERE market_key = 'coinbase:btc-usd'),
-     'coinbase', 'BTC-USD',
-     (SELECT source_id FROM data_sources
-      WHERE source_key = 'coinbase_exchange_spot_rest_v1'),
-     'market-symbol:coinbase:BTC-USD', 'v1', 1,
-     '2026-01-01 00:00:00+00', '2026-01-01 00:00:00+00',
-     '2026-01-01 00:00:00+00', repeat('6', 64)),
-    ((SELECT market_id FROM markets WHERE market_key = 'coinbase:eth-usd'),
-     'coinbase', 'ETH-USD',
-     (SELECT source_id FROM data_sources
-      WHERE source_key = 'coinbase_exchange_spot_rest_v1'),
-     'market-symbol:coinbase:ETH-USD', 'v1', 1,
-     '2026-01-01 00:00:00+00', '2026-01-01 00:00:00+00',
-     '2026-01-01 00:00:00+00', repeat('7', 64))
+)
+SELECT (SELECT market_id FROM markets
+        WHERE market_key = 'plus500_t4:' || lower(asset_symbol) || '-usd-front'),
+       'plus500_t4_logical', venue_symbol,
+       (SELECT source_id FROM data_sources WHERE source_key = 'plus500_t4_futures_v1'),
+       'market-symbol:plus500-t4:' || venue_symbol, 'v1', 1,
+       '2026-08-11 00:00:00+00', '2026-08-11 00:00:00+00',
+       '2026-08-11 00:00:00+00', content_hash
+FROM (VALUES
+    ('BTC', 'BTC-FUTURES-FRONT', repeat('c', 64)),
+    ('ETH', 'ETH-FUTURES-FRONT', repeat('d', 64))
+) AS item(asset_symbol, venue_symbol, content_hash)
 ON CONFLICT (source_id, source_record_key, revision_no) DO NOTHING;
 
 INSERT INTO risk_policies (
@@ -178,102 +112,66 @@ INSERT INTO risk_policies (
     source_record_key, source_version, revision_no, observed_at, available_at,
     ingested_at, content_hash
 ) VALUES (
-    'v1-read-only', '2026-08-10-r2', '2026-01-01 00:00:00+00',
+    'v1-read-only-plus500-t4', '2026-08-11', '2026-08-11 00:00:00+00',
     $policy${
-      "policy_id": "v1-read-only-2026-08-10-r2",
-      "policy_schema_version": 2,
-      "mode": "V1_READ_ONLY",
-      "execution_enabled": false,
-      "allowed_decisions": ["NO_SIGNAL", "ALERT"],
-      "allowed_assets": ["BTC/USD", "ETH/USD"],
-      "allowed_intervals_minutes": [240, 1440, 10080],
-      "min_samples": 60,
-      "min_data_quality": 0.85,
-      "max_staleness_multiplier": 1.25,
-      "max_reference_price_age_seconds": 300,
-      "max_gap_multiplier": 1.5,
-      "max_annualized_volatility": 1.2,
-      "max_absolute_period_return": 0.2,
-      "report_ttl_seconds": 3600,
-      "max_clock_skew_seconds": 30,
-      "min_consensus_sources": 2,
-      "min_consensus_overlap": 120,
-      "max_reference_price_deviation_from_median_bps": 50.0,
-      "max_cross_source_divergence_bps": 100.0,
-      "max_cross_source_ohlc_divergence_bps": 500.0,
-      "max_cross_source_volume_zscore_delta": 3.0,
-      "max_divergent_candle_fraction": 0.0,
-      "max_market_price": 1000000000.0,
-      "max_base_volume": 1000000000000.0,
-      "leverage_allowed": false,
-      "martingale_allowed": false,
-      "exchange_credentials_allowed": false,
-      "human_approval_required_for_execution": true
+      "policy_id":"v1-read-only-plus500-t4-2026-08-11",
+      "policy_schema_version":3,
+      "mode":"V1_READ_ONLY",
+      "execution_enabled":false,
+      "allowed_decisions":["NO_SIGNAL","ALERT"],
+      "allowed_assets":["BTC/USD","ETH/USD"],
+      "allowed_intervals_minutes":[240,1440,10080],
+      "min_samples":60,
+      "min_data_quality":0.85,
+      "max_staleness_multiplier":1.25,
+      "max_reference_price_age_seconds":300,
+      "max_gap_multiplier":1.5,
+      "max_annualized_volatility":1.2,
+      "max_absolute_period_return":0.2,
+      "report_ttl_seconds":3600,
+      "max_clock_skew_seconds":30,
+      "required_source_count":1,
+      "required_history_candles":120,
+      "max_market_price":1000000000.0,
+      "max_base_volume":1000000000000.0,
+      "leverage_allowed":false,
+      "martingale_allowed":false,
+      "exchange_credentials_allowed":false,
+      "human_approval_required_for_execution":true
     }$policy$::jsonb,
     (SELECT source_id FROM data_sources WHERE source_key = 'crypto_agent_registry_v1'),
-    'risk-policy:v1-read-only:2026-08-10-r2', 'v1', 1,
-    '2026-01-01 00:00:00+00', '2026-01-01 00:00:00+00',
-    '2026-01-01 00:00:00+00',
-    'c44f0366fae8cb8605855999c9afb8ff9c55a0777c4deb423330632b78dc7ec8'
+    'risk-policy:v1-read-only-plus500-t4:2026-08-11', 'v1', 1,
+    '2026-08-11 00:00:00+00', '2026-08-11 00:00:00+00',
+    '2026-08-11 00:00:00+00',
+    '589a39880a7bff780e510864525817dd890764e85b43ffdd6419cabc80a62d7d'
 )
 ON CONFLICT (policy_key, policy_version) DO NOTHING;
 
 INSERT INTO market_data_source_bindings (
     source_id, market_id, canonical_symbol, venue_symbol,
     observed_at, available_at, ingested_at, content_hash
-) VALUES
-    ((SELECT source_id FROM data_sources WHERE source_key = 'kraken_spot_rest_v1'),
-     (SELECT market_id FROM markets WHERE market_key = 'kraken:btc-usd'),
-     'BTC/USD', 'XBTUSD', '2026-01-01 00:00:00+00', '2026-01-01 00:00:00+00',
-     '2026-01-01 00:00:00+00', repeat('8', 64)),
-    ((SELECT source_id FROM data_sources WHERE source_key = 'kraken_spot_rest_v1'),
-     (SELECT market_id FROM markets WHERE market_key = 'kraken:eth-usd'),
-     'ETH/USD', 'ETHUSD', '2026-01-01 00:00:00+00', '2026-01-01 00:00:00+00',
-     '2026-01-01 00:00:00+00', repeat('9', 64)),
-    ((SELECT source_id FROM data_sources
-      WHERE source_key = 'coinbase_exchange_spot_rest_v1'),
-     (SELECT market_id FROM markets WHERE market_key = 'coinbase:btc-usd'),
-     'BTC/USD', 'BTC-USD', '2026-01-01 00:00:00+00', '2026-01-01 00:00:00+00',
-     '2026-01-01 00:00:00+00', repeat('a', 64)),
-    ((SELECT source_id FROM data_sources
-      WHERE source_key = 'coinbase_exchange_spot_rest_v1'),
-     (SELECT market_id FROM markets WHERE market_key = 'coinbase:eth-usd'),
-     'ETH/USD', 'ETH-USD', '2026-01-01 00:00:00+00', '2026-01-01 00:00:00+00',
-     '2026-01-01 00:00:00+00', repeat('b', 64))
+)
+SELECT
+    (SELECT source_id FROM data_sources WHERE source_key = 'plus500_t4_futures_v1'),
+    (SELECT market_id FROM markets
+     WHERE market_key = 'plus500_t4:' || lower(asset_symbol) || '-usd-front'),
+    asset_symbol || '/USD', venue_symbol,
+    '2026-08-11 00:00:00+00', '2026-08-11 00:00:00+00',
+    '2026-08-11 00:00:00+00', content_hash
+FROM (VALUES
+    ('BTC', 'BTC-FUTURES-FRONT', repeat('e', 64)),
+    ('ETH', 'ETH-FUTURES-FRONT', repeat('f', 64))
+) AS item(asset_symbol, venue_symbol, content_hash)
 ON CONFLICT (source_id, market_id) DO NOTHING;
 
-INSERT INTO canonical_candle_series (
-    series_key, canonical_market_id, canonical_source_id, risk_policy_id,
-    canonical_symbol, interval_seconds, algorithm_version, policy_hash,
-    observed_at, available_at, ingested_at, content_hash
+INSERT INTO t4_runtime_config (
+    source_id, provider_key, venue_key, bridge_protocol, read_only,
+    order_routes_enabled, observed_at, available_at, ingested_at, content_hash
+) VALUES (
+    (SELECT source_id FROM data_sources WHERE source_key = 'plus500_t4_futures_v1'),
+    'plus500_t4_futures_v1', 'plus500_t4', 'loopback_http_json_v1', TRUE, FALSE,
+    '2026-08-11 00:00:00+00', '2026-08-11 00:00:00+00',
+    '2026-08-11 00:00:00+00',
+    'f01d1e313c0b3f23250ac89a91241134e7a77e58a8e5727e1338c7ddde63c249'
 )
-SELECT 'canonical:' || lower(replace(symbol, '/', '-')) || ':' || interval_seconds,
-       CASE symbol
-           WHEN 'BTC/USD' THEN
-               (SELECT market_id FROM markets
-                WHERE market_key = 'crypto_agent_consensus:btc-usd')
-           ELSE
-               (SELECT market_id FROM markets
-                WHERE market_key = 'crypto_agent_consensus:eth-usd')
-       END,
-       (SELECT source_id FROM data_sources
-        WHERE source_key = 'cross_exchange_spot_consensus_v1'),
-       (SELECT risk_policy_id FROM risk_policies
-        WHERE policy_key = 'v1-read-only' AND policy_version = '2026-08-10-r2'),
-       symbol, interval_seconds, 'cross_exchange_spot_consensus_v1',
-       'c44f0366fae8cb8605855999c9afb8ff9c55a0777c4deb423330632b78dc7ec8',
-       '2026-01-01 00:00:00+00', '2026-01-01 00:00:00+00',
-       '2026-01-01 00:00:00+00',
-       CASE symbol || ':' || interval_seconds
-           WHEN 'BTC/USD:14400' THEN repeat('c', 64)
-           WHEN 'BTC/USD:86400' THEN repeat('d', 64)
-           WHEN 'BTC/USD:604800' THEN repeat('e', 64)
-           WHEN 'ETH/USD:14400' THEN repeat('f', 64)
-           WHEN 'ETH/USD:86400' THEN repeat('0', 64)
-           ELSE repeat('1', 64)
-       END
-FROM (VALUES
-    ('BTC/USD', 14400), ('BTC/USD', 86400), ('BTC/USD', 604800),
-    ('ETH/USD', 14400), ('ETH/USD', 86400), ('ETH/USD', 604800)
-) AS required_series(symbol, interval_seconds)
-ON CONFLICT (series_key) DO NOTHING;
+ON CONFLICT (provider_key) DO NOTHING;

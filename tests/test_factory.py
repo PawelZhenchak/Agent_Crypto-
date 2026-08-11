@@ -11,10 +11,10 @@ from crypto_agent.factory import build_orchestrator
 
 
 class FactorySafetyTests(unittest.TestCase):
-    def test_exchange_credentials_are_rejected(self) -> None:
+    def test_t4_credentials_are_rejected_in_analysis_process(self) -> None:
         with patch.dict(
             "os.environ",
-            {"KRAKEN_API_KEY": "forbidden", "CRYPTO_AGENT_ENV": "development"},
+            {"T4_PASSWORD": "forbidden", "CRYPTO_AGENT_ENV": "development"},
             clear=False,
         ):
             with self.assertRaises(RuntimeError):
@@ -23,7 +23,7 @@ class FactorySafetyTests(unittest.TestCase):
     def test_production_is_blocked_until_full_v1_gate_passes(self) -> None:
         with patch.dict("os.environ", {"CRYPTO_AGENT_ENV": "production"}, clear=False):
             with self.assertRaises(RuntimeError):
-                build_orchestrator("kraken")
+                build_orchestrator("t4")
 
     def test_default_policy_is_not_relative_to_the_process_cwd(self) -> None:
         with TemporaryDirectory() as directory:
@@ -41,7 +41,9 @@ class FactorySafetyTests(unittest.TestCase):
             ):
                 orchestrator = build_orchestrator("synthetic")
 
-        self.assertEqual(orchestrator.policy.policy_id, "v1-read-only-2026-08-10-r2")
+        self.assertEqual(
+            orchestrator.policy.policy_id, "v1-read-only-plus500-t4-2026-08-11"
+        )
 
     def test_wheel_includes_runtime_policy_and_migrations(self) -> None:
         pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"

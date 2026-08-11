@@ -15,13 +15,13 @@ from .narrator import NarrativeUnavailable, OpenAINarrator
 from .resource_paths import default_migration_directory
 
 
-API_VERSION = f"{__version__}-v1.1"
+API_VERSION = f"{__version__}-plus500-t4-v1"
 
 
 app = FastAPI(
-    title="Crypto Research Agent V1.1",
+    title="Plus500 Futures T4 Research Agent",
     version=API_VERSION,
-    description="Development-only dual-feed research system. No trading execution.",
+    description="Development-only T4 market-data research system. No trading execution.",
 )
 
 
@@ -98,7 +98,7 @@ def health(response: Response) -> dict[str, object]:
 async def analyze(
     symbol: str = Query(default="BTC/USD", pattern=r"^(BTC|ETH)/USD$"),
     interval_minutes: Literal[240, 1440, 10080] = Query(default=1440),
-    provider: Literal["synthetic", "kraken", "coinbase", "consensus"] | None = Query(
+    provider: Literal["synthetic", "t4"] | None = Query(
         default=None
     ),
     narrate: bool = Query(default=False),
