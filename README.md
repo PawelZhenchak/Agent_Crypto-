@@ -1,6 +1,6 @@
 # Plus500 Futures T4 Research Agent
 
-Wersja `0.3.0` analizuje wyłącznie dane futures z **Plus500 Futures / T4**.
+Wersja `0.4.0` analizuje wyłącznie dane futures z **Plus500 Futures / T4**.
 System działa tylko w trybie odczytu i może zwrócić `ALERT` lub `NO_SIGNAL`.
 Nie loguje się do innych platform i nie składa, nie zmienia ani nie anuluje zleceń.
 
@@ -35,9 +35,11 @@ Tryb `synthetic` służy wyłącznie testom i zawsze pozostaje diagnostyczny.
 1. Skopiuj `.env.example` do `.env`.
 2. Ustaw ten sam, losowy `T4_BRIDGE_TOKEN` w workerze i
    `CRYPTO_AGENT_T4_BRIDGE_TOKEN` w procesie Python.
-3. Uruchom odizolowany worker T4 .NET na loopback `127.0.0.1:8784`.
-4. Ustaw `CRYPTO_AGENT_DATA_PROVIDER=t4`.
-5. Uruchom:
+3. Ustaw `T4_CONTRACT_CATALOG_PATH` na prywatną kopię katalogu opartą na
+   `configs/t4-contract-catalog.example.json` i wpisz rzeczywiste serie T4.
+4. Uruchom odizolowany worker T4 .NET na loopback `127.0.0.1:8784`.
+5. Ustaw `CRYPTO_AGENT_DATA_PROVIDER=t4`.
+6. Uruchom:
 
 ```bash
 crypto-agent analyze --provider t4 --symbol BTC/USD --interval 1440

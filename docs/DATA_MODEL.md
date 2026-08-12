@@ -7,6 +7,8 @@ Aktywny rejestr zawiera:
 - binding `BTC/USD` → `BTC-FUTURES-FRONT`;
 - binding `ETH/USD` → `ETH-FUTURES-FRONT`;
 - runtime protocol: `loopback_http_json_v1`;
+- envelope schema: `2` z `contract_roll_at`, `contract_selection` i
+  `rolled_from_contract_id`;
 - `read_only=true` i `order_routes_enabled=false`.
 
 Nazwy `*-FUTURES-FRONT` są logicznymi aliasami. Worker musi utrwalać rzeczywisty

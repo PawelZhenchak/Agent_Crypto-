@@ -57,7 +57,7 @@ def _payload() -> dict[str, object]:
             }
         )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "source_id": "plus500_t4_futures_v1",
         "venue_id": "plus500_t4",
         "read_only": True,
@@ -66,6 +66,9 @@ def _payload() -> dict[str, object]:
         "interval_minutes": 1440,
         "contract_id": "CME:MBT:202609",
         "contract_expires_at": (as_of + timedelta(days=30)).isoformat(),
+        "contract_roll_at": (as_of + timedelta(days=25)).isoformat(),
+        "contract_selection": "front_month",
+        "rolled_from_contract_id": None,
         "volume_zscore": 3.5,
         "candles": candles,
         "reference_price": {
@@ -133,6 +136,21 @@ class Plus500T4ProviderTests(unittest.TestCase):
                 )
         self.assertEqual(raised.exception.code, "T4_PAYLOAD_INVALID")
 
+    def test_old_bridge_schema_fails_closed(self) -> None:
+        payload = _payload()
+        payload["schema_version"] = 1
+        with patch(
+            "crypto_agent.providers.t4.build_opener",
+            return_value=_Opener(payload),
+        ), self.assertRaises(ProviderError) as raised:
+            Plus500T4Provider(bridge_token=_BRIDGE_TOKEN).fetch_batch(
+                symbol="BTC/USD",
+                interval_minutes=1440,
+                as_of=datetime(2026, 8, 11, tzinfo=timezone.utc),
+                limit=120,
+            )
+        self.assertEqual(raised.exception.code, "T4_PAYLOAD_INVALID")
+
     def test_order_routes_attestation_fails_closed(self) -> None:
         payload = _payload()
         payload["order_routes_exposed"] = True
@@ -151,6 +169,57 @@ class Plus500T4ProviderTests(unittest.TestCase):
     def test_expired_contract_fails_closed(self) -> None:
         payload = _payload()
         payload["contract_expires_at"] = "2026-08-11T00:00:00+00:00"
+        with patch(
+            "crypto_agent.providers.t4.build_opener",
+            return_value=_Opener(payload),
+        ), self.assertRaises(ProviderError) as raised:
+            Plus500T4Provider(bridge_token=_BRIDGE_TOKEN).fetch_batch(
+                symbol="BTC/USD",
+                interval_minutes=1440,
+                as_of=datetime(2026, 8, 11, tzinfo=timezone.utc),
+                limit=120,
+            )
+        self.assertEqual(raised.exception.code, "T4_PAYLOAD_INVALID")
+
+    def test_contract_in_roll_window_fails_closed(self) -> None:
+        payload = _payload()
+        payload["contract_roll_at"] = "2026-08-11T00:00:00+00:00"
+        with patch(
+            "crypto_agent.providers.t4.build_opener",
+            return_value=_Opener(payload),
+        ), self.assertRaises(ProviderError) as raised:
+            Plus500T4Provider(bridge_token=_BRIDGE_TOKEN).fetch_batch(
+                symbol="BTC/USD",
+                interval_minutes=1440,
+                as_of=datetime(2026, 8, 11, tzinfo=timezone.utc),
+                limit=120,
+            )
+        self.assertEqual(raised.exception.code, "T4_PAYLOAD_INVALID")
+
+    def test_controlled_roll_provenance_is_retained(self) -> None:
+        payload = _payload()
+        payload["contract_id"] = "CME:MBT:202612"
+        payload["contract_selection"] = "rolled"
+        payload["rolled_from_contract_id"] = "CME:MBT:202609"
+        with patch(
+            "crypto_agent.providers.t4.build_opener",
+            return_value=_Opener(payload),
+        ):
+            batch = Plus500T4Provider(bridge_token=_BRIDGE_TOKEN).fetch_batch(
+                symbol="BTC/USD",
+                interval_minutes=1440,
+                as_of=datetime(2026, 8, 11, tzinfo=timezone.utc),
+                limit=120,
+            )
+        self.assertEqual(batch.metadata["t4_contract_selection"], "rolled")
+        self.assertEqual(
+            batch.metadata["t4_rolled_from_contract_id"], "CME:MBT:202609"
+        )
+
+    def test_forged_roll_provenance_fails_closed(self) -> None:
+        payload = _payload()
+        payload["contract_selection"] = "rolled"
+        payload["rolled_from_contract_id"] = payload["contract_id"]
         with patch(
             "crypto_agent.providers.t4.build_opener",
             return_value=_Opener(payload),

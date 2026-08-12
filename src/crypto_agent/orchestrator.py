@@ -364,9 +364,27 @@ def _source_attested(
             and batch.metadata.get("t4_source_id") == Plus500T4Provider.source_id
             and batch.metadata.get("t4_venue_id") == Plus500T4Provider.venue_id
             and batch.metadata.get("t4_order_routes_exposed") is False
-            and batch.metadata.get("t4_bridge_schema_version") == 1
+            and batch.metadata.get("t4_bridge_schema_version") == 2
             and isinstance(batch.metadata.get("t4_contract_id"), str)
             and bool(batch.metadata.get("t4_contract_id"))
+            and isinstance(batch.metadata.get("t4_contract_roll_at"), str)
+            and isinstance(batch.metadata.get("t4_contract_expires_at"), str)
+            and batch.metadata.get("t4_contract_selection") in {"front_month", "rolled"}
+            and (
+                (
+                    batch.metadata.get("t4_contract_selection") == "front_month"
+                    and batch.metadata.get("t4_rolled_from_contract_id") is None
+                )
+                or (
+                    batch.metadata.get("t4_contract_selection") == "rolled"
+                    and isinstance(
+                        batch.metadata.get("t4_rolled_from_contract_id"), str
+                    )
+                    and bool(batch.metadata.get("t4_rolled_from_contract_id"))
+                    and batch.metadata.get("t4_rolled_from_contract_id")
+                    != batch.metadata.get("t4_contract_id")
+                )
+            )
         )
     except (AttributeError, KeyError, TypeError, ValueError):
         return False

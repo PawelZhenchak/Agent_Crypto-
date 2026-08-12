@@ -11,22 +11,21 @@ public static class RequestValidator
         DateTimeOffset asOf,
         int limit)
     {
-        if (!options.Contracts.TryGetValue(symbol, out var contract) || !contract.IsConfigured)
-        {
-            throw new T4SessionUnavailableException("The requested T4 contract is not configured.");
-        }
-
         if (!AllowedIntervals.Contains(intervalMinutes) || limit is < 60 or > 720 ||
-            asOf.Offset != TimeSpan.Zero || asOf > DateTimeOffset.UtcNow.AddSeconds(30) ||
-            contract.ExpiresAt <= asOf)
+            asOf.Offset != TimeSpan.Zero || asOf > DateTimeOffset.UtcNow.AddSeconds(30))
         {
             throw new ArgumentException("The market-data request is outside the approved policy.");
         }
+
+        var selection = options.ContractCatalog.Resolve(symbol, asOf);
+        var contract = selection.Contract;
 
         return new MarketDataRequest(
             symbol,
             contract.ContractId,
             contract.ExpiresAt,
+            contract.RollAt,
+            selection.RolledFromContractId,
             intervalMinutes,
             asOf,
             limit);

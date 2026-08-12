@@ -6,6 +6,8 @@ public sealed record MarketDataRequest(
     string LogicalSymbol,
     string ContractId,
     DateTimeOffset ContractExpiresAt,
+    DateTimeOffset ContractRollAt,
+    string? RolledFromContractId,
     int IntervalMinutes,
     DateTimeOffset AsOf,
     int Limit);
@@ -20,6 +22,9 @@ public sealed record MarketDataEnvelope(
     [property: JsonPropertyName("interval_minutes")] int IntervalMinutes,
     [property: JsonPropertyName("contract_id")] string ContractId,
     [property: JsonPropertyName("contract_expires_at")] DateTimeOffset ContractExpiresAt,
+    [property: JsonPropertyName("contract_roll_at")] DateTimeOffset ContractRollAt,
+    [property: JsonPropertyName("contract_selection")] string ContractSelection,
+    [property: JsonPropertyName("rolled_from_contract_id")] string? RolledFromContractId,
     [property: JsonPropertyName("volume_zscore")] double? VolumeZScore,
     [property: JsonPropertyName("candles")] IReadOnlyList<CandleEnvelope> Candles,
     [property: JsonPropertyName("reference_price")] ReferencePriceEnvelope ReferencePrice);

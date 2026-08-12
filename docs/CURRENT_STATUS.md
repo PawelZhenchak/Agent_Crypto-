@@ -1,4 +1,4 @@
-# Aktualny stan — 0.3.0
+# Aktualny stan — 0.4.0
 
 ## Gotowe
 
@@ -14,6 +14,10 @@
 - kontrakt odrzuca nieznany, nieważny lub wygasły rzeczywisty contract ID;
 - bridge nie zawiera endpointów zleceń i domyślnie działa fail-closed;
 - CI buduje bridge i uruchamia osobne testy kontraktowe .NET.
+- lokalny katalog kolejnych serii wybiera front-month według czasu UTC;
+- granica `roll_at` wymusza kontrolowane przejście na następną serię;
+- schema bridge v2 zachowuje contract ID, expiry, roll i poprzednią serię;
+- brak bezpiecznej kolejnej serii kończy się `NOT_READY` / `NO_SIGNAL`.
 
 ## Świadomie zachowana historia
 
@@ -26,7 +30,6 @@ Nie są aktywną konfiguracją ani źródłami runtime.
 - rejestracja aplikacji T4 u Plus500 Futures Technologies/CTS;
 - adapter oficjalnego klienta T4 po otrzymaniu aktualnego pakietu i przykładów API;
 - konto T4 Simulator i test live contract;
-- rozwiązywanie rzeczywistego kontraktu front-month oraz kontrolowany roll;
 - operacyjny zapis danych T4 i replay w PostgreSQL;
 - ponowny test migracji `0013` na prawdziwym PostgreSQL 16 w GitHub Actions;
 - wielotygodniowy odbiór read-only V1.
