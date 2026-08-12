@@ -456,6 +456,14 @@ _MIGRATED_COLUMN_REQUIREMENTS = (
             ("ingested_at", "timestamptz"),
         ),
     )
+    + (
+        _ColumnRequirement(
+            table="t4_ingestion_batches",
+            name="rolled_from_contract_id",
+            type_name="text",
+            not_null=False,
+        ),
+    )
     + _column_requirements(
         "t4_canonical_candles",
         (
