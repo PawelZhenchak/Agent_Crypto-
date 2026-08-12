@@ -3,15 +3,18 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from .monitoring import MonitoringRepository
+from .monitoring_policy import MonitoringPolicy
 from .orchestrator import ResearchOrchestrator
 from .policy import RiskPolicy
+from .postgres import PostgresSettings, PsycopgConnectionFactory
 from .providers import (
     Plus500T4Provider,
     SyntheticProvider,
 )
-from .resource_paths import default_risk_policy_path
+from .providers.base import CandleProvider
+from .resource_paths import default_monitoring_policy_path, default_risk_policy_path
 from .storage import ReportRepository
-
 
 FORBIDDEN_EXCHANGE_SECRET_NAMES = {
     "BINANCE_API_KEY",
@@ -51,6 +54,7 @@ def build_orchestrator(provider_name: str | None = None) -> ResearchOrchestrator
         os.getenv("CRYPTO_AGENT_DATABASE_PATH", "var/crypto_agent_plus500_t4.db")
     )
     policy = RiskPolicy.load(policy_path)
+    provider: CandleProvider
     if selected == "synthetic":
         provider = SyntheticProvider()
     elif selected == "t4":
@@ -76,3 +80,16 @@ def _assert_no_exchange_credentials() -> None:
         raise RuntimeError(
             "Exchange credentials are forbidden in the V1 process: " + ", ".join(present)
         )
+
+
+def build_monitoring_repository() -> MonitoringRepository:
+    configured_path = os.getenv("CRYPTO_AGENT_MONITORING_POLICY_PATH")
+    policy_path = (
+        Path(configured_path)
+        if configured_path is not None
+        else default_monitoring_policy_path()
+    )
+    return MonitoringRepository(
+        PsycopgConnectionFactory(PostgresSettings.from_env()),
+        MonitoringPolicy.load(policy_path),
+    )

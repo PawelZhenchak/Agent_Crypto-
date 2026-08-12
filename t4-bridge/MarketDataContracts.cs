@@ -18,6 +18,7 @@ public sealed record MarketDataEnvelope(
     [property: JsonPropertyName("venue_id")] string VenueId,
     [property: JsonPropertyName("read_only")] bool ReadOnly,
     [property: JsonPropertyName("order_routes_exposed")] bool OrderRoutesExposed,
+    [property: JsonPropertyName("environment")] string Environment,
     [property: JsonPropertyName("logical_symbol")] string LogicalSymbol,
     [property: JsonPropertyName("interval_minutes")] int IntervalMinutes,
     [property: JsonPropertyName("contract_id")] string ContractId,

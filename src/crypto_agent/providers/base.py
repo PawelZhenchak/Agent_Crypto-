@@ -51,6 +51,8 @@ class ProviderBatch:
     raw_payload: bytes | None = field(default=None, repr=False)
     raw_payload_sha256: str | None = None
     futures_evidence: FuturesEvidence | None = None
+    # Runtime-only provenance. Fixtures and replay deliberately remain false.
+    external_delivery_eligible: bool = False
 
 
 class CandleProvider(Protocol):

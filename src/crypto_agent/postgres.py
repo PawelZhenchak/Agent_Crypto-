@@ -4,13 +4,19 @@ import hashlib
 import importlib
 import os
 import re
+import threading
 from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol, cast
 
+from .deadline import (
+    bounded_analysis_timeout,
+    ensure_analysis_deadline,
+    remaining_analysis_timeout,
+)
 
 SqlParams = Sequence[object] | Mapping[str, object]
 
@@ -104,11 +110,17 @@ class PsycopgConnectionFactory:
     settings: PostgresSettings
 
     def __call__(self) -> DBConnection:
+        timeout_budget = bounded_analysis_timeout(
+            float(self.settings.connect_timeout_seconds)
+        )
+        if timeout_budget < 1.0:
+            raise TimeoutError("PostgreSQL connection deadline is too short")
+        connect_timeout = max(1, int(timeout_budget))
         try:
             driver = importlib.import_module("psycopg")
             connection = driver.connect(
                 self.settings.dsn,
-                connect_timeout=self.settings.connect_timeout_seconds,
+                connect_timeout=connect_timeout,
                 autocommit=False,
             )
         except Exception:
@@ -127,25 +139,73 @@ def transaction(connection_factory: ConnectionFactory) -> Iterator[DBConnection]
 
     try:
         connection = connection_factory()
-    except PostgresError:
+    except (PostgresError, TimeoutError):
         raise
     except Exception:
         raise PostgresUnavailableError("PostgreSQL is unavailable") from None
 
     try:
         yield connection
-        connection.commit()
+        _commit_with_analysis_deadline(connection)
     except Exception:
-        try:
+        with suppress(Exception):
             connection.rollback()
-        except Exception:
-            pass
         raise
     finally:
-        try:
+        with suppress(Exception):
             connection.close()
-        except Exception:
-            pass
+
+
+def _commit_with_analysis_deadline(connection: DBConnection) -> None:
+    """Commit with cancellation support when a total analysis deadline is active."""
+
+    remaining = remaining_analysis_timeout()
+    if remaining is None:
+        connection.commit()
+        return
+
+    cancel_method = getattr(connection, "cancel", None)
+    if not callable(cancel_method):
+        raise PostgresOperationError(
+            "PostgreSQL connection cannot enforce the analysis deadline"
+        )
+    cancel = cast(Callable[[], object], cancel_method)
+    deadline_reached = threading.Event()
+    commit_finished = threading.Event()
+    timer = threading.Timer(
+        remaining,
+        _cancel_commit_until_finished,
+        args=(cancel, deadline_reached, commit_finished),
+    )
+    timer.daemon = True
+    timer.start()
+    try:
+        ensure_analysis_deadline()
+        if deadline_reached.is_set():
+            ensure_analysis_deadline()
+        connection.commit()
+    except Exception:
+        ensure_analysis_deadline()
+        raise
+    finally:
+        commit_finished.set()
+        timer.cancel()
+    ensure_analysis_deadline()
+
+
+def _cancel_commit_until_finished(
+    cancel: Callable[[], object],
+    deadline_reached: threading.Event,
+    commit_finished: threading.Event,
+) -> None:
+    deadline_reached.set()
+    # Cancellation can race just ahead of the driver's COMMIT I/O and become a
+    # no-op. Retry until the caller confirms that COMMIT returned; ``cancel()`` is
+    # Psycopg's thread-safe interruption boundary and uses a separate libpq request.
+    while not commit_finished.is_set():
+        with suppress(Exception):
+            cancel()
+        commit_finished.wait(0.001)
 
 
 @contextmanager
@@ -154,10 +214,8 @@ def cursor(connection: DBConnection) -> Iterator[DBCursor]:
     try:
         yield database_cursor
     finally:
-        try:
+        with suppress(Exception):
             database_cursor.close()
-        except Exception:
-            pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,6 +266,31 @@ class _ColumnRequirement:
     name: str
     type_name: str
     not_null: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class _CatalogDefinitionRequirement:
+    table: str
+    name: str
+    object_type: str
+    definition: str
+
+
+@dataclass(frozen=True, slots=True)
+class _IndexRequirement:
+    table: str
+    name: str
+    unique: bool
+    definition: str
+
+
+@dataclass(frozen=True, slots=True)
+class _FunctionDefinitionRequirement:
+    name: str
+    language: str
+    volatility: str
+    security_definer: bool
+    source_sha256: str
 
 
 _MIGRATION_FILE = re.compile(r"^(?P<version>[0-9]{4})_(?P<name>[a-z0-9_]+)\.sql$")
@@ -272,6 +355,8 @@ _MIGRATED_TABLES = (
     "t4_futures_snapshots",
     "t4_orderbook_levels",
     "t4_contract_transition_evidence",
+    "alert_delivery_outbox",
+    "alert_delivery_attempts",
 )
 _BASE_TRIGGER_FUNCTIONS = (
     "forbid_append_only_change",
@@ -290,6 +375,7 @@ _MIGRATED_TRIGGER_FUNCTIONS = (
     "enforce_v1_reference_price_manifest",
     "enforce_v1_reference_price_provenance",
     "enforce_v1_reference_price_exact_provenance",
+    "enforce_alert_delivery_attempt",
 )
 
 
@@ -544,6 +630,60 @@ _MIGRATED_COLUMN_REQUIREMENTS = (
             ("content_hash", "sha256_hex"),
         ),
     )
+    + _column_requirements(
+        "alert_delivery_outbox",
+        (
+            ("alert_delivery_outbox_id", "int8"),
+            ("alert_id", "int8"),
+            ("channel", "text"),
+            ("destination", "text"),
+            ("idempotency_key", "sha256_hex"),
+            ("monitoring_policy_id", "text"),
+            ("monitoring_policy_hash", "sha256_hex"),
+            ("retention_days", "int2"),
+            ("payload", "jsonb"),
+            ("payload_hash", "sha256_hex"),
+            ("available_at", "timestamptz"),
+            ("expires_at", "timestamptz"),
+            ("max_attempts", "int2"),
+            ("created_at", "timestamptz"),
+            ("content_hash", "sha256_hex"),
+        ),
+    )
+    + _column_requirements(
+        "alert_delivery_attempts",
+        (
+            ("alert_delivery_attempt_id", "int8"),
+            ("alert_delivery_outbox_id", "int8"),
+            ("attempt_no", "int2"),
+            ("outcome", "text"),
+            ("started_at", "timestamptz"),
+            ("finished_at", "timestamptz"),
+            ("request_payload_hash", "sha256_hex"),
+            ("content_hash", "sha256_hex"),
+            ("created_at", "timestamptz"),
+        ),
+    )
+    + (
+        _ColumnRequirement(
+            table="alert_delivery_attempts",
+            name="next_attempt_at",
+            type_name="timestamptz",
+            not_null=False,
+        ),
+        _ColumnRequirement(
+            table="alert_delivery_attempts",
+            name="error_code",
+            type_name="text",
+            not_null=False,
+        ),
+        _ColumnRequirement(
+            table="alert_delivery_attempts",
+            name="previous_attempt_hash",
+            type_name="sha256_hex",
+            not_null=False,
+        ),
+    )
 )
 
 
@@ -673,6 +813,308 @@ _MIGRATED_TRIGGER_REQUIREMENTS = _append_only_trigger_requirements(_MIGRATED_TAB
         1 | 4,
         deferrable=True,
         initially_deferred=True,
+    ),
+    _TriggerRequirement(
+        "alert_delivery_attempt_integrity_guard",
+        "alert_delivery_attempts",
+        "enforce_alert_delivery_attempt",
+        1 | 2 | 4,
+    ),
+)
+_OPERATIONAL_CONSTRAINT_REQUIREMENTS = (
+    _CatalogDefinitionRequirement(
+        "t4_ingestion_batches",
+        "t4_ingestion_batches_bridge_schema_version_check",
+        "c",
+        "CHECK ((bridge_schema_version = ANY (ARRAY[2, 3, 4])))",
+    ),
+    _CatalogDefinitionRequirement(
+        "alert_delivery_outbox",
+        "alert_delivery_outbox_pkey",
+        "p",
+        "PRIMARY KEY (alert_delivery_outbox_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "alert_delivery_outbox",
+        "alert_delivery_outbox_alert_fk",
+        "f",
+        "FOREIGN KEY (alert_id) REFERENCES crypto_agent.alerts(alert_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "alert_delivery_outbox",
+        "alert_delivery_outbox_idempotency_key_key",
+        "u",
+        "UNIQUE (idempotency_key)",
+    ),
+    _CatalogDefinitionRequirement(
+        "alert_delivery_outbox",
+        "alert_delivery_outbox_content_hash_key",
+        "u",
+        "UNIQUE (content_hash)",
+    ),
+    _CatalogDefinitionRequirement(
+        "alert_delivery_outbox",
+        "alert_delivery_outbox_alert_id_channel_destination_key",
+        "u",
+        "UNIQUE (alert_id, channel, destination)",
+    ),
+    _CatalogDefinitionRequirement(
+        "alert_delivery_outbox",
+        "alert_delivery_outbox_channel_check",
+        "c",
+        "CHECK ((channel = 'stdout_json'::text))",
+    ),
+    _CatalogDefinitionRequirement(
+        "alert_delivery_outbox",
+        "alert_delivery_outbox_destination_check",
+        "c",
+        "CHECK ((destination = 'process_stdout'::text))",
+    ),
+    _CatalogDefinitionRequirement(
+        "alert_delivery_outbox",
+        "alert_delivery_outbox_policy_id_check",
+        "c",
+        "CHECK (((btrim(monitoring_policy_id) <> ''::text) "
+        "AND (length(monitoring_policy_id) <= 128)))",
+    ),
+    _CatalogDefinitionRequirement(
+        "alert_delivery_outbox",
+        "alert_delivery_outbox_retention_check",
+        "c",
+        "CHECK (((retention_days >= 35) AND (retention_days <= 365)))",
+    ),
+    _CatalogDefinitionRequirement(
+        "alert_delivery_outbox",
+        "alert_delivery_outbox_max_attempts_check",
+        "c",
+        "CHECK (((max_attempts >= 1) AND (max_attempts <= 5)))",
+    ),
+    _CatalogDefinitionRequirement(
+        "alert_delivery_outbox",
+        "alert_delivery_outbox_payload_check",
+        "c",
+        "CHECK ((jsonb_typeof(payload) = 'object'::text))",
+    ),
+    _CatalogDefinitionRequirement(
+        "alert_delivery_outbox",
+        "alert_delivery_outbox_payload_check1",
+        "c",
+        """
+        CHECK (((payload ?& ARRAY['schema_version'::text,
+            'alert_type'::text, 'decision'::text,
+            'decision_id'::text, 'trace_id'::text, 'asset_id'::text,
+            'instrument_id'::text, 'horizon'::text, 'as_of'::text,
+            'expires_at'::text, 'reason_codes'::text, 'data_snapshot_id'::text,
+            'policy_id'::text, 'policy_hash_sha256'::text,
+            'futures_policy_id'::text, 'futures_policy_hash_sha256'::text,
+            'environment'::text, 'external_delivery'::text, 'read_only'::text,
+            'execution_enabled'::text, 'not_financial_advice'::text,
+            'monitoring_policy_id'::text,
+            'monitoring_policy_hash_sha256'::text, 'retention_days'::text])
+        AND ((payload - ARRAY['schema_version'::text,
+            'alert_type'::text, 'decision'::text,
+            'decision_id'::text, 'trace_id'::text, 'asset_id'::text,
+            'instrument_id'::text, 'horizon'::text, 'as_of'::text,
+            'expires_at'::text, 'reason_codes'::text, 'data_snapshot_id'::text,
+            'policy_id'::text, 'policy_hash_sha256'::text,
+            'futures_policy_id'::text, 'futures_policy_hash_sha256'::text,
+            'environment'::text, 'external_delivery'::text, 'read_only'::text,
+            'execution_enabled'::text, 'not_financial_advice'::text,
+            'monitoring_policy_id'::text,
+            'monitoring_policy_hash_sha256'::text, 'retention_days'::text])
+        = '{}'::jsonb)))
+        """,
+    ),
+    _CatalogDefinitionRequirement(
+        "alert_delivery_outbox",
+        "alert_delivery_outbox_payload_check2",
+        "c",
+        "CHECK (((payload -> 'schema_version'::text) = '1'::jsonb))",
+    ),
+    _CatalogDefinitionRequirement(
+        "alert_delivery_outbox",
+        "alert_delivery_outbox_payload_check3",
+        "c",
+        "CHECK (((payload ->> 'alert_type'::text) = 'research_alert_v1'::text))",
+    ),
+    _CatalogDefinitionRequirement(
+        "alert_delivery_outbox",
+        "alert_delivery_outbox_payload_check4",
+        "c",
+        "CHECK (((payload ? 'decision'::text) "
+        "AND ((payload ->> 'decision'::text) = 'ALERT'::text)))",
+    ),
+    _CatalogDefinitionRequirement(
+        "alert_delivery_outbox",
+        "alert_delivery_outbox_payload_check5",
+        "c",
+        "CHECK (((payload ->> 'environment'::text) = 'live_t4'::text))",
+    ),
+    _CatalogDefinitionRequirement(
+        "alert_delivery_outbox",
+        "alert_delivery_outbox_payload_check6",
+        "c",
+        "CHECK (((payload -> 'external_delivery'::text) = 'false'::jsonb))",
+    ),
+    _CatalogDefinitionRequirement(
+        "alert_delivery_outbox",
+        "alert_delivery_outbox_payload_check7",
+        "c",
+        "CHECK (((payload ? 'read_only'::text) "
+        "AND (jsonb_typeof((payload -> 'read_only'::text)) = 'boolean'::text) "
+        "AND ((payload -> 'read_only'::text) = 'true'::jsonb)))",
+    ),
+    _CatalogDefinitionRequirement(
+        "alert_delivery_outbox",
+        "alert_delivery_outbox_payload_check8",
+        "c",
+        "CHECK (((payload -> 'execution_enabled'::text) = 'false'::jsonb))",
+    ),
+    _CatalogDefinitionRequirement(
+        "alert_delivery_outbox",
+        "alert_delivery_outbox_payload_check9",
+        "c",
+        "CHECK (((payload -> 'not_financial_advice'::text) = 'true'::jsonb))",
+    ),
+    _CatalogDefinitionRequirement(
+        "alert_delivery_outbox",
+        "alert_delivery_outbox_payload_check10",
+        "c",
+        "CHECK ((octet_length((payload)::text) <= 16384))",
+    ),
+    _CatalogDefinitionRequirement(
+        "alert_delivery_outbox",
+        "alert_delivery_outbox_check",
+        "c",
+        "CHECK (((payload ->> 'monitoring_policy_id'::text) = monitoring_policy_id))",
+    ),
+    _CatalogDefinitionRequirement(
+        "alert_delivery_outbox",
+        "alert_delivery_outbox_check1",
+        "c",
+        "CHECK (((payload ->> 'monitoring_policy_hash_sha256'::text) "
+        "= (monitoring_policy_hash)::text))",
+    ),
+    _CatalogDefinitionRequirement(
+        "alert_delivery_outbox",
+        "alert_delivery_outbox_check2",
+        "c",
+        "CHECK (((payload -> 'retention_days'::text) "
+        "= to_jsonb((retention_days)::integer)))",
+    ),
+    _CatalogDefinitionRequirement(
+        "alert_delivery_outbox",
+        "alert_delivery_outbox_check3",
+        "c",
+        "CHECK ((available_at < expires_at))",
+    ),
+    _CatalogDefinitionRequirement(
+        "alert_delivery_attempts",
+        "alert_delivery_attempts_pkey",
+        "p",
+        "PRIMARY KEY (alert_delivery_attempt_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "alert_delivery_attempts",
+        "alert_delivery_attempts_outbox_fk",
+        "f",
+        "FOREIGN KEY (alert_delivery_outbox_id) REFERENCES "
+        "crypto_agent.alert_delivery_outbox(alert_delivery_outbox_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "alert_delivery_attempts",
+        "alert_delivery_attempts_alert_delivery_outbox_id_attempt_no_key",
+        "u",
+        "UNIQUE (alert_delivery_outbox_id, attempt_no)",
+    ),
+    _CatalogDefinitionRequirement(
+        "alert_delivery_attempts",
+        "alert_delivery_attempts_content_hash_key",
+        "u",
+        "UNIQUE (content_hash)",
+    ),
+    _CatalogDefinitionRequirement(
+        "alert_delivery_attempts",
+        "alert_delivery_attempts_attempt_no_check",
+        "c",
+        "CHECK ((attempt_no > 0))",
+    ),
+    _CatalogDefinitionRequirement(
+        "alert_delivery_attempts",
+        "alert_delivery_attempts_outcome_check",
+        "c",
+        "CHECK ((outcome = ANY (ARRAY['delivered'::text, "
+        "'retryable_failure'::text, 'permanent_failure'::text, "
+        "'expired'::text])))",
+    ),
+    _CatalogDefinitionRequirement(
+        "alert_delivery_attempts",
+        "alert_delivery_attempts_check",
+        "c",
+        "CHECK ((started_at <= finished_at))",
+    ),
+    _CatalogDefinitionRequirement(
+        "alert_delivery_attempts",
+        "alert_delivery_attempts_error_code_check",
+        "c",
+        "CHECK (((error_code IS NULL) OR "
+        "(error_code ~ '^[A-Z][A-Z0-9_]{0,63}$'::text)))",
+    ),
+    _CatalogDefinitionRequirement(
+        "alert_delivery_attempts",
+        "alert_delivery_attempts_check1",
+        "c",
+        """
+        CHECK ((((outcome = 'delivered'::text) AND (next_attempt_at IS NULL)
+        AND (error_code IS NULL)) OR ((outcome = 'retryable_failure'::text)
+        AND (next_attempt_at IS NOT NULL) AND (next_attempt_at > finished_at)
+        AND (error_code IS NOT NULL)) OR ((outcome = 'permanent_failure'::text)
+        AND (next_attempt_at IS NULL) AND (error_code IS NOT NULL))
+        OR ((outcome = 'expired'::text) AND (next_attempt_at IS NULL))))
+        """,
+    ),
+    _CatalogDefinitionRequirement(
+        "alert_delivery_attempts",
+        "alert_delivery_attempts_check2",
+        "c",
+        "CHECK ((((attempt_no = 1) AND (previous_attempt_hash IS NULL)) "
+        "OR ((attempt_no > 1) AND (previous_attempt_hash IS NOT NULL))))",
+    ),
+)
+_OPERATIONAL_INDEX_REQUIREMENTS = (
+    _IndexRequirement(
+        "alert_delivery_outbox",
+        "alert_delivery_outbox_due_idx",
+        False,
+        "CREATE INDEX alert_delivery_outbox_due_idx ON "
+        "crypto_agent.alert_delivery_outbox USING btree "
+        "(available_at, expires_at, alert_delivery_outbox_id)",
+    ),
+    _IndexRequirement(
+        "alert_delivery_attempts",
+        "alert_delivery_attempts_outbox_idx",
+        False,
+        "CREATE INDEX alert_delivery_attempts_outbox_idx ON "
+        "crypto_agent.alert_delivery_attempts USING btree "
+        "(alert_delivery_outbox_id, attempt_no DESC)",
+    ),
+    _IndexRequirement(
+        "alert_delivery_attempts",
+        "alert_delivery_attempts_terminal_idx",
+        False,
+        "CREATE INDEX alert_delivery_attempts_terminal_idx ON "
+        "crypto_agent.alert_delivery_attempts USING btree "
+        "(outcome, finished_at DESC) WHERE (outcome = ANY "
+        "(ARRAY['delivered'::text, 'permanent_failure'::text, 'expired'::text]))",
+    ),
+)
+_OPERATIONAL_FUNCTION_REQUIREMENTS = (
+    _FunctionDefinitionRequirement(
+        "enforce_alert_delivery_attempt",
+        "plpgsql",
+        "v",
+        False,
+        "fa988543f76637d631a84a1548437802bb728c672364bb088aac37d8a65c1f29",
     ),
 )
 _EXPECTED_BINDINGS = (
@@ -842,6 +1284,12 @@ def check_postgres_health(
     try:
         with transaction(connection_factory) as connection, cursor(connection) as db_cursor:
             db_cursor.execute("SET TRANSACTION READ ONLY")
+            # Catalog deparsers such as pg_get_constraintdef() use search_path
+            # when deciding whether to qualify object names.  A CI role named
+            # ``crypto_agent`` implicitly exposes the same-named schema through
+            # ``\"$user\"`` and would otherwise make equivalent constraints look
+            # different.  Keep health attestation deterministic across roles.
+            db_cursor.execute("SET LOCAL search_path TO pg_catalog")
             db_cursor.execute(
                 """
                 SELECT current_setting('server_version_num'),
@@ -1023,6 +1471,31 @@ def check_postgres_health(
                 for name in _MIGRATED_TRIGGER_FUNCTIONS
                 if name not in migrated_functions
             )
+            migrated_missing.extend(
+                _catalog_definition_differences(
+                    "constraint",
+                    _OPERATIONAL_CONSTRAINT_REQUIREMENTS,
+                    _catalog_constraints(
+                        db_cursor,
+                        _OPERATIONAL_CONSTRAINT_REQUIREMENTS,
+                    ),
+                )
+            )
+            migrated_missing.extend(
+                _index_differences(
+                    _OPERATIONAL_INDEX_REQUIREMENTS,
+                    _catalog_indexes(db_cursor, _OPERATIONAL_INDEX_REQUIREMENTS),
+                )
+            )
+            migrated_missing.extend(
+                _function_definition_differences(
+                    _OPERATIONAL_FUNCTION_REQUIREMENTS,
+                    _catalog_function_definitions(
+                        db_cursor,
+                        _OPERATIONAL_FUNCTION_REQUIREMENTS,
+                    ),
+                )
+            )
             if migrated_missing:
                 return _health_result(
                     status_code="MIGRATED_SCHEMA_MISSING",
@@ -1195,6 +1668,182 @@ def _column_differences(
     return tuple(sorted(differences))
 
 
+def _catalog_constraints(
+    db_cursor: DBCursor,
+    required: Sequence[_CatalogDefinitionRequirement],
+) -> dict[tuple[str, str], tuple[str, bool, str]]:
+    db_cursor.execute(
+        """
+        SELECT rel.relname, con.conname, con.contype, con.convalidated,
+               pg_catalog.pg_get_constraintdef(con.oid, false)
+        FROM pg_catalog.pg_constraint AS con
+        JOIN pg_catalog.pg_class AS rel ON rel.oid = con.conrelid
+        JOIN pg_catalog.pg_namespace AS ns ON ns.oid = rel.relnamespace
+        WHERE ns.nspname = 'crypto_agent'
+          AND rel.relname = ANY(%s)
+          AND con.conname = ANY(%s)
+        """,
+        (
+            sorted({item.table for item in required}),
+            sorted({item.name for item in required}),
+        ),
+    )
+    return {
+        (
+            str(_row_value(row, "relname", 0)),
+            str(_row_value(row, "conname", 1)),
+        ): (
+            str(_row_value(row, "contype", 2)),
+            _row_value(row, "convalidated", 3) is True,
+            _normalize_catalog_definition(_row_value(row, "definition", 4)),
+        )
+        for row in db_cursor.fetchall()
+    }
+
+
+def _catalog_definition_differences(
+    object_label: str,
+    required: Sequence[_CatalogDefinitionRequirement],
+    actual: Mapping[tuple[str, str], tuple[str, bool, str]],
+) -> tuple[str, ...]:
+    required_by_key = {(item.table, item.name): item for item in required}
+    differences = {
+        f"{object_label}:{item.table}.{item.name}"
+        for item in required
+        if actual.get((item.table, item.name))
+        != (
+            item.object_type,
+            True,
+            _normalize_catalog_definition(item.definition),
+        )
+    }
+    differences.update(
+        f"unexpected:{object_label}:{table}.{name}"
+        for table, name in actual.keys() - required_by_key.keys()
+    )
+    return tuple(sorted(differences))
+
+
+def _catalog_indexes(
+    db_cursor: DBCursor,
+    required: Sequence[_IndexRequirement],
+) -> dict[tuple[str, str], tuple[bool, bool, bool, str]]:
+    db_cursor.execute(
+        """
+        SELECT rel.relname, idx.relname, ind.indisunique, ind.indisvalid,
+               ind.indisready,
+               pg_catalog.pg_get_indexdef(ind.indexrelid, 0, false)
+        FROM pg_catalog.pg_index AS ind
+        JOIN pg_catalog.pg_class AS rel ON rel.oid = ind.indrelid
+        JOIN pg_catalog.pg_namespace AS ns ON ns.oid = rel.relnamespace
+        JOIN pg_catalog.pg_class AS idx ON idx.oid = ind.indexrelid
+        WHERE ns.nspname = 'crypto_agent'
+          AND rel.relname = ANY(%s)
+          AND idx.relname = ANY(%s)
+        """,
+        (
+            sorted({item.table for item in required}),
+            sorted({item.name for item in required}),
+        ),
+    )
+    return {
+        (
+            str(_row_value(row, "relname", 0)),
+            str(_row_value(row, "index_name", 1)),
+        ): (
+            _row_value(row, "indisunique", 2) is True,
+            _row_value(row, "indisvalid", 3) is True,
+            _row_value(row, "indisready", 4) is True,
+            _normalize_catalog_definition(_row_value(row, "definition", 5)),
+        )
+        for row in db_cursor.fetchall()
+    }
+
+
+def _index_differences(
+    required: Sequence[_IndexRequirement],
+    actual: Mapping[tuple[str, str], tuple[bool, bool, bool, str]],
+) -> tuple[str, ...]:
+    required_by_key = {(item.table, item.name): item for item in required}
+    differences = {
+        f"index:{item.table}.{item.name}"
+        for item in required
+        if actual.get((item.table, item.name))
+        != (
+            item.unique,
+            True,
+            True,
+            _normalize_catalog_definition(item.definition),
+        )
+    }
+    differences.update(
+        f"unexpected:index:{table}.{name}"
+        for table, name in actual.keys() - required_by_key.keys()
+    )
+    return tuple(sorted(differences))
+
+
+def _catalog_function_definitions(
+    db_cursor: DBCursor,
+    required: Sequence[_FunctionDefinitionRequirement],
+) -> dict[str, tuple[str, str, bool, str]]:
+    db_cursor.execute(
+        """
+        SELECT proc.proname, lang.lanname, proc.provolatile, proc.prosecdef,
+               proc.prosrc
+        FROM pg_catalog.pg_proc AS proc
+        JOIN pg_catalog.pg_namespace AS ns ON ns.oid = proc.pronamespace
+        JOIN pg_catalog.pg_language AS lang ON lang.oid = proc.prolang
+        WHERE ns.nspname = 'crypto_agent'
+          AND proc.proname = ANY(%s)
+          AND proc.prorettype = 'pg_catalog.trigger'::pg_catalog.regtype
+          AND pg_catalog.pg_get_function_identity_arguments(proc.oid) = ''
+        """,
+        ([item.name for item in required],),
+    )
+    return {
+        str(_row_value(row, "proname", 0)): (
+            str(_row_value(row, "lanname", 1)),
+            str(_row_value(row, "provolatile", 2)),
+            _row_value(row, "prosecdef", 3) is True,
+            _definition_sha256(_row_value(row, "prosrc", 4)),
+        )
+        for row in db_cursor.fetchall()
+    }
+
+
+def _function_definition_differences(
+    required: Sequence[_FunctionDefinitionRequirement],
+    actual: Mapping[str, tuple[str, str, bool, str]],
+) -> tuple[str, ...]:
+    required_by_name = {item.name: item for item in required}
+    differences = {
+        f"function_definition:{item.name}"
+        for item in required
+        if actual.get(item.name)
+        != (
+            item.language,
+            item.volatility,
+            item.security_definer,
+            item.source_sha256,
+        )
+    }
+    differences.update(
+        f"unexpected:function_definition:{name}"
+        for name in actual.keys() - required_by_name.keys()
+    )
+    return tuple(sorted(differences))
+
+
+def _normalize_catalog_definition(value: object) -> str:
+    return " ".join(str(value).split())
+
+
+def _definition_sha256(value: object) -> str:
+    normalized = _normalize_catalog_definition(value)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
 def _catalog_triggers(
     db_cursor: DBCursor, tables: Sequence[str]
 ) -> tuple[_TriggerRequirement, ...]:
@@ -1223,7 +1872,7 @@ def _catalog_triggers(
                 name=str(_row_value(row, "tgname", 0)),
                 table=str(_row_value(row, "relname", 1)),
                 function=str(_row_value(row, "proname", 2)),
-                type_mask=int(_row_value(row, "tgtype", 4)),
+                type_mask=_catalog_int(_row_value(row, "tgtype", 4)),
                 deferrable=_row_value(row, "tgdeferrable", 5) is True,
                 initially_deferred=_row_value(row, "tginitdeferred", 6) is True,
             )
@@ -1323,7 +1972,7 @@ def _missing_seed_requirements(
     series_counts = Counter(
         (
             str(_row_value(row, "canonical_symbol", 0)),
-            int(_row_value(row, "interval_seconds", 1)),
+            _catalog_int(_row_value(row, "interval_seconds", 1)),
         )
         for row in db_cursor.fetchall()
     )
@@ -1401,6 +2050,17 @@ def _first_value(row: object | None) -> object | None:
     if row is None:
         return None
     return _row_value(row, "value", 0)
+
+
+def _catalog_int(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, str, bytes, bytearray)):
+        raise PostgresOperationError("PostgreSQL returned an invalid catalog integer")
+    try:
+        return int(value)
+    except ValueError:
+        raise PostgresOperationError(
+            "PostgreSQL returned an invalid catalog integer"
+        ) from None
 
 
 def _row_value(row: object, key: str, index: int) -> object:

@@ -4,11 +4,18 @@ import hashlib
 import json
 import math
 import re
+import threading
+import time
+from contextlib import suppress
 from datetime import datetime, timedelta
 from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from ..deadline import ensure_analysis_deadline
+from ..deadline import (
+    AnalysisDeadlineExceeded,
+    bounded_analysis_timeout,
+    ensure_analysis_deadline,
+)
 from ..domain import (
     BasisReference,
     Candle,
@@ -31,6 +38,21 @@ class _NoRedirectHandler(HTTPRedirectHandler):
         return None
 
 
+def _close_response(response: object) -> None:
+    close = getattr(response, "close", None)
+    if not callable(close):
+        return
+    # Closing is best effort here: the caller will still fail closed on any
+    # read/validation error, and timer callbacks must never leak exceptions.
+    with suppress(Exception):
+        close()
+
+
+def _expire_response(response: object, timed_out: threading.Event) -> None:
+    timed_out.set()
+    _close_response(response)
+
+
 class Plus500T4Provider:
     """Read-only adapter for a local Plus500 Futures T4 .NET bridge.
 
@@ -44,7 +66,7 @@ class Plus500T4Provider:
     _allowed_intervals = frozenset({240, 1440, 10080})
     _allowed_symbols = frozenset({"BTC/USD", "ETH/USD"})
     _max_response_bytes = 4_000_000
-    _bridge_schema_version = 3
+    _bridge_schema_version = 4
     _contract_id_pattern = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{2,127}$")
 
     def __init__(
@@ -133,16 +155,25 @@ class Plus500T4Provider:
             method="GET",
         )
         ensure_analysis_deadline()
+        request_timeout = bounded_analysis_timeout(self._timeout_seconds)
         try:
             response = build_opener(_NoRedirectHandler()).open(
-                request, timeout=self._timeout_seconds
+                request, timeout=request_timeout
             )
-            status = getattr(response, "status", 200)
-            content_type = response.headers.get_content_type()
-            if status != 200 or content_type != "application/json":
-                raise ValueError("unexpected bridge response")
-            payload_bytes = response.read(self._max_response_bytes + 1)
+            try:
+                status = getattr(response, "status", 200)
+                content_type = response.headers.get_content_type()
+                if status != 200 or content_type != "application/json":
+                    raise ValueError("unexpected bridge response")
+                payload_bytes = self._read_response_with_timeout(response)
+            finally:
+                _close_response(response)
+        except AnalysisDeadlineExceeded:
+            raise
         except Exception as exc:
+            # A response closed by the deadline timer will normally surface as
+            # an I/O error. Preserve the machine-specific total-deadline error.
+            ensure_analysis_deadline()
             raise ProviderError(
                 "Plus500 T4 bridge is unavailable", code="T4_BRIDGE_UNAVAILABLE"
             ) from exc
@@ -164,6 +195,7 @@ class Plus500T4Provider:
                 or payload.get("venue_id") != self.venue_id
                 or payload.get("read_only") is not True
                 or payload.get("order_routes_exposed") is not False
+                or payload.get("environment") != "live_t4"
                 or payload.get("logical_symbol") != symbol
                 or type(payload.get("interval_minutes")) is not int
                 or payload.get("interval_minutes") != interval_minutes
@@ -220,6 +252,7 @@ class Plus500T4Provider:
                 "t4_source_id": payload.get("source_id"),
                 "t4_venue_id": payload.get("venue_id"),
                 "t4_order_routes_exposed": payload.get("order_routes_exposed"),
+                "t4_environment": payload.get("environment"),
                 "t4_volume_zscore": payload.get("volume_zscore"),
                 "t4_bridge_schema_version": payload.get("schema_version"),
                 "t4_contract_id": payload.get("contract_id"),
@@ -235,7 +268,40 @@ class Plus500T4Provider:
             raw_payload=payload_bytes,
             raw_payload_sha256=hashlib.sha256(payload_bytes).hexdigest(),
             futures_evidence=futures_evidence,
+            external_delivery_eligible=True,
         )
+
+    def _read_response_with_timeout(self, response: object) -> bytes:
+        read = getattr(response, "read", None)
+        close = getattr(response, "close", None)
+        if not callable(read) or not callable(close):
+            raise ValueError("unexpected bridge response")
+
+        read_timeout = bounded_analysis_timeout(self._timeout_seconds)
+        read_deadline = time.monotonic() + read_timeout
+        timed_out = threading.Event()
+        timeout_timer = threading.Timer(
+            read_timeout,
+            _expire_response,
+            (response, timed_out),
+        )
+        timeout_timer.daemon = True
+        timeout_timer.start()
+        try:
+            payload_bytes = read(self._max_response_bytes + 1)
+            if timed_out.is_set() or time.monotonic() >= read_deadline:
+                raise TimeoutError("T4 bridge response read timed out")
+            if not isinstance(payload_bytes, bytes):
+                raise ValueError("unexpected bridge response")
+            ensure_analysis_deadline()
+            return payload_bytes
+        except AnalysisDeadlineExceeded:
+            raise
+        except Exception:
+            ensure_analysis_deadline()
+            raise
+        finally:
+            timeout_timer.cancel()
 
     def _parse_candle(
         self, item: object, symbol: str, interval_minutes: int

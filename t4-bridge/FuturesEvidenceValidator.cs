@@ -6,6 +6,7 @@ public static class FuturesEvidenceValidator
     private const string VenueId = "plus500_t4";
     private const string BasisSourceId = "plus500_t4_index_v1";
     private const string BasisReferenceType = "index";
+    private const string LiveEnvironment = "live_t4";
     private static readonly HashSet<string> SessionStatuses = ["OPEN", "CLOSED", "HALTED"];
 
     public static void Validate(MarketDataRequest request, MarketDataEnvelope envelope)
@@ -18,9 +19,10 @@ public static class FuturesEvidenceValidator
         var expectedSelection = request.RolledFromContractId is null ? "front_month" : "rolled";
         if (evidence is null || evidence.Bids is null || evidence.Asks is null ||
             evidence.BasisReference is null ||
-            envelope.SchemaVersion != 3 || envelope.SourceId != SourceId ||
+            envelope.SchemaVersion != 4 || envelope.SourceId != SourceId ||
             envelope.VenueId != VenueId || envelope.ReadOnly is not true ||
             envelope.OrderRoutesExposed is not false ||
+            envelope.Environment != LiveEnvironment ||
             envelope.LogicalSymbol != request.LogicalSymbol ||
             envelope.IntervalMinutes != request.IntervalMinutes ||
             envelope.ContractId != request.ContractId ||

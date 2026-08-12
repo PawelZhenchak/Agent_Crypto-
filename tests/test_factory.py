@@ -12,27 +12,33 @@ from crypto_agent.factory import build_orchestrator
 
 class FactorySafetyTests(unittest.TestCase):
     def test_t4_credentials_are_rejected_in_analysis_process(self) -> None:
-        with patch.dict(
-            "os.environ",
-            {"T4_PASSWORD": "forbidden", "CRYPTO_AGENT_ENV": "development"},
-            clear=False,
+        with (
+            patch.dict(
+                "os.environ",
+                {"T4_PASSWORD": "forbidden", "CRYPTO_AGENT_ENV": "development"},
+                clear=False,
+            ),
+            self.assertRaises(RuntimeError),
         ):
-            with self.assertRaises(RuntimeError):
-                build_orchestrator("synthetic")
+            build_orchestrator("synthetic")
 
     def test_production_is_blocked_until_full_v1_gate_passes(self) -> None:
-        with patch.dict("os.environ", {"CRYPTO_AGENT_ENV": "production"}, clear=False):
-            with self.assertRaises(RuntimeError):
-                build_orchestrator("t4")
+        with (
+            patch.dict("os.environ", {"CRYPTO_AGENT_ENV": "production"}, clear=False),
+            self.assertRaises(RuntimeError),
+        ):
+            build_orchestrator("t4")
 
     def test_t4_provider_requires_bridge_token(self) -> None:
-        with patch.dict(
-            os.environ,
-            {"CRYPTO_AGENT_ENV": "development", "CRYPTO_AGENT_T4_BRIDGE_TOKEN": ""},
-            clear=False,
+        with (
+            patch.dict(
+                os.environ,
+                {"CRYPTO_AGENT_ENV": "development", "CRYPTO_AGENT_T4_BRIDGE_TOKEN": ""},
+                clear=False,
+            ),
+            self.assertRaises(ValueError),
         ):
-            with self.assertRaises(ValueError):
-                build_orchestrator("t4")
+            build_orchestrator("t4")
 
     def test_default_policy_is_not_relative_to_the_process_cwd(self) -> None:
         with TemporaryDirectory() as directory:
@@ -50,16 +56,18 @@ class FactorySafetyTests(unittest.TestCase):
             ):
                 orchestrator = build_orchestrator("synthetic")
 
-        self.assertEqual(
-            orchestrator.policy.policy_id, "v1-read-only-plus500-t4-2026-08-11"
-        )
+        self.assertEqual(orchestrator.policy.policy_id, "v1-read-only-plus500-t4-2026-08-11")
 
     def test_wheel_includes_runtime_policy_and_migrations(self) -> None:
         pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
         contents = pyproject.read_text(encoding="utf-8")
         self.assertIn(
-            '"configs/risk_policy.v1.json" = '
-            '"crypto_agent/resources/configs/risk_policy.v1.json"',
+            '"configs/risk_policy.v1.json" = "crypto_agent/resources/configs/risk_policy.v1.json"',
+            contents,
+        )
+        self.assertIn(
+            '"configs/monitoring_policy.v1.json" = '
+            '"crypto_agent/resources/configs/monitoring_policy.v1.json"',
             contents,
         )
         self.assertIn(

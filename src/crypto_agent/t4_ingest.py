@@ -8,7 +8,7 @@ import math
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import cast
 
 from .domain import (
@@ -35,11 +35,10 @@ from .postgres import (
 )
 from .providers.base import ProviderBatch, ProviderError
 
-
 T4_SOURCE_ID = "plus500_t4_futures_v1"
 T4_VENUE_ID = "plus500_t4"
-T4_SCHEMA_VERSION = 3
-T4_SUPPORTED_SCHEMA_VERSIONS = frozenset({2, 3})
+T4_SCHEMA_VERSION = 4
+T4_SUPPORTED_SCHEMA_VERSIONS = frozenset({2, 3, 4})
 T4_MAX_RAW_PAYLOAD_BYTES = 4_000_000
 
 
@@ -95,7 +94,7 @@ class T4ReplayResult:
                 "t4_replay_fingerprint_sha256": self.replay_fingerprint_sha256,
                 "t4_replay_source_batch_hashes": list(self.source_batch_hashes),
                 "t4_futures_evidence_attested": bool(
-                    self.bridge_schema_version == 3
+                    self.bridge_schema_version in {3, 4}
                     and self.futures_evidence is not None
                 ),
             },
@@ -241,7 +240,7 @@ class T4IngestRepository:
                                 _candle_hash(candle),
                             ),
                         )
-                    if schema_version == 3:
+                    if schema_version in {3, 4}:
                         if batch.futures_evidence is None:
                             raise ValueError("T4 schema v3 futures evidence is missing")
                         _persist_futures_evidence(
@@ -281,15 +280,15 @@ class T4IngestRepository:
                         (payload_hash,),
                     )
                     existing = db_cursor.fetchone()
-                    expected_snapshot_count = 1 if schema_version == 3 else 0
+                    expected_snapshot_count = 1 if schema_version in {3, 4} else 0
                     expected_level_count = (
                         len(batch.futures_evidence.bids)
                         + len(batch.futures_evidence.asks)
-                        if schema_version == 3 and batch.futures_evidence is not None
+                        if schema_version in {3, 4} and batch.futures_evidence is not None
                         else 0
                     )
                     expected_transition_count = int(
-                        schema_version == 3
+                        schema_version in {3, 4}
                         and batch.futures_evidence is not None
                         and batch.futures_evidence.contract_transition is not None
                     )
@@ -430,7 +429,7 @@ class T4IngestRepository:
                             19,
                         )
                     )
-                    if schema_version_in_transaction == 3:
+                    if schema_version_in_transaction in {3, 4}:
                         batch_id = int(
                             _row_value(newest_in_transaction, "t4_batch_id", 20)
                         )
@@ -546,7 +545,7 @@ class T4IngestRepository:
             _row_value(newest, "rolled_from_contract_id", 14)
         )
         futures_evidence = None
-        if bridge_schema_version == 3:
+        if bridge_schema_version in {3, 4}:
             futures_evidence = _replay_futures_evidence(
                 snapshot_row=snapshot_row,
                 level_rows=level_rows,
@@ -832,11 +831,13 @@ def _replay_futures_evidence(
             }
             if str(_row_value(row, "content_hash", 4)) != _object_hash(level_payload):
                 raise ValueError("order-book hash mismatch")
-        if transition_row is not None and transition is not None:
-            if str(_row_value(transition_row, "content_hash", 9)) != _object_hash(
-                _transition_payload(transition)
-            ):
-                raise ValueError("transition hash mismatch")
+        if (
+            transition_row is not None
+            and transition is not None
+            and str(_row_value(transition_row, "content_hash", 9))
+            != _object_hash(_transition_payload(transition))
+        ):
+            raise ValueError("transition hash mismatch")
         return evidence
     except (IndexError, KeyError, TypeError, ValueError):
         raise ProviderError(
@@ -1060,7 +1061,7 @@ class T4IngestionScheduler:
         intervals: Sequence[int] = (240, 1440, 10080),
         as_of: datetime | None = None,
     ) -> tuple[T4IngestionReceipt, ...]:
-        cutoff = as_of or datetime.now(timezone.utc)
+        cutoff = as_of or datetime.now(UTC)
         return tuple(
             self.fetch_and_persist(symbol, interval, cutoff)
             for symbol in symbols
@@ -1124,6 +1125,10 @@ def _validated_envelope(
     }
     if any(envelope.get(key) != value for key, value in required.items()):
         raise ValueError("T4 raw payload attestation mismatch")
+    if schema_version == 4 and envelope.get("environment") != "live_t4":
+        raise ValueError("T4 live environment attestation mismatch")
+    if schema_version == 4 and metadata.get("t4_environment") != "live_t4":
+        raise ValueError("T4 live environment metadata mismatch")
     expires_at = _utc_metadata(metadata, "t4_contract_expires_at")
     roll_at = _utc_metadata(metadata, "t4_contract_roll_at")
     if (
@@ -1427,7 +1432,7 @@ def _row_value(row: object, name: str, index: int) -> object:
 def _as_utc(value: object) -> datetime:
     if not isinstance(value, datetime) or value.tzinfo is None:
         raise ValueError("PostgreSQL replay returned an invalid timestamp")
-    normalized = value.astimezone(timezone.utc)
+    normalized = value.astimezone(UTC)
     if normalized.utcoffset() != timedelta(0):
         raise ValueError("PostgreSQL replay timestamp is not UTC")
     return normalized

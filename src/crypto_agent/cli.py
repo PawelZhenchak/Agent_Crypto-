@@ -6,11 +6,12 @@ import json
 import os
 import sys
 import threading
+from collections.abc import Sequence
 from dataclasses import replace
 from datetime import datetime
-from typing import Sequence
 
-from .factory import build_orchestrator
+from .factory import build_monitoring_repository, build_orchestrator
+from .monitoring import run_monitored_analysis
 from .narrator import OpenAINarrator
 from .providers.t4 import Plus500T4Provider
 from .resource_paths import (
@@ -84,6 +85,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     analyze_replay.add_argument("--limit", type=int, default=120)
     analyze_replay.add_argument("--as-of", required=True)
+
+    monitor = subparsers.add_parser(
+        "monitor",
+        help="Run a resilient read-only T4 analysis and persist operational traces",
+    )
+    monitor.add_argument("--symbol", default="BTC/USD", choices=("BTC/USD", "ETH/USD"))
+    monitor.add_argument("--interval", type=int, default=1440, choices=(240, 1440, 10080))
+    monitor.add_argument("--limit", type=int, default=120)
+    monitor.add_argument("--watch", action="store_true")
+    monitor.add_argument("--poll-seconds", type=float, default=300.0)
+
+    delivery = subparsers.add_parser(
+        "deliver-alerts",
+        help="Deliver immutable research alerts as canonical stdout JSON",
+    )
+    delivery.add_argument("--watch", action="store_true")
+    delivery.add_argument("--poll-seconds", type=float, default=5.0)
+
+    subparsers.add_parser(
+        "monitoring-status",
+        help="Read the local monitoring dashboard projection as JSON",
+    )
     return parser
 
 
@@ -106,6 +129,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_replay_command(args)
     if args.command == "analyze-replay":
         return _run_analyze_replay_command(args)
+    if args.command == "monitor":
+        return _run_monitor_command(args)
+    if args.command == "deliver-alerts":
+        return _run_alert_delivery_command(args)
+    if args.command == "monitoring-status":
+        return _run_monitoring_status_command()
     return 2
 
 
@@ -214,10 +243,14 @@ def _run_analyze_replay_command(args: argparse.Namespace) -> int:
 
     try:
         cutoff = datetime.fromisoformat(args.as_of.replace("Z", "+00:00"))
-        report = ResearchOrchestrator(
+        orchestrator = ResearchOrchestrator(
             provider=T4ReplayProvider(_t4_repository()),
             policy=RiskPolicy.load(default_risk_policy_path()),
-        ).analyze(
+        )
+        report, _ = run_monitored_analysis(
+            orchestrator.analyze,
+            build_monitoring_repository(),
+            operation="analyze_replay",
             symbol=args.symbol,
             interval_minutes=args.interval,
             as_of=cutoff,
@@ -230,6 +263,128 @@ def _run_analyze_replay_command(args: argparse.Namespace) -> int:
         exit_code = 1
     print(json.dumps(payload, indent=2, ensure_ascii=False))
     return exit_code
+
+
+def _run_monitor_command(args: argparse.Namespace) -> int:
+    if not _valid_poll_seconds(args.poll_seconds, minimum=1.0):
+        print(
+            json.dumps({"status": "error", "error_code": "POLL_INTERVAL_INVALID"}),
+            file=sys.stderr,
+        )
+        return 2
+    stop_event = threading.Event()
+    exit_code = 0
+    while not stop_event.is_set():
+        try:
+            orchestrator = build_orchestrator("t4")
+            report, receipt = run_monitored_analysis(
+                orchestrator.analyze,
+                build_monitoring_repository(),
+                operation="live_t4_analysis",
+                symbol=args.symbol,
+                interval_minutes=args.interval,
+                limit=args.limit,
+            )
+            payload = {
+                "status": receipt.status,
+                "trace_id": receipt.trace_id,
+                "decision": report.decision.value,
+                "reason_codes": list(report.reason_codes),
+                "alert_enqueued": receipt.alert_enqueued,
+                "read_only": True,
+            }
+            cycle_exit_code = 0
+        except Exception:
+            payload = {
+                "status": "error",
+                "error_code": "MONITORING_CYCLE_FAILED",
+                "read_only": True,
+            }
+            cycle_exit_code = 1
+        print(json.dumps(payload, ensure_ascii=False), file=sys.stderr)
+        exit_code = max(exit_code, cycle_exit_code)
+        if not args.watch:
+            return cycle_exit_code
+        try:
+            if stop_event.wait(float(args.poll_seconds)):
+                break
+        except KeyboardInterrupt:
+            stop_event.set()
+    return exit_code
+
+
+def _run_alert_delivery_command(args: argparse.Namespace) -> int:
+    if not _valid_poll_seconds(args.poll_seconds, minimum=0.5):
+        print(
+            json.dumps({"status": "error", "error_code": "POLL_INTERVAL_INVALID"}),
+            file=sys.stderr,
+        )
+        return 2
+    stop_event = threading.Event()
+    exit_code = 0
+    while not stop_event.is_set():
+        try:
+            result = build_monitoring_repository().deliver_one(sys.stdout)
+            cycle_exit_code = (
+                0 if result.status in {"idle", "delivered"} else 1
+            )
+            if result.status != "idle":
+                print(
+                    json.dumps(
+                        {
+                            "delivery_status": result.status,
+                            "alert_key": result.alert_key,
+                            "attempt_no": result.attempt_no,
+                            "error_code": result.error_code,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    file=sys.stderr,
+                )
+        except Exception:
+            cycle_exit_code = 1
+            print(
+                json.dumps(
+                    {"status": "error", "error_code": "ALERT_DELIVERY_FAILED"}
+                ),
+                file=sys.stderr,
+            )
+        exit_code = max(exit_code, cycle_exit_code)
+        if not args.watch:
+            return cycle_exit_code
+        try:
+            if stop_event.wait(float(args.poll_seconds)):
+                break
+        except KeyboardInterrupt:
+            stop_event.set()
+    return exit_code
+
+
+def _run_monitoring_status_command() -> int:
+    try:
+        data = build_monitoring_repository().dashboard()
+        payload = {
+            "summary": data.summary,
+            "alerts": list(data.alerts),
+            "incidents": list(data.incidents),
+            "read_only": True,
+        }
+        exit_code = 0
+    except Exception:
+        payload = {"status": "error", "error_code": "MONITORING_UNAVAILABLE"}
+        exit_code = 1
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return exit_code
+
+
+def _valid_poll_seconds(value: object, *, minimum: float) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return False
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return False
+    return minimum <= numeric <= 86_400 and numeric == numeric
 
 
 def _run_database_command(action: str, migration_directory: str | None) -> int:

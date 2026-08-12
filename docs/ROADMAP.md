@@ -17,7 +17,16 @@
    bull/base/bear, migracja `0015`, hashe evidence oraz deterministyczne
    `analyze-replay`. Historyczne v2 są odczytywalne, ale kończą się `NO_SIGNAL`.
    Walidacja na prawdziwych danych nadal zależy od dostępu T4 z punktu 3.
-7. **Monitoring i alert delivery** — następny etap; dashboard, trace, incident log.
-8. **Odbiór V1** — minimum cztery tygodnie read-only i raport jakości.
+7. **Monitoring i alert delivery offline** — wdrożone w 0.7.0: trace przed
+   analizą, bezpieczne artifacts, deduplikowany incident log, lokalny dashboard,
+   read-only loopback API, migracja `0016`, transakcyjny outbox i ograniczone
+   delivery `stdout_json` → `process_stdout`. Live delivery wymaga schema v4 i
+   `environment=live_t4`; historyczne v2/v3 są replay-only. Outbox działa
+   at-least-once, a konsument deduplikuje po `idempotency_key`. Analiza API jest
+   wyłącznie `POST /v1/analyze` z `X-Crypto-Agent-Request: analyze-v1`. Synthetic,
+   fixture, replay, `NO_SIGNAL`, veto i stale nigdy nie są dostarczane. Webhook,
+   Slack, Telegram, e-mail i SMS są poza zakresem tej wersji.
+8. **Odbiór V1** — podłączenie oficjalnego klienta, testy live, minimum cztery
+   tygodnie obserwacji read-only i raport jakości.
 
-`v1_gate_passed=false` do ukończenia dostępu live, punktów 7–8 i pełnego odbioru.
+`v1_gate_passed=false` do ukończenia dostępu live i punktu 8.

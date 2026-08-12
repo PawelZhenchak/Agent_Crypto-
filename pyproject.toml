@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "crypto-research-agent"
-version = "0.6.0"
+version = "0.7.0"
 description = "Read-only Plus500 Futures T4 research agent"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -36,6 +36,7 @@ packages = ["src/crypto_agent"]
 [tool.hatch.build.targets.wheel.force-include]
 "configs/risk_policy.v1.json" = "crypto_agent/resources/configs/risk_policy.v1.json"
 "configs/futures_analysis_policy.v1.json" = "crypto_agent/resources/configs/futures_analysis_policy.v1.json"
+"configs/monitoring_policy.v1.json" = "crypto_agent/resources/configs/monitoring_policy.v1.json"
 "db/schema.sql" = "crypto_agent/resources/db/schema.sql"
 "db/migrations" = "crypto_agent/resources/db/migrations"
 "db/seeds" = "crypto_agent/resources/db/seeds"
