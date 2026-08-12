@@ -6,14 +6,14 @@ nie ma endpointów tworzenia, modyfikowania ani anulowania zleceń.
 
 ## Obecny stan
 
-Host, walidacja zapytań, kontrakt JSON schema v3 i zabezpieczenia są gotowe.
+Host, walidacja zapytań, kontrakt live JSON schema v4 i zabezpieczenia są gotowe.
 Oficjalny klient T4 nie jest podłączony. Zarejestrowany obecnie
 `T4ApplicationRegistrationPendingReader` pozostaje celowo fail-closed do czasu
 rejestracji aplikacji u Plus500 Futures Technologies/CTS i otrzymania aktualnego
 pakietu API. Bez tego `/healthz` i `/v1/market-data` zwracają `503`, a agent
 zwraca `NO_SIGNAL`.
 
-Schema v3 wymaga `futures_evidence` zawierającego:
+Live schema v4 wymaga `environment=live_t4` oraz `futures_evidence` zawierającego:
 
 - pełny, uporządkowany snapshot poziomów bid i ask;
 - status sesji `OPEN`, `CLOSED` albo `HALTED`;
@@ -52,9 +52,11 @@ odpowiedniki ETH pozostają zgodne wstecz, ale nie umożliwiają bezpiecznego ro
 Po wejściu w okno roll host zwróci `503`, dopóki nie otrzyma katalogu z następną
 serią.
 
-Historyczny kontrakt schema v2 jest obsługiwany po stronie replayu Python, lecz
-nie spełnia wymagań bieżącego bridge’a. Brak futures evidence powoduje
-`NO_SIGNAL`, nigdy wyliczenie metryk z danych zastępczych.
+Historyczne kontrakty schema v2 i v3 są obsługiwane po stronie replayu Python,
+lecz nie spełniają wymagań bieżącego bridge’a live i nigdy nie kwalifikują się do
+external delivery. Brak futures evidence w v2 powoduje `NO_SIGNAL`, nigdy
+wyliczenie metryk z danych zastępczych. Replay v3 może odtworzyć pełny evidence,
+ale pozostaje replayem, a nie źródłem live.
 
 Nie przesyłaj loginu, hasła, identyfikatora aplikacji ani tokenu bridge do
 repozytorium lub procesu Python poza odpowiadającą mu wartością lokalnego tokenu.

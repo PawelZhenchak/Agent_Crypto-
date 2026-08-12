@@ -12,8 +12,8 @@ def analysis_timeout_seconds() -> float:
         value = float(raw)
     except ValueError:
         raise ValueError("CRYPTO_AGENT_ANALYSIS_TIMEOUT_SECONDS is invalid") from None
-    if not math.isfinite(value) or not 1 <= value <= 120:
+    if not math.isfinite(value) or not 3 <= value <= 120:
         raise ValueError(
-            "CRYPTO_AGENT_ANALYSIS_TIMEOUT_SECONDS must be finite and in [1, 120]"
+            "CRYPTO_AGENT_ANALYSIS_TIMEOUT_SECONDS must be finite and in [3, 120]"
         )
     return value

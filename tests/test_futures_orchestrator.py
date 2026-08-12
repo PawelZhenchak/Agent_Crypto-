@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import unittest
-from datetime import timedelta
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 from crypto_agent.orchestrator import ResearchOrchestrator
@@ -54,7 +53,7 @@ class FuturesOrchestratorTests(unittest.TestCase):
             ),
             contract_selection=str(metadata["t4_contract_selection"]),
             rolled_from_contract_id=None,
-            bridge_schema_version=3,
+            bridge_schema_version=4,
             futures_evidence=batch.futures_evidence,
             source_batch_hashes=(batch.raw_payload_sha256 or "0" * 64,),
             replay_fingerprint_sha256="f" * 64,

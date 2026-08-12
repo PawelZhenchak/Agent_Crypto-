@@ -1,0 +1,12 @@
+{
+  "policy_id": "monitoring-v1-2026-08-12",
+  "schema_version": 1,
+  "retention_days": 90,
+  "channel": "stdout_json",
+  "destination": "process_stdout",
+  "max_attempts": 3,
+  "retry_base_seconds": 2,
+  "retry_max_seconds": 30,
+  "attempt_timeout_seconds": 2.0,
+  "max_page_size": 50
+}

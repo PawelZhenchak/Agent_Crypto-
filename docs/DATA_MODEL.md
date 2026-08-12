@@ -1,4 +1,4 @@
-# Model danych T4
+# Model danych T4 i monitoringu
 
 Aktywny rejestr zawiera:
 
@@ -7,8 +7,9 @@ Aktywny rejestr zawiera:
 - binding `BTC/USD` → `BTC-FUTURES-FRONT`;
 - binding `ETH/USD` → `ETH-FUTURES-FRONT`;
 - runtime protocol: `loopback_http_json_v1`;
-- operacyjny envelope schema: `3` z `contract_roll_at`, `contract_selection`,
-  `rolled_from_contract_id` i `futures_evidence`;
+- operacyjny envelope live schema: `4` z `contract_roll_at`,
+  `contract_selection`, `rolled_from_contract_id`, `futures_evidence` i
+  `environment=live_t4`;
 - `read_only=true` i `order_routes_enabled=false`.
 
 Nazwy `*-FUTURES-FRONT` są logicznymi aliasami. Worker musi utrwalać rzeczywisty
@@ -44,12 +45,49 @@ Migracja `0015` rozszerza append-only model schema v3:
 
 Replay schema v3 odtwarza pełny `FuturesEvidence` i włącza go do fingerprintu
 wejścia analizy. Komenda `analyze-replay` używa tego samego risk gate co analiza
-bieżąca. Schema v2 pozostaje obsługiwana tylko dla historycznego odczytu: nie ma
-wierszy evidence z migracji `0015`, więc metryki mają status `UNAVAILABLE`, a
-decyzja musi być `NO_SIGNAL`.
+bieżąca, ale wynik replayu nigdy nie kwalifikuje się do external delivery. Schema
+v2 pozostaje obsługiwana tylko dla historycznego odczytu: nie ma wierszy evidence
+z migracji `0015`, więc metryki mają status `UNAVAILABLE`, a decyzja musi być
+`NO_SIGNAL`. Tylko bieżący payload schema v4 z `environment=live_t4` może wejść do
+kwalifikacji live alertu.
 
 Raport futures rozróżnia `AVAILABLE`, `UNAVAILABLE`, `INVALID` oraz
 `NOT_APPLICABLE`; brakująca wartość nigdy nie jest kodowana jako zero. Model
 metryk obejmuje spread w bps, depth obu stron, imbalance, basis w bps,
 annualized basis, z-score i względny wolumen, czas do rollu i expiry, expiry risk
 oraz wpływ rollu.
+
+## Monitoring 0.7.0
+
+Monitoring wykorzystuje istniejące tabele badawcze zamiast duplikować model:
+
+- `research_runs`, `research_run_events` i `research_artifacts` przechowują trace,
+  stan operacji i bezpieczny, zredukowany artifact raportu;
+- `data_quality_incidents` i `data_quality_incident_events` przechowują
+  deduplikowane incydenty, bez surowych wyjątków i danych dostępowych;
+- `alerts` i `alert_events` przechowują wyłącznie kwalifikujące się decyzje live
+  `ALERT` oraz ich cykl życia.
+
+Migracja `0016` dodaje dwa append-only zbiory:
+
+- `alert_delivery_outbox` wiąże alert z jedyną trasą
+  `stdout_json` → `process_stdout`, kanonicznym payloadem, SHA-256, idempotency key,
+  oknem dostępności/wygaśnięcia i maksymalną liczbą prób;
+- `alert_delivery_attempts` przechowuje wynik każdej próby, numer sekwencji,
+  payload hash, poprzedni hash, content hash, czas i bezpieczny kod błędu.
+
+Triggery wymuszają kolejność prób, zgodność hasha payloadu, retry nie wcześniejszy
+niż wyznaczona granica, limit prób, terminalność oraz okno expiry. `UPDATE`,
+`DELETE` i `TRUNCATE` obu tabel są zabronione.
+
+Research run/artifact, alert, alert event i outbox powstają w jednej transakcji
+PostgreSQL. SQLite nie uczestniczy w tej transakcji i nie należy interpretować
+tego jako atomowości między różnymi silnikami baz danych.
+
+Domyślna wersjonowana polityka ustawia horyzont retencji na 90 dni. Model audytowy
+pozostaje append-only; wartość retencji nie oznacza automatycznego kasowania
+rekordów przez worker delivery.
+
+Outbox jest trwały, ale granica zapisu do stdout ma semantykę at-least-once.
+Konsument musi deduplikować po `idempotency_key`; model nie obiecuje exactly-once
+między bazą a procesem odbiorcy.

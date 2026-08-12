@@ -3,8 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from datetime import datetime, timedelta, timezone
-from uuid import uuid4
+from datetime import UTC, datetime, timedelta
+from uuid import UUID, uuid4
 
 from . import __version__
 from .analytics import calculate_metrics
@@ -33,7 +33,6 @@ from .resource_paths import default_futures_policy_path
 from .signals import VOLUME_ALERT_ZSCORE, apply_futures_gate, propose_research_alert
 from .storage import ReportRepository
 from .t4_ingest import T4ReplayProvider
-
 
 SYSTEM_VERSION = f"{__version__}-plus500-t4-v1"
 MODEL_VERSION = "deterministic-futures-research-v2"
@@ -64,9 +63,11 @@ class ResearchOrchestrator:
         interval_minutes: int = 1440,
         as_of: datetime | None = None,
         limit: int = 120,
+        trace_id: str | None = None,
     ) -> ResearchReport:
         ensure_analysis_deadline()
-        started_at = datetime.now(timezone.utc)
+        analysis_trace_id = _trace_id(trace_id)
+        started_at = datetime.now(UTC)
         requested_cutoff = as_of or started_at
         if requested_cutoff.tzinfo is None or requested_cutoff.utcoffset() != timedelta(0):
             raise ValueError("as_of must be timezone-aware and normalized to UTC")
@@ -112,10 +113,10 @@ class ResearchOrchestrator:
                         futures_evidence=exc.evidence.futures_evidence,
                     )
                 quality = _failure_quality(exc.code)
-                analysis_time = as_of or datetime.now(timezone.utc)
+                analysis_time = as_of or datetime.now(UTC)
             else:
                 # Live knowledge is sealed after ingestion. An explicit replay cutoff stays fixed.
-                analysis_time = as_of or datetime.now(timezone.utc)
+                analysis_time = as_of or datetime.now(UTC)
                 quality = assess_data_quality(
                     candles,
                     as_of=analysis_time,
@@ -203,7 +204,7 @@ class ResearchOrchestrator:
         instrument_id = f"{self.provider.source_id}:{symbol}:{interval_minutes}m"
         report = ResearchReport(
             decision_id=str(uuid4()),
-            trace_id=str(uuid4()),
+            trace_id=analysis_trace_id,
             as_of=analysis_time,
             expires_at=expires_at,
             asset_id=_canonical_asset_id(symbol),
@@ -244,6 +245,16 @@ class ResearchOrchestrator:
                 "not_financial_advice": True,
                 "v1_gate_passed": False,
                 "plus500_t4_source_attested": source_attested,
+                "external_delivery_eligible": bool(
+                    source_attested
+                    and provider_batch is not None
+                    and provider_batch.external_delivery_eligible
+                    and provider_batch.metadata.get("t4_environment") == "live_t4"
+                ),
+                "t4_bridge_schema_version": provider_metadata.get(
+                    "t4_bridge_schema_version"
+                ),
+                "t4_environment": provider_metadata.get("t4_environment"),
                 "plus500_t4_volume_anomaly_attested": volume_anomaly_attested,
                 "futures_gate_passed": futures_analysis.gate_passed,
                 "futures_policy_id": self.futures_policy.policy_id,
@@ -294,6 +305,18 @@ def _horizon(interval_minutes: int) -> str:
     return {240: "4h", 1440: "1d", 10080: "1w"}.get(
         interval_minutes, f"{interval_minutes}m"
     )
+
+
+def _trace_id(value: str | None) -> str:
+    if value is None:
+        return str(uuid4())
+    try:
+        parsed = UUID(value)
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError("trace_id must be a canonical UUID") from None
+    if str(parsed) != value:
+        raise ValueError("trace_id must be a canonical UUID")
+    return value
 
 
 def _thesis(metrics: MarketMetrics | None, risk: RiskAssessment) -> str:
@@ -432,7 +455,7 @@ def _source_attested(
                 and batch.futures_evidence is None
             )
             or (
-                schema_version == 3
+                schema_version in {3, 4}
                 and batch.metadata.get("t4_futures_evidence_attested") is True
                 and batch.futures_evidence is not None
             )
@@ -455,7 +478,7 @@ def _source_attested(
             and batch.metadata.get("t4_source_id") == Plus500T4Provider.source_id
             and batch.metadata.get("t4_venue_id") == Plus500T4Provider.venue_id
             and batch.metadata.get("t4_order_routes_exposed") is False
-            and schema_version in {2, 3}
+            and schema_version in {2, 3, 4}
             and futures_evidence_valid
             and isinstance(batch.metadata.get("t4_contract_id"), str)
             and bool(batch.metadata.get("t4_contract_id"))

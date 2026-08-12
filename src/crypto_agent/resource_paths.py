@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-
 _PACKAGE_DIRECTORY = Path(__file__).resolve().parent
 _SOURCE_PROJECT_DIRECTORY = _PACKAGE_DIRECTORY.parents[1]
 
@@ -24,6 +23,16 @@ def default_futures_policy_path() -> Path:
         _PACKAGE_DIRECTORY / "resources" / "configs" / "futures_analysis_policy.v1.json",
         _SOURCE_PROJECT_DIRECTORY / "configs" / "futures_analysis_policy.v1.json",
         description="packaged futures analysis policy",
+    )
+
+
+def default_monitoring_policy_path() -> Path:
+    """Locate the strict local monitoring and delivery policy."""
+
+    return _first_existing(
+        _PACKAGE_DIRECTORY / "resources" / "configs" / "monitoring_policy.v1.json",
+        _SOURCE_PROJECT_DIRECTORY / "configs" / "monitoring_policy.v1.json",
+        description="packaged monitoring policy",
     )
 
 

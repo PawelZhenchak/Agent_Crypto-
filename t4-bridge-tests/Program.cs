@@ -142,11 +142,12 @@ var validEvidence = new FuturesEvidenceEnvelope(
         request.AsOf),
     null);
 var validEnvelope = new MarketDataEnvelope(
-    3,
+    4,
     "plus500_t4_futures_v1",
     "plus500_t4",
     true,
     false,
+    "live_t4",
     request.LogicalSymbol,
     request.IntervalMinutes,
     request.ContractId,
@@ -165,6 +166,9 @@ var validEnvelope = new MarketDataEnvelope(
         request.AsOf),
     validEvidence);
 FuturesEvidenceValidator.Validate(request, validEnvelope);
+Expect<T4SessionUnavailableException>(() => FuturesEvidenceValidator.Validate(
+    request,
+    validEnvelope with { Environment = "fixture" }));
 Expect<T4SessionUnavailableException>(() => FuturesEvidenceValidator.Validate(
     request,
     validEnvelope with { OrderRoutesExposed = true }));
