@@ -1,23 +1,32 @@
 # Plus500 Futures T4 Research Agent
 
-Wersja `0.5.0` analizuje wyłącznie dane futures z **Plus500 Futures / T4**.
+Wersja `0.6.0` analizuje wyłącznie dane futures z **Plus500 Futures / T4**.
 System działa tylko w trybie odczytu i może zwrócić `ALERT` lub `NO_SIGNAL`.
 Nie loguje się do innych platform i nie składa, nie zmienia ani nie anuluje zleceń.
 
 ## Źródło danych
 
 Proces analityczny łączy się wyłącznie z lokalnym mostem T4 pod
-`http://127.0.0.1:8784`. Most .NET utrzymuje sesję oficjalnego T4 API i wystawia
-tylko dane rynkowe. Dane logowania T4 nigdy nie trafiają do procesu Python.
-Połączenie loopback wymaga dodatkowo wspólnego, losowego tokenu bridge.
+`http://127.0.0.1:8784`. Most .NET jest granicą dla docelowej sesji oficjalnego
+T4 API i wystawia wyłącznie dane rynkowe. Dane logowania T4 nigdy nie trafiają do
+procesu Python. Połączenie loopback wymaga dodatkowo wspólnego, losowego tokenu.
+
+Oficjalny klient T4 nie jest jeszcze podłączony. Bieżący
+`T4ApplicationRegistrationPendingReader` zwraca `503`, więc próba analizy live
+kończy się bezpiecznym `NO_SIGNAL`. Dane fixture używane w testach nie są danymi
+live i nie potwierdzają połączenia z T4 Simulator.
 
 Obsługiwany zakres V1:
 
 - logiczny front-month Bitcoin futures: `BTC-FUTURES-FRONT`;
 - logiczny front-month Ether futures: `ETH-FUTURES-FRONT`;
 - interwały 4h, 1d i 1w;
-- minimum 120 świec oraz świeża cena referencyjna;
-- jedna zatwierdzona proweniencja: `plus500_t4_futures_v1`.
+- minimum 120 świec oraz pełny snapshot order booka;
+- metryki wolumenu, spreadu, depth, imbalance, basis, annualized basis, expiry i
+  wpływu rollu;
+- jedna zatwierdzona proweniencja futures: `plus500_t4_futures_v1`;
+- jedyna zatwierdzona referencja basis: typ `index` ze źródła
+  `plus500_t4_index_v1`.
 
 ## Szybki test offline
 
@@ -45,9 +54,9 @@ Tryb `synthetic` służy wyłącznie testom i zawsze pozostaje diagnostyczny.
 crypto-agent analyze --provider t4 --symbol BTC/USD --interval 1440
 ```
 
-Host bridge jest już zbudowany. Do czasu zarejestrowania aplikacji T4 i
-podłączenia oficjalnego klienta polecenie bezpiecznie zwróci `NO_SIGNAL` z kodem
-`T4_BRIDGE_UNAVAILABLE`.
+Host bridge i kontrakt schema v3 są zbudowane. Do czasu zarejestrowania aplikacji
+T4 i podłączenia oficjalnego klienta polecenie bezpiecznie zwróci `NO_SIGNAL` z
+kodem `T4_BRIDGE_UNAVAILABLE`.
 
 ## PostgreSQL 16
 
@@ -62,7 +71,9 @@ crypto-agent db health
 Prawidłowy wynik końcowy to `READY`. Migracje `0011` i `0012` są zachowane bez
 zmian jako historia wcześniejszego prototypu. Migracja `0013` ustanawia T4 jako
 jedyne operacyjne źródło, a `0014` dodaje append-only ingest i point-in-time
-replay. Nowy seed nie zawiera konfiguracji innych platform.
+replay. Migracja `0015` dodaje append-only snapshoty futures, poziomy order booka,
+dowody przejścia kontraktu i ich hashe. Nowy seed nie zawiera konfiguracji innych
+platform.
 
 Po podłączeniu oficjalnego klienta T4 pojedynczy batch można zapisać poleceniem:
 
@@ -77,6 +88,18 @@ odtwarza wyłącznie dane dostępne w zadanym czasie:
 crypto-agent replay --symbol BTC/USD --interval 1440 \
   --as-of 2026-08-11T00:00:00+00:00
 ```
+
+Deterministyczną analizę tego samego replayu uruchamia:
+
+```bash
+crypto-agent analyze-replay --symbol BTC/USD --interval 1440 \
+  --as-of 2026-08-11T00:00:00+00:00
+```
+
+Historyczne batche schema v2 pozostają odczytywalne, ale nie zawierają pełnego
+futures evidence i dlatego analiza zawsze kończy się `NO_SIGNAL`. Operacyjny
+alert wymaga kompletnego schema v3. `v1_gate_passed` pozostaje ustawione na
+`false`; kolejnym etapem jest punkt 7 — monitoring i dostarczanie alertów.
 
 Szczegóły: [instrukcja uruchomienia](docs/INSTRUKCJA_URUCHOMIENIA.md),
 [architektura](docs/ARCHITECTURE.md), [stan projektu](docs/CURRENT_STATUS.md).

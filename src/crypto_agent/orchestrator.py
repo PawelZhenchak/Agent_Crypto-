@@ -19,16 +19,24 @@ from .domain import (
     ResearchReport,
     RiskAssessment,
 )
+from .futures_analytics import (
+    FuturesAnalysis,
+    analyze_futures,
+    futures_evidence_to_dict,
+)
+from .futures_policy import FuturesAnalysisPolicy
 from .policy import RiskGate, RiskPolicy
 from .providers.base import CandleProvider, ProviderBatch, ProviderError, fetch_provider_batch
 from .providers.t4 import Plus500T4Provider
 from .quality import assess_data_quality, deduplicate_exact_candles
-from .signals import VOLUME_ALERT_ZSCORE, propose_research_alert
+from .resource_paths import default_futures_policy_path
+from .signals import VOLUME_ALERT_ZSCORE, apply_futures_gate, propose_research_alert
 from .storage import ReportRepository
+from .t4_ingest import T4ReplayProvider
 
 
 SYSTEM_VERSION = f"{__version__}-plus500-t4-v1"
-MODEL_VERSION = "deterministic-research-v1"
+MODEL_VERSION = "deterministic-futures-research-v2"
 
 
 class ResearchOrchestrator:
@@ -38,12 +46,16 @@ class ResearchOrchestrator:
         provider: CandleProvider,
         policy: RiskPolicy,
         repository: ReportRepository | None = None,
+        futures_policy: FuturesAnalysisPolicy | None = None,
     ) -> None:
         policy.validate_v1_safety()
         self.provider = provider
         self.policy = policy
         self.risk_gate = RiskGate(policy)
         self.repository = repository
+        self.futures_policy = futures_policy or FuturesAnalysisPolicy.load(
+            default_futures_policy_path()
+        )
 
     def analyze(
         self,
@@ -97,6 +109,7 @@ class ResearchOrchestrator:
                             "provider_failure_code": exc.code,
                         },
                         reference_price=exc.evidence.reference_price,
+                        futures_evidence=exc.evidence.futures_evidence,
                     )
                 quality = _failure_quality(exc.code)
                 analysis_time = as_of or datetime.now(timezone.utc)
@@ -120,7 +133,15 @@ class ResearchOrchestrator:
             provider_batch.reference_price if provider_batch is not None else None
         )
         candle_snapshot = _canonical_input(input_candles)
-        snapshot = _canonical_evidence(candle_snapshot, reference_price)
+        snapshot = _canonical_evidence(candle_snapshot, reference_price, provider_batch)
+        snapshot.append(
+            {
+                "record_type": "analysis_context",
+                "as_of": analysis_time.isoformat(),
+                "futures_policy_id": self.futures_policy.policy_id,
+                "futures_policy_hash_sha256": self.futures_policy.policy_hash_sha256,
+            }
+        )
         input_fingerprint = _input_fingerprint(snapshot)
         metrics_allowed = quality.passed and quality.score >= self.policy.min_data_quality
         analytics_candles = deduplicate_exact_candles(candles) if metrics_allowed else []
@@ -130,13 +151,29 @@ class ResearchOrchestrator:
             batch=provider_batch,
             required_sources=self.policy.required_source_count,
         )
+        provider_metadata = provider_batch.metadata if provider_batch is not None else {}
+        futures_analysis = analyze_futures(
+            analytics_candles,
+            provider_batch.futures_evidence if provider_batch is not None else None,
+            as_of=analysis_time,
+            symbol=symbol,
+            contract_id=provider_metadata.get("t4_contract_id"),
+            contract_expires_at=provider_metadata.get("t4_contract_expires_at"),
+            contract_roll_at=provider_metadata.get("t4_contract_roll_at"),
+            contract_selection=provider_metadata.get("t4_contract_selection"),
+            rolled_from_contract_id=provider_metadata.get("t4_rolled_from_contract_id"),
+            policy=self.futures_policy,
+        )
         volume_anomaly_attested = _volume_anomaly_attested(
-            provider_batch,
+            futures_analysis,
             source_attested=source_attested,
         )
-        proposal = propose_research_alert(
-            metrics,
-            volume_anomaly_attested=volume_anomaly_attested,
+        proposal = apply_futures_gate(
+            propose_research_alert(
+                metrics,
+                volume_anomaly_attested=volume_anomaly_attested,
+            ),
+            futures_analysis,
         )
         expires_at = analysis_time + timedelta(seconds=self.policy.report_ttl_seconds)
         risk = self.risk_gate.evaluate(
@@ -151,8 +188,18 @@ class ResearchOrchestrator:
             source_attested=source_attested,
             proposed_decision=proposal.decision,
             proposal_reasons=proposal.reasons,
+            additional_veto_flags=futures_analysis.veto_flags,
+            additional_veto_reasons=(
+                "The deterministic futures-evidence gate did not pass.",
+            )
+            if futures_analysis.veto_flags
+            else (),
         )
-        reason_codes = tuple(dict.fromkeys((*risk.flags, *proposal.reason_codes)))
+        reason_codes = tuple(
+            dict.fromkeys(
+                (*risk.flags, *proposal.reason_codes, *futures_analysis.reason_codes)
+            )
+        )
         instrument_id = f"{self.provider.source_id}:{symbol}:{interval_minutes}m"
         report = ResearchReport(
             decision_id=str(uuid4()),
@@ -169,13 +216,12 @@ class ResearchOrchestrator:
             policy_version=self.policy.policy_id,
             data_snapshot_id=f"sha256:{input_fingerprint}",
             thesis=_thesis(metrics, risk),
-            counter_evidence=_counter_evidence(metrics, quality.flags),
-            scenarios=_scenarios(metrics),
-            invalidation_conditions=(
-                "Pojawienie się nowszych danych niż as_of.",
-                "Spadek jakości danych poniżej progu polityki.",
-                "Zmiana sklasyfikowanego reżimu lub aktywacja risk veto.",
+            counter_evidence=(
+                *_counter_evidence(metrics, quality.flags),
+                *futures_analysis.counter_evidence,
             ),
+            scenarios=_scenarios(metrics, futures_analysis),
+            invalidation_conditions=futures_analysis.invalidation_conditions,
             data_quality=quality,
             risk=risk,
             sources=(
@@ -190,6 +236,7 @@ class ResearchOrchestrator:
                 )
             ),
             metrics=metrics,
+            futures_metrics=futures_analysis.metrics,
             metadata={
                 "system_version": SYSTEM_VERSION,
                 "mode": self.policy.mode,
@@ -198,6 +245,9 @@ class ResearchOrchestrator:
                 "v1_gate_passed": False,
                 "plus500_t4_source_attested": source_attested,
                 "plus500_t4_volume_anomaly_attested": volume_anomaly_attested,
+                "futures_gate_passed": futures_analysis.gate_passed,
+                "futures_policy_id": self.futures_policy.policy_id,
+                "futures_policy_hash_sha256": self.futures_policy.policy_hash_sha256,
                 "market": instrument_id,
                 "requested_as_of": requested_cutoff.isoformat(),
                 "input_fingerprint_sha256": input_fingerprint,
@@ -295,17 +345,45 @@ def _canonical_input(candles: list[Candle]) -> list[dict[str, object]]:
 def _canonical_evidence(
     candle_snapshot: list[dict[str, object]],
     reference_price: ReferencePriceSnapshot | None,
+    batch: ProviderBatch | None,
 ) -> list[dict[str, object]]:
     reference = _canonical_reference_price(reference_price)
-    if reference is None:
-        return candle_snapshot
-    return [
-        *candle_snapshot,
-        {
-            "record_type": "reference_price_snapshot",
-            **reference,
-        },
-    ]
+    records: list[dict[str, object]] = list(candle_snapshot)
+    if reference is not None:
+        records.append(
+            {
+                "record_type": "reference_price_snapshot",
+                **reference,
+            }
+        )
+    if batch is not None:
+        metadata = batch.metadata
+        lifecycle_keys = (
+            "t4_bridge_schema_version",
+            "t4_source_id",
+            "t4_venue_id",
+            "t4_contract_id",
+            "t4_contract_expires_at",
+            "t4_contract_roll_at",
+            "t4_contract_selection",
+            "t4_rolled_from_contract_id",
+        )
+        if any(key in metadata for key in lifecycle_keys):
+            records.append(
+                {
+                    "record_type": "t4_contract_lifecycle",
+                    **{key: metadata.get(key) for key in lifecycle_keys},
+                }
+            )
+        futures_evidence = futures_evidence_to_dict(batch.futures_evidence)
+        if futures_evidence is not None:
+            records.append(
+                {
+                    "record_type": "t4_futures_evidence",
+                    **futures_evidence,
+                }
+            )
+    return records
 
 
 def _canonical_reference_price(
@@ -341,11 +419,24 @@ def _source_attested(
     batch: ProviderBatch | None,
     required_sources: int,
 ) -> bool:
-    if type(provider) is not Plus500T4Provider or batch is None:
+    if type(provider) not in {Plus500T4Provider, T4ReplayProvider} or batch is None:
         return False
     try:
         source_ids = tuple(item.get("id") for item in batch.sources)
         reference = batch.reference_price
+        schema_version = batch.metadata.get("t4_bridge_schema_version")
+        futures_evidence_valid = bool(
+            (
+                schema_version == 2
+                and type(provider) is T4ReplayProvider
+                and batch.futures_evidence is None
+            )
+            or (
+                schema_version == 3
+                and batch.metadata.get("t4_futures_evidence_attested") is True
+                and batch.futures_evidence is not None
+            )
+        )
         return bool(
             type(required_sources) is int
             and required_sources == 1
@@ -364,7 +455,8 @@ def _source_attested(
             and batch.metadata.get("t4_source_id") == Plus500T4Provider.source_id
             and batch.metadata.get("t4_venue_id") == Plus500T4Provider.venue_id
             and batch.metadata.get("t4_order_routes_exposed") is False
-            and batch.metadata.get("t4_bridge_schema_version") == 2
+            and schema_version in {2, 3}
+            and futures_evidence_valid
             and isinstance(batch.metadata.get("t4_contract_id"), str)
             and bool(batch.metadata.get("t4_contract_id"))
             and isinstance(batch.metadata.get("t4_contract_roll_at"), str)
@@ -402,16 +494,13 @@ def _input_fingerprint(snapshot: list[dict[str, object]]) -> str:
 
 
 def _volume_anomaly_attested(
-    batch: ProviderBatch | None,
+    futures: FuturesAnalysis,
     *,
     source_attested: bool,
 ) -> bool:
-    if (
-        source_attested is not True
-        or batch is None
-    ):
+    if source_attested is not True:
         return False
-    value = batch.metadata.get("t4_volume_zscore")
+    value = futures.metrics.volume_zscore
     return bool(
         not isinstance(value, bool)
         and isinstance(value, (int, float))
@@ -468,29 +557,56 @@ def _counter_evidence(
     return tuple(evidence)
 
 
-def _scenarios(metrics: MarketMetrics | None) -> tuple[dict[str, object], ...]:
+def _scenarios(
+    metrics: MarketMetrics | None,
+    futures: FuturesAnalysis,
+) -> tuple[dict[str, object], ...]:
     if metrics is None:
         return (
             {
-                "name": "no_signal",
-                "condition": "Dane nie przechodzą kontroli jakości lub ryzyka.",
+                "name": "data_failure",
+                "condition": "Dane nie przechodzą kontroli jakości lub bramki futures.",
                 "probability": None,
+                "active": True,
             },
         )
+    trend_ratio = metrics.sma_20 / metrics.sma_50
+    bull_active = bool(
+        futures.gate_passed
+        and trend_ratio > 1.02
+        and metrics.last_price > metrics.sma_20
+        and metrics.return_7_periods > 0
+    )
+    bear_active = bool(
+        futures.gate_passed
+        and trend_ratio < 0.98
+        and metrics.last_price < metrics.sma_20
+        and metrics.return_7_periods < 0
+    )
+    base_active = bool(futures.gate_passed and 0.98 <= trend_ratio <= 1.02)
     return (
         {
-            "name": "base",
-            "condition": f"Reżim {metrics.regime.value} pozostaje aktywny.",
+            "name": "bull",
+            "condition": "SMA20/SMA50 > 1.02, close > SMA20 i zwrot 7 okresów > 0.",
             "probability": None,
+            "active": bull_active,
         },
         {
-            "name": "adverse",
-            "condition": "Zmienność rośnie lub cena narusza warunki unieważnienia.",
+            "name": "base",
+            "condition": "SMA20/SMA50 pozostaje w przedziale [0.98, 1.02].",
             "probability": None,
+            "active": base_active,
+        },
+        {
+            "name": "bear",
+            "condition": "SMA20/SMA50 < 0.98, close < SMA20 i zwrot 7 okresów < 0.",
+            "probability": None,
+            "active": bear_active,
         },
         {
             "name": "data_failure",
-            "condition": "Źródła stają się opóźnione, sprzeczne albo niedostępne.",
+            "condition": "Dowody są opóźnione, sprzeczne, niepełne albo niedostępne.",
             "probability": None,
+            "active": not futures.gate_passed,
         },
     )

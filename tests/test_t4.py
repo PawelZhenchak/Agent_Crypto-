@@ -58,7 +58,7 @@ def _payload() -> dict[str, object]:
             }
         )
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "source_id": "plus500_t4_futures_v1",
         "venue_id": "plus500_t4",
         "read_only": True,
@@ -79,6 +79,33 @@ def _payload() -> dict[str, object]:
             "event_time": (as_of - timedelta(minutes=1)).isoformat(),
             "available_at": as_of.isoformat(),
             "ingested_at": as_of.isoformat(),
+        },
+        "futures_evidence": {
+            "contract_id": "CME:MBT:202609",
+            "source_id": "plus500_t4_futures_v1",
+            "session_status": "OPEN",
+            "is_full_snapshot": True,
+            "observed_at": (as_of - timedelta(seconds=2)).isoformat(),
+            "available_at": (as_of - timedelta(seconds=1)).isoformat(),
+            "ingested_at": as_of.isoformat(),
+            "bids": [
+                {"level": level, "price": 220.0 - level / 10, "quantity": 2.0 + level}
+                for level in range(1, 6)
+            ],
+            "asks": [
+                {"level": level, "price": 220.0 + level / 10, "quantity": 3.0 + level}
+                for level in range(1, 6)
+            ],
+            "basis_reference": {
+                "symbol": "BTC/USD",
+                "reference_type": "index",
+                "source": "plus500_t4_index_v1",
+                "price": 219.5,
+                "observed_at": (as_of - timedelta(seconds=2)).isoformat(),
+                "available_at": (as_of - timedelta(seconds=1)).isoformat(),
+                "ingested_at": as_of.isoformat(),
+            },
+            "contract_transition": None,
         },
     }
 
@@ -140,6 +167,25 @@ class Plus500T4ProviderTests(unittest.TestCase):
                     as_of=datetime(2026, 8, 11, tzinfo=timezone.utc),
                     limit=120,
                 )
+        self.assertEqual(raised.exception.code, "T4_PAYLOAD_INVALID")
+
+    def test_unapproved_basis_source_fails_closed(self) -> None:
+        payload = _payload()
+        evidence = payload["futures_evidence"]
+        assert isinstance(evidence, dict)
+        basis = evidence["basis_reference"]
+        assert isinstance(basis, dict)
+        basis["source"] = "totally_untrusted_fake_source"
+        with patch(
+            "crypto_agent.providers.t4.build_opener",
+            return_value=_Opener(payload),
+        ), self.assertRaises(ProviderError) as raised:
+            Plus500T4Provider(bridge_token=_BRIDGE_TOKEN).fetch_batch(
+                symbol="BTC/USD",
+                interval_minutes=1440,
+                as_of=datetime(2026, 8, 11, tzinfo=timezone.utc),
+                limit=120,
+            )
         self.assertEqual(raised.exception.code, "T4_PAYLOAD_INVALID")
 
     def test_old_bridge_schema_fails_closed(self) -> None:
@@ -207,6 +253,20 @@ class Plus500T4ProviderTests(unittest.TestCase):
         payload["contract_id"] = "CME:MBT:202612"
         payload["contract_selection"] = "rolled"
         payload["rolled_from_contract_id"] = "CME:MBT:202609"
+        evidence = payload["futures_evidence"]
+        assert isinstance(evidence, dict)
+        evidence["contract_id"] = "CME:MBT:202612"
+        evidence["contract_transition"] = {
+            "from_contract_id": "CME:MBT:202609",
+            "to_contract_id": "CME:MBT:202612",
+            "price_type": "mid",
+            "from_price": 219.8,
+            "to_price": 220.0,
+            "source": "plus500_t4_futures_v1",
+            "observed_at": "2026-08-10T23:59:58+00:00",
+            "available_at": "2026-08-10T23:59:59+00:00",
+            "ingested_at": "2026-08-11T00:00:00+00:00",
+        }
         with patch(
             "crypto_agent.providers.t4.build_opener",
             return_value=_Opener(payload),

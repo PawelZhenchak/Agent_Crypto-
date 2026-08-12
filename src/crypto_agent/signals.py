@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .domain import Decision, MarketMetrics, Regime
+from .futures_analytics import FuturesAnalysis
 
 
 VOLUME_ALERT_ZSCORE = 2.0
@@ -54,4 +55,29 @@ def propose_research_alert(
         decision=Decision.ALERT,
         reason_codes=tuple(reason_codes),
         reasons=tuple(triggers),
+    )
+
+
+def apply_futures_gate(
+    proposal: ResearchProposal,
+    futures: FuturesAnalysis,
+) -> ResearchProposal:
+    """Require complete futures evidence before preserving any research alert."""
+
+    reason_codes = tuple(
+        dict.fromkeys((*proposal.reason_codes, *futures.reason_codes))
+    )
+    if futures.gate_passed:
+        return ResearchProposal(
+            decision=proposal.decision,
+            reason_codes=reason_codes,
+            reasons=proposal.reasons,
+        )
+    return ResearchProposal(
+        decision=Decision.NO_SIGNAL,
+        reason_codes=reason_codes,
+        reasons=(
+            *proposal.reasons,
+            "Pełny zestaw atestowanych dowodów futures nie przeszedł bramki.",
+        ),
     )

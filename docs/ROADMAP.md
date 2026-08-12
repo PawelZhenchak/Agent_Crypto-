@@ -11,6 +11,13 @@
    dokładny raw payload hash, idempotencja, append-only candles, scheduler i
    deterministyczny point-in-time replay. Live contract tests, reconnect, sesja i
    głębokość rynku pozostają zablokowane do czasu dostępu T4 z punktu 3.
-6. **Analiza futures** — spread, volume, depth, roll, basis i expiry risk.
-7. **Monitoring i alert delivery** — dashboard, trace, incident log.
+6. **Analiza futures offline** — wdrożona w 0.6.0: schema v3, spread, depth,
+   imbalance, basis i annualized basis z zatwierdzonego indeksu
+   `plus500_t4_index_v1`, wolumen, expiry risk, wpływ rollu, scenariusze
+   bull/base/bear, migracja `0015`, hashe evidence oraz deterministyczne
+   `analyze-replay`. Historyczne v2 są odczytywalne, ale kończą się `NO_SIGNAL`.
+   Walidacja na prawdziwych danych nadal zależy od dostępu T4 z punktu 3.
+7. **Monitoring i alert delivery** — następny etap; dashboard, trace, incident log.
 8. **Odbiór V1** — minimum cztery tygodnie read-only i raport jakości.
+
+`v1_gate_passed=false` do ukończenia dostępu live, punktów 7–8 i pełnego odbioru.

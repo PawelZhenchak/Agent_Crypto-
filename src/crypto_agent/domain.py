@@ -22,6 +22,27 @@ class Regime(StrEnum):
     HIGH_VOLATILITY = "HIGH_VOLATILITY"
 
 
+class MetricStatus(StrEnum):
+    """Availability of one futures-specific metric.
+
+    Missing evidence is never represented by a numeric zero.  ``INVALID`` means
+    evidence was present but failed validation, while ``NOT_APPLICABLE`` is used
+    only when a metric has no meaning for the current contract state (for example
+    roll impact before the first controlled roll).
+    """
+
+    AVAILABLE = "AVAILABLE"
+    UNAVAILABLE = "UNAVAILABLE"
+    INVALID = "INVALID"
+    NOT_APPLICABLE = "NOT_APPLICABLE"
+
+
+class SessionStatus(StrEnum):
+    OPEN = "OPEN"
+    CLOSED = "CLOSED"
+    HALTED = "HALTED"
+
+
 @dataclass(frozen=True, slots=True)
 class Candle:
     symbol: str
@@ -83,6 +104,61 @@ class ReferencePriceSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class OrderBookLevel:
+    level: int
+    price: float
+    quantity: float
+
+
+@dataclass(frozen=True, slots=True)
+class BasisReference:
+    """Explicit spot/index observation used for futures basis.
+
+    The existing T4 ``reference_price`` is intentionally not reused here: it is
+    an execution-safety observation for the futures market and is not attested as
+    a spot or index price.
+    """
+
+    symbol: str
+    reference_type: str
+    source: str
+    price: float
+    observed_at: datetime
+    available_at: datetime
+    ingested_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ContractTransitionEvidence:
+    from_contract_id: str
+    to_contract_id: str
+    price_type: str
+    from_price: float
+    to_price: float
+    source: str
+    observed_at: datetime
+    available_at: datetime
+    ingested_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class FuturesEvidence:
+    """Immutable microstructure evidence attached to one exact T4 batch."""
+
+    contract_id: str
+    source: str
+    session_status: SessionStatus
+    is_full_snapshot: bool
+    observed_at: datetime
+    available_at: datetime
+    ingested_at: datetime
+    bids: tuple[OrderBookLevel, ...]
+    asks: tuple[OrderBookLevel, ...]
+    basis_reference: BasisReference
+    contract_transition: ContractTransitionEvidence | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class DataQualityReport:
     score: float
     sample_count: int
@@ -107,6 +183,30 @@ class MarketMetrics:
     sma_50: float
     volume_zscore: float
     regime: Regime
+
+
+@dataclass(frozen=True, slots=True)
+class FuturesMetrics:
+    volume_status: MetricStatus
+    volume_zscore: float | None
+    relative_volume: float | None
+    spread_status: MetricStatus
+    spread_bps: float | None
+    depth_status: MetricStatus
+    bid_depth: float | None
+    ask_depth: float | None
+    book_imbalance: float | None
+    basis_status: MetricStatus
+    basis_bps: float | None
+    annualized_basis: float | None
+    lifecycle_status: MetricStatus
+    seconds_to_roll: float | None
+    seconds_to_expiry: float | None
+    expiry_risk: str | None
+    roll_impact_status: MetricStatus
+    roll_impact_bps: float | None
+    session_status: SessionStatus | None
+    flags: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,6 +246,7 @@ class ResearchReport:
     risk: RiskAssessment
     sources: tuple[dict[str, str], ...]
     metrics: MarketMetrics | None
+    futures_metrics: FuturesMetrics | None = None
     narrative: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 

@@ -13,8 +13,17 @@ from typing import Sequence
 from .factory import build_orchestrator
 from .narrator import OpenAINarrator
 from .providers.t4 import Plus500T4Provider
-from .resource_paths import default_migration_directory, default_v1_seed_path
-from .t4_ingest import T4IngestionReceipt, T4IngestionScheduler, T4IngestRepository
+from .resource_paths import (
+    default_migration_directory,
+    default_risk_policy_path,
+    default_v1_seed_path,
+)
+from .t4_ingest import (
+    T4IngestionReceipt,
+    T4IngestionScheduler,
+    T4IngestRepository,
+    T4ReplayProvider,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -62,6 +71,19 @@ def build_parser() -> argparse.ArgumentParser:
     replay.add_argument("--interval", type=int, default=1440, choices=(240, 1440, 10080))
     replay.add_argument("--limit", type=int, default=120)
     replay.add_argument("--as-of", required=True)
+
+    analyze_replay = subparsers.add_parser(
+        "analyze-replay",
+        help="Create a deterministic futures report from PostgreSQL at an exact cutoff",
+    )
+    analyze_replay.add_argument(
+        "--symbol", default="BTC/USD", choices=("BTC/USD", "ETH/USD")
+    )
+    analyze_replay.add_argument(
+        "--interval", type=int, default=1440, choices=(240, 1440, 10080)
+    )
+    analyze_replay.add_argument("--limit", type=int, default=120)
+    analyze_replay.add_argument("--as-of", required=True)
     return parser
 
 
@@ -82,6 +104,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_ingest_command(args)
     if args.command == "replay":
         return _run_replay_command(args)
+    if args.command == "analyze-replay":
+        return _run_analyze_replay_command(args)
     return 2
 
 
@@ -168,10 +192,38 @@ def _run_replay_command(args: argparse.Namespace) -> int:
             "as_of": result.as_of.isoformat(),
             "candle_count": len(result.candles),
             "contract_id": result.contract_id,
+            "bridge_schema_version": result.bridge_schema_version,
+            "futures_evidence_present": result.futures_evidence is not None,
             "source_batch_hashes": list(result.source_batch_hashes),
             "replay_fingerprint_sha256": result.replay_fingerprint_sha256,
             "read_only": True,
         }
+        exit_code = 0
+    except (PostgresError, ProviderError, RuntimeError, ValueError) as exc:
+        payload = {"status": "error", "error": str(exc), "read_only": True}
+        exit_code = 1
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return exit_code
+
+
+def _run_analyze_replay_command(args: argparse.Namespace) -> int:
+    from .orchestrator import ResearchOrchestrator
+    from .policy import RiskPolicy
+    from .postgres import PostgresError
+    from .providers.base import ProviderError
+
+    try:
+        cutoff = datetime.fromisoformat(args.as_of.replace("Z", "+00:00"))
+        report = ResearchOrchestrator(
+            provider=T4ReplayProvider(_t4_repository()),
+            policy=RiskPolicy.load(default_risk_policy_path()),
+        ).analyze(
+            symbol=args.symbol,
+            interval_minutes=args.interval,
+            as_of=cutoff,
+            limit=args.limit,
+        )
+        payload: dict[str, object] = report.to_dict()
         exit_code = 0
     except (PostgresError, ProviderError, RuntimeError, ValueError) as exc:
         payload = {"status": "error", "error": str(exc), "read_only": True}

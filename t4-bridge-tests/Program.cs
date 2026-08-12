@@ -116,6 +116,68 @@ await ExpectAsync<T4SessionUnavailableException>(() => reader.ReadAsync(
     request,
     CancellationToken.None));
 
+var evidenceObservedAt = request.AsOf.AddSeconds(-2);
+var evidenceAvailableAt = request.AsOf.AddSeconds(-1);
+var validEvidence = new FuturesEvidenceEnvelope(
+    request.ContractId,
+    "plus500_t4_futures_v1",
+    "OPEN",
+    true,
+    evidenceObservedAt,
+    evidenceAvailableAt,
+    request.AsOf,
+    Enumerable.Range(1, 5)
+        .Select(level => new OrderBookLevelEnvelope(level, 100.0 - level / 10.0, level))
+        .ToArray(),
+    Enumerable.Range(1, 5)
+        .Select(level => new OrderBookLevelEnvelope(level, 100.0 + level / 10.0, level + 1))
+        .ToArray(),
+    new BasisReferenceEnvelope(
+        request.LogicalSymbol,
+        "index",
+        "plus500_t4_index_v1",
+        99.0,
+        evidenceObservedAt,
+        evidenceAvailableAt,
+        request.AsOf),
+    null);
+var validEnvelope = new MarketDataEnvelope(
+    3,
+    "plus500_t4_futures_v1",
+    "plus500_t4",
+    true,
+    false,
+    request.LogicalSymbol,
+    request.IntervalMinutes,
+    request.ContractId,
+    request.ContractExpiresAt,
+    request.ContractRollAt,
+    "front_month",
+    null,
+    null,
+    Array.Empty<CandleEnvelope>(),
+    new ReferencePriceEnvelope(
+        request.LogicalSymbol,
+        "plus500_t4_futures_v1",
+        100.0,
+        evidenceObservedAt,
+        evidenceAvailableAt,
+        request.AsOf),
+    validEvidence);
+FuturesEvidenceValidator.Validate(request, validEnvelope);
+Expect<T4SessionUnavailableException>(() => FuturesEvidenceValidator.Validate(
+    request,
+    validEnvelope with { OrderRoutesExposed = true }));
+Expect<T4SessionUnavailableException>(() => FuturesEvidenceValidator.Validate(
+    request,
+    validEnvelope with
+    {
+        FuturesEvidence = validEvidence with
+        {
+            BasisReference = validEvidence.BasisReference with { Source = "unapproved" },
+        },
+    }));
+
 Console.WriteLine("T4 bridge contract tests passed.");
 
 static void Assert(bool condition, string message)

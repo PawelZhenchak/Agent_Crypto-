@@ -103,6 +103,16 @@ class AnalysisDeadlineTests(unittest.TestCase):
                 limit=120,
             )
         )
+        snapshot.append(
+            {
+                "record_type": "analysis_context",
+                "as_of": report.as_of.isoformat(),
+                "futures_policy_id": report.metadata["futures_policy_id"],
+                "futures_policy_hash_sha256": report.metadata[
+                    "futures_policy_hash_sha256"
+                ],
+            }
+        )
 
         with TemporaryDirectory() as directory:
             database_path = Path(directory) / "reports.db"
