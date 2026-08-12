@@ -17,6 +17,16 @@ def default_risk_policy_path() -> Path:
     )
 
 
+def default_futures_policy_path() -> Path:
+    """Locate the versioned futures-analysis policy."""
+
+    return _first_existing(
+        _PACKAGE_DIRECTORY / "resources" / "configs" / "futures_analysis_policy.v1.json",
+        _SOURCE_PROJECT_DIRECTORY / "configs" / "futures_analysis_policy.v1.json",
+        description="packaged futures analysis policy",
+    )
+
+
 def default_migration_directory() -> Path:
     """Locate checksummed migrations without depending on the process cwd."""
 

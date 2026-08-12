@@ -154,6 +154,7 @@ class PostgresV11Tests(unittest.TestCase):
                 "0012_reference_price_policy_contract.sql",
                 "0013_plus500_t4_runtime.sql",
                 "0014_t4_operational_ingest.sql",
+                "0015_t4_futures_evidence.sql",
             )
         )
         base_tables = set(re.findall(r"^CREATE TABLE ([a-z0-9_]+)", base_sql, re.MULTILINE))
@@ -167,11 +168,11 @@ class PostgresV11Tests(unittest.TestCase):
         self.assertEqual(set(postgres_module._BASE_TABLES), base_tables)
         self.assertEqual(set(postgres_module._MIGRATED_TABLES), migrated_tables)
         self.assertEqual(len(postgres_module._BASE_TABLES), 42)
-        self.assertEqual(len(postgres_module._MIGRATED_TABLES), 11)
+        self.assertEqual(len(postgres_module._MIGRATED_TABLES), 14)
         self.assertEqual(
             len(postgres_module._BASE_TRIGGER_REQUIREMENTS)
             + len(postgres_module._MIGRATED_TRIGGER_REQUIREMENTS),
-            121,
+            127,
         )
         for requirement in (
             *postgres_module._BASE_TRIGGER_REQUIREMENTS,
@@ -201,7 +202,8 @@ class PostgresV11Tests(unittest.TestCase):
     def test_migration_is_discovered_with_sha256(self) -> None:
         migrations = discover_migrations(PROJECT_ROOT / "db/migrations")
         self.assertEqual(
-            [item.version for item in migrations], ["0011", "0012", "0013", "0014"]
+            [item.version for item in migrations],
+            ["0011", "0012", "0013", "0014", "0015"],
         )
         for migration in migrations:
             self.assertRegex(migration.checksum_sha256, r"^[0-9a-f]{64}$")
@@ -216,6 +218,21 @@ class PostgresV11Tests(unittest.TestCase):
         self.assertIn("t4_ingestion_batches_append_only_row_guard", sql)
         self.assertIn("t4_canonical_candles_append_only_row_guard", sql)
         self.assertNotIn("order_routes", sql.lower())
+
+    def test_t4_futures_evidence_migration_is_append_only(self) -> None:
+        sql = (
+            PROJECT_ROOT / "db/migrations/0015_t4_futures_evidence.sql"
+        ).read_text(encoding="utf-8")
+        self.assertIn("CREATE TABLE crypto_agent.t4_futures_snapshots", sql)
+        self.assertIn("CREATE TABLE crypto_agent.t4_orderbook_levels", sql)
+        self.assertIn(
+            "CREATE TABLE crypto_agent.t4_contract_transition_evidence", sql
+        )
+        self.assertIn("bridge_schema_version IN (2, 3)", sql)
+        self.assertIn("basis_reference_source = 'plus500_t4_index_v1'", sql)
+        self.assertIn("evidence_source = 'plus500_t4_futures_v1'", sql)
+        self.assertIn("t4_futures_snapshots_append_only_row_guard", sql)
+        self.assertIn("t4_orderbook_levels_append_only_truncate_guard", sql)
 
     def test_reference_price_policy_migration_is_exact_and_guarded(self) -> None:
         sql = (
@@ -352,7 +369,8 @@ class PostgresV11Tests(unittest.TestCase):
         self.assertTrue(health.base_schema_ready)
         self.assertEqual(health.status_code, "MIGRATIONS_PENDING")
         self.assertEqual(
-            health.missing_migrations, ("0011", "0012", "0013", "0014")
+            health.missing_migrations,
+            ("0011", "0012", "0013", "0014", "0015"),
         )
         self.assertTrue(connection.committed)
         self.assertTrue(connection.closed)
@@ -388,7 +406,8 @@ class PostgresV11Tests(unittest.TestCase):
         self.assertFalse(health.healthy)
         self.assertEqual(health.status_code, "MIGRATIONS_PENDING")
         self.assertEqual(
-            health.missing_migrations, ("0011", "0012", "0013", "0014")
+            health.missing_migrations,
+            ("0011", "0012", "0013", "0014", "0015"),
         )
 
     def test_caller_cannot_replace_packaged_migration_manifest_with_subset(self) -> None:

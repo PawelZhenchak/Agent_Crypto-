@@ -27,7 +27,8 @@ public sealed record MarketDataEnvelope(
     [property: JsonPropertyName("rolled_from_contract_id")] string? RolledFromContractId,
     [property: JsonPropertyName("volume_zscore")] double? VolumeZScore,
     [property: JsonPropertyName("candles")] IReadOnlyList<CandleEnvelope> Candles,
-    [property: JsonPropertyName("reference_price")] ReferencePriceEnvelope ReferencePrice);
+    [property: JsonPropertyName("reference_price")] ReferencePriceEnvelope ReferencePrice,
+    [property: JsonPropertyName("futures_evidence")] FuturesEvidenceEnvelope FuturesEvidence);
 
 public sealed record CandleEnvelope(
     [property: JsonPropertyName("symbol")] string Symbol,
@@ -48,5 +49,43 @@ public sealed record ReferencePriceEnvelope(
     [property: JsonPropertyName("source")] string Source,
     [property: JsonPropertyName("price")] double Price,
     [property: JsonPropertyName("event_time")] DateTimeOffset EventTime,
+    [property: JsonPropertyName("available_at")] DateTimeOffset AvailableAt,
+    [property: JsonPropertyName("ingested_at")] DateTimeOffset IngestedAt);
+
+public sealed record FuturesEvidenceEnvelope(
+    [property: JsonPropertyName("contract_id")] string ContractId,
+    [property: JsonPropertyName("source_id")] string SourceId,
+    [property: JsonPropertyName("session_status")] string SessionStatus,
+    [property: JsonPropertyName("is_full_snapshot")] bool IsFullSnapshot,
+    [property: JsonPropertyName("observed_at")] DateTimeOffset ObservedAt,
+    [property: JsonPropertyName("available_at")] DateTimeOffset AvailableAt,
+    [property: JsonPropertyName("ingested_at")] DateTimeOffset IngestedAt,
+    [property: JsonPropertyName("bids")] IReadOnlyList<OrderBookLevelEnvelope> Bids,
+    [property: JsonPropertyName("asks")] IReadOnlyList<OrderBookLevelEnvelope> Asks,
+    [property: JsonPropertyName("basis_reference")] BasisReferenceEnvelope BasisReference,
+    [property: JsonPropertyName("contract_transition")] ContractTransitionEnvelope? ContractTransition);
+
+public sealed record OrderBookLevelEnvelope(
+    [property: JsonPropertyName("level")] int Level,
+    [property: JsonPropertyName("price")] double Price,
+    [property: JsonPropertyName("quantity")] double Quantity);
+
+public sealed record BasisReferenceEnvelope(
+    [property: JsonPropertyName("symbol")] string Symbol,
+    [property: JsonPropertyName("reference_type")] string ReferenceType,
+    [property: JsonPropertyName("source")] string Source,
+    [property: JsonPropertyName("price")] double Price,
+    [property: JsonPropertyName("observed_at")] DateTimeOffset ObservedAt,
+    [property: JsonPropertyName("available_at")] DateTimeOffset AvailableAt,
+    [property: JsonPropertyName("ingested_at")] DateTimeOffset IngestedAt);
+
+public sealed record ContractTransitionEnvelope(
+    [property: JsonPropertyName("from_contract_id")] string FromContractId,
+    [property: JsonPropertyName("to_contract_id")] string ToContractId,
+    [property: JsonPropertyName("price_type")] string PriceType,
+    [property: JsonPropertyName("from_price")] double FromPrice,
+    [property: JsonPropertyName("to_price")] double ToPrice,
+    [property: JsonPropertyName("source")] string Source,
+    [property: JsonPropertyName("observed_at")] DateTimeOffset ObservedAt,
     [property: JsonPropertyName("available_at")] DateTimeOffset AvailableAt,
     [property: JsonPropertyName("ingested_at")] DateTimeOffset IngestedAt);

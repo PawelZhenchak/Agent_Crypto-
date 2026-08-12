@@ -160,6 +160,8 @@ class RiskGate:
         source_attested: bool,
         proposed_decision: Decision = Decision.NO_SIGNAL,
         proposal_reasons: tuple[str, ...] = (),
+        additional_veto_flags: tuple[str, ...] = (),
+        additional_veto_reasons: tuple[str, ...] = (),
     ) -> RiskAssessment:
         quality_is_structured = type(quality) is DataQualityReport
         quality_structurally_valid = quality_is_structured and _valid_quality_input(
@@ -194,6 +196,16 @@ class RiskGate:
             and proposed_decision.value in self.policy.allowed_decisions
         )
         source_attestation_valid = isinstance(source_attested, bool)
+        additional_veto_valid = bool(
+            type(additional_veto_flags) is tuple
+            and all(
+                isinstance(flag, str)
+                and re.fullmatch(r"[A-Z][A-Z0-9_]{2,63}", flag)
+                for flag in additional_veto_flags
+            )
+            and type(additional_veto_reasons) is tuple
+            and all(isinstance(reason, str) and reason.strip() for reason in additional_veto_reasons)
+        )
 
         if not quality_valid:
             invalid_input_reasons.append("DataQualityReport failed independent validation.")
@@ -209,6 +221,8 @@ class RiskGate:
             invalid_input_reasons.append("Proposed decision is outside the V1 allowlist.")
         if not source_attestation_valid:
             invalid_input_reasons.append("Source attestation must be a strict boolean.")
+        if not additional_veto_valid:
+            invalid_input_reasons.append("Additional deterministic veto input is invalid.")
         if invalid_input_reasons:
             flags.append("INVALID_RISK_INPUT")
             reasons.extend(invalid_input_reasons)
@@ -218,6 +232,10 @@ class RiskGate:
             reasons.append(
                 "The read-only Plus500 T4 market-data source was not attested."
             )
+
+        if additional_veto_valid:
+            flags.extend(additional_veto_flags)
+            reasons.extend(additional_veto_reasons)
 
         if symbol not in self.policy.allowed_assets:
             flags.append("ASSET_NOT_ALLOWED")
@@ -261,6 +279,7 @@ class RiskGate:
             "STALE_DATA",
             "DATA_CONFLICT",
             *(quality.critical_flags if quality_structurally_valid else ()),
+            *(additional_veto_flags if additional_veto_valid else ()),
         }
         vetoed = not reference_price_valid or any(flag in veto_flags for flag in flags)
         decision = Decision.NO_SIGNAL if vetoed or not decision_valid else proposed_decision

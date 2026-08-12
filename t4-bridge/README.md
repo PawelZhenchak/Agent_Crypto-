@@ -6,11 +6,25 @@ nie ma endpointów tworzenia, modyfikowania ani anulowania zleceń.
 
 ## Obecny stan
 
-Host, walidacja zapytań, kontrakt JSON i zabezpieczenia są gotowe. Adapter do
-oficjalnego klienta T4 pozostaje celowo fail-closed do czasu zarejestrowania
-aplikacji u Plus500 Futures Technologies/CTS i otrzymania aktualnego pakietu API.
-Bez tego `/healthz` i `/v1/market-data` zwracają `503`, a agent zwraca
-`NO_SIGNAL`.
+Host, walidacja zapytań, kontrakt JSON schema v3 i zabezpieczenia są gotowe.
+Oficjalny klient T4 nie jest podłączony. Zarejestrowany obecnie
+`T4ApplicationRegistrationPendingReader` pozostaje celowo fail-closed do czasu
+rejestracji aplikacji u Plus500 Futures Technologies/CTS i otrzymania aktualnego
+pakietu API. Bez tego `/healthz` i `/v1/market-data` zwracają `503`, a agent
+zwraca `NO_SIGNAL`.
+
+Schema v3 wymaga `futures_evidence` zawierającego:
+
+- pełny, uporządkowany snapshot poziomów bid i ask;
+- status sesji `OPEN`, `CLOSED` albo `HALTED`;
+- basis reference typu dokładnie `index` ze źródła
+  `plus500_t4_index_v1`;
+- po kontrolowanym rollu — zsynchronizowane ceny `mid` starego i nowego kontraktu.
+
+Bridge odrzuca niepełny, zablokowany lub przecięty order book, niezgodne czasy,
+niezatwierdzony basis, zły kontrakt i brak wymaganego transition evidence.
+Payloady fixture z testów kontraktowych nie są danymi live i nie zastępują
+oficjalnego klienta.
 
 ## Uruchomienie granicy bezpieczeństwa
 
@@ -37,6 +51,10 @@ Pojedyncze zmienne `T4_BTC_CONTRACT_ID` / `T4_BTC_CONTRACT_EXPIRES_AT` i ich
 odpowiedniki ETH pozostają zgodne wstecz, ale nie umożliwiają bezpiecznego rollu.
 Po wejściu w okno roll host zwróci `503`, dopóki nie otrzyma katalogu z następną
 serią.
+
+Historyczny kontrakt schema v2 jest obsługiwany po stronie replayu Python, lecz
+nie spełnia wymagań bieżącego bridge’a. Brak futures evidence powoduje
+`NO_SIGNAL`, nigdy wyliczenie metryk z danych zastępczych.
 
 Nie przesyłaj loginu, hasła, identyfikatora aplikacji ani tokenu bridge do
 repozytorium lub procesu Python poza odpowiadającą mu wartością lokalnego tokenu.

@@ -1,0 +1,20 @@
+{
+  "policy_id": "futures-analysis-v1-2026-08-12",
+  "schema_version": 1,
+  "required_book_depth": 5,
+  "max_snapshot_age_seconds": 60,
+  "max_basis_age_seconds": 60,
+  "max_timestamp_skew_seconds": 5,
+  "max_spread_bps": 250.0,
+  "min_depth_per_side": 1.0,
+  "max_absolute_basis_bps": 2500.0,
+  "max_absolute_roll_impact_bps": 1500.0,
+  "basis_reference_type": "index",
+  "basis_source_id": "plus500_t4_index_v1",
+  "roll_warning_seconds": 86400,
+  "roll_high_risk_seconds": 3600,
+  "expiry_warning_seconds": 604800,
+  "expiry_high_risk_seconds": 172800,
+  "volume_window": 30,
+  "relative_volume_window": 20
+}

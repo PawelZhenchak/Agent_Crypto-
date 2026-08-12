@@ -5,7 +5,12 @@ from datetime import datetime
 from typing import Any, Protocol
 
 from ..deadline import AnalysisDeadlineExceeded
-from ..domain import Candle, ReferencePriceObservation, ReferencePriceSnapshot
+from ..domain import (
+    Candle,
+    FuturesEvidence,
+    ReferencePriceObservation,
+    ReferencePriceSnapshot,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,6 +21,7 @@ class ProviderFailureEvidence:
     sources: tuple[dict[str, str], ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
     reference_price: ReferencePriceSnapshot | None = None
+    futures_evidence: FuturesEvidence | None = None
 
 
 class ProviderError(RuntimeError):
@@ -44,6 +50,7 @@ class ProviderBatch:
     reference_price: ReferencePriceSnapshot | None = None
     raw_payload: bytes | None = field(default=None, repr=False)
     raw_payload_sha256: str | None = None
+    futures_evidence: FuturesEvidence | None = None
 
 
 class CandleProvider(Protocol):

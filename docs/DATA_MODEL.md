@@ -7,8 +7,8 @@ Aktywny rejestr zawiera:
 - binding `BTC/USD` → `BTC-FUTURES-FRONT`;
 - binding `ETH/USD` → `ETH-FUTURES-FRONT`;
 - runtime protocol: `loopback_http_json_v1`;
-- envelope schema: `2` z `contract_roll_at`, `contract_selection` i
-  `rolled_from_contract_id`;
+- operacyjny envelope schema: `3` z `contract_roll_at`, `contract_selection`,
+  `rolled_from_contract_id` i `futures_evidence`;
 - `read_only=true` i `order_routes_enabled=false`.
 
 Nazwy `*-FUTURES-FRONT` są logicznymi aliasami. Worker musi utrwalać rzeczywisty
@@ -27,3 +27,29 @@ migracji `0014`:
   tworzy duplikatów;
 - replay wybiera wyłącznie rekordy `available_at <= as_of`, rozstrzyga rewizje
   deterministycznie i zwraca fingerprint SHA-256 całego wyniku.
+
+Migracja `0015` rozszerza append-only model schema v3:
+
+- `t4_futures_snapshots` wiąże dokładnie jeden batch z kontraktem, statusem sesji,
+  czasami snapshotu oraz typed basis reference;
+- basis reference musi mieć typ `index`, source ID `plus500_t4_index_v1` i symbol
+  zgodny z logicznym symbolem batcha;
+- `t4_orderbook_levels` zapisuje uporządkowane poziomy bid/ask i hash treści
+  każdego poziomu;
+- `t4_contract_transition_evidence` zapisuje zsynchronizowane ceny typu `mid`
+  starego i nowego kontraktu po kontrolowanym rollu;
+- snapshot i transition mają własne `content_hash`, a surowy batch zachowuje
+  niezależny `raw_payload_hash`;
+- triggery blokują `UPDATE`, `DELETE` i `TRUNCATE` wszystkich nowych tabel.
+
+Replay schema v3 odtwarza pełny `FuturesEvidence` i włącza go do fingerprintu
+wejścia analizy. Komenda `analyze-replay` używa tego samego risk gate co analiza
+bieżąca. Schema v2 pozostaje obsługiwana tylko dla historycznego odczytu: nie ma
+wierszy evidence z migracji `0015`, więc metryki mają status `UNAVAILABLE`, a
+decyzja musi być `NO_SIGNAL`.
+
+Raport futures rozróżnia `AVAILABLE`, `UNAVAILABLE`, `INVALID` oraz
+`NOT_APPLICABLE`; brakująca wartość nigdy nie jest kodowana jako zero. Model
+metryk obejmuje spread w bps, depth obu stron, imbalance, basis w bps,
+annualized basis, z-score i względny wolumen, czas do rollu i expiry, expiry risk
+oraz wpływ rollu.

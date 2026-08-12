@@ -49,6 +49,7 @@ app.MapGet("/v1/market-data", async (
     {
         var request = RequestValidator.Validate(options, symbol, interval_minutes, as_of, limit);
         var result = await reader.ReadAsync(request, cancellationToken);
+        FuturesEvidenceValidator.Validate(request, result);
         return Results.Json(result);
     }
     catch (ArgumentException)

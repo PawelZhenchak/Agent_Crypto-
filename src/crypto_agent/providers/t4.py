@@ -2,13 +2,27 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from datetime import datetime, timedelta
 from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from ..deadline import ensure_analysis_deadline
-from ..domain import Candle, ReferencePriceObservation, ReferencePriceSnapshot
+from ..domain import (
+    BasisReference,
+    Candle,
+    ContractTransitionEvidence,
+    FuturesEvidence,
+    OrderBookLevel,
+    ReferencePriceObservation,
+    ReferencePriceSnapshot,
+    SessionStatus,
+)
+from ..futures_policy import (
+    APPROVED_BASIS_REFERENCE_TYPE,
+    APPROVED_BASIS_SOURCE_ID,
+)
 from .base import ProviderBatch, ProviderError
 
 
@@ -30,7 +44,7 @@ class Plus500T4Provider:
     _allowed_intervals = frozenset({240, 1440, 10080})
     _allowed_symbols = frozenset({"BTC/USD", "ETH/USD"})
     _max_response_bytes = 4_000_000
-    _bridge_schema_version = 2
+    _bridge_schema_version = 3
     _contract_id_pattern = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{2,127}$")
 
     def __init__(
@@ -177,6 +191,14 @@ class Plus500T4Provider:
                 for item in payload["candles"]
             )
             reference = self._parse_reference(payload["reference_price"], symbol)
+            futures_evidence = self._parse_futures_evidence(
+                payload["futures_evidence"],
+                symbol=symbol,
+                contract_id=contract_id,
+                contract_selection=contract_selection,
+                rolled_from_contract_id=rolled_from_contract_id,
+                as_of=as_of,
+            )
         except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ProviderError("T4 payload is invalid", code="T4_PAYLOAD_INVALID") from exc
         if len(candles) < limit:
@@ -205,12 +227,14 @@ class Plus500T4Provider:
                 "t4_contract_roll_at": contract_roll_at.isoformat(),
                 "t4_contract_selection": contract_selection,
                 "t4_rolled_from_contract_id": rolled_from_contract_id,
+                "t4_futures_evidence_attested": True,
             },
             reference_price=ReferencePriceSnapshot(
                 symbol=symbol, observations=(reference,)
             ),
             raw_payload=payload_bytes,
             raw_payload_sha256=hashlib.sha256(payload_bytes).hexdigest(),
+            futures_evidence=futures_evidence,
         )
 
     def _parse_candle(
@@ -253,6 +277,120 @@ class Plus500T4Provider:
             source=self.source_id,
         )
 
+    def _parse_futures_evidence(
+        self,
+        item: object,
+        *,
+        symbol: str,
+        contract_id: str,
+        contract_selection: str,
+        rolled_from_contract_id: object,
+        as_of: datetime,
+    ) -> FuturesEvidence:
+        if not isinstance(item, dict):
+            raise ValueError("futures evidence is not an object")
+        if (
+            item.get("contract_id") != contract_id
+            or item.get("source_id") != self.source_id
+            or item.get("is_full_snapshot") is not True
+        ):
+            raise ValueError("futures evidence scope mismatch")
+        try:
+            session_status = SessionStatus(item["session_status"])
+        except (KeyError, ValueError):
+            raise ValueError("futures session status is invalid") from None
+        observed_at = _utc(item["observed_at"])
+        available_at = _utc(item["available_at"])
+        ingested_at = _utc(item["ingested_at"])
+        if not observed_at <= available_at <= ingested_at <= as_of:
+            raise ValueError("futures evidence time order is invalid")
+
+        bids = _parse_levels(item.get("bids"), side="bid")
+        asks = _parse_levels(item.get("asks"), side="ask")
+        if asks[0].price <= bids[0].price:
+            raise ValueError("futures order book is crossed or locked")
+        current_mid = bids[0].price + (asks[0].price - bids[0].price) / 2.0
+
+        basis_item = item.get("basis_reference")
+        if not isinstance(basis_item, dict):
+            raise ValueError("basis reference is missing")
+        basis_source = basis_item.get("source")
+        if (
+            basis_item.get("symbol") != symbol
+            or basis_item.get("reference_type") != APPROVED_BASIS_REFERENCE_TYPE
+            or basis_source != APPROVED_BASIS_SOURCE_ID
+        ):
+            raise ValueError("basis reference scope is invalid")
+        basis_observed_at = _utc(basis_item["observed_at"])
+        basis_available_at = _utc(basis_item["available_at"])
+        basis_ingested_at = _utc(basis_item["ingested_at"])
+        if not basis_observed_at <= basis_available_at <= basis_ingested_at <= as_of:
+            raise ValueError("basis reference time order is invalid")
+        basis = BasisReference(
+            symbol=symbol,
+            reference_type=str(basis_item["reference_type"]),
+            source=basis_source,
+            price=_positive_number(basis_item["price"]),
+            observed_at=basis_observed_at,
+            available_at=basis_available_at,
+            ingested_at=basis_ingested_at,
+        )
+
+        transition_item = item.get("contract_transition")
+        transition: ContractTransitionEvidence | None
+        if contract_selection == "front_month":
+            if transition_item is not None:
+                raise ValueError("front-month evidence cannot contain a roll transition")
+            transition = None
+        else:
+            if not isinstance(transition_item, dict):
+                raise ValueError("rolled contract requires transition evidence")
+            transition_observed_at = _utc(transition_item["observed_at"])
+            transition_available_at = _utc(transition_item["available_at"])
+            transition_ingested_at = _utc(transition_item["ingested_at"])
+            if not (
+                transition_item.get("from_contract_id") == rolled_from_contract_id
+                and transition_item.get("to_contract_id") == contract_id
+                and transition_item.get("price_type") == "mid"
+                and transition_item.get("source") == self.source_id
+                and math.isclose(
+                    _positive_number(transition_item["to_price"]),
+                    current_mid,
+                    rel_tol=1e-12,
+                    abs_tol=1e-12,
+                )
+                and transition_observed_at
+                <= transition_available_at
+                <= transition_ingested_at
+                <= as_of
+            ):
+                raise ValueError("roll transition evidence is invalid")
+            transition = ContractTransitionEvidence(
+                from_contract_id=str(transition_item["from_contract_id"]),
+                to_contract_id=contract_id,
+                price_type="mid",
+                from_price=_positive_number(transition_item["from_price"]),
+                to_price=_positive_number(transition_item["to_price"]),
+                source=self.source_id,
+                observed_at=transition_observed_at,
+                available_at=transition_available_at,
+                ingested_at=transition_ingested_at,
+            )
+
+        return FuturesEvidence(
+            contract_id=contract_id,
+            source=self.source_id,
+            session_status=session_status,
+            is_full_snapshot=True,
+            observed_at=observed_at,
+            available_at=available_at,
+            ingested_at=ingested_at,
+            bids=bids,
+            asks=asks,
+            basis_reference=basis,
+            contract_transition=transition,
+        )
+
 
 def _utc(value: object) -> datetime:
     if not isinstance(value, str):
@@ -270,3 +408,43 @@ def _number(value: object) -> float:
     if not result == result or result in {float("inf"), float("-inf")}:
         raise ValueError("numeric value must be finite")
     return result
+
+
+def _positive_number(value: object) -> float:
+    result = _number(value)
+    if result <= 0:
+        raise ValueError("numeric value must be positive")
+    return result
+
+
+def _parse_levels(value: object, *, side: str) -> tuple[OrderBookLevel, ...]:
+    if not isinstance(value, list) or not 1 <= len(value) <= 50:
+        raise ValueError("order-book side is incomplete")
+    levels: list[OrderBookLevel] = []
+    for expected_level, item in enumerate(value, start=1):
+        if not isinstance(item, dict) or type(item.get("level")) is not int:
+            raise ValueError("order-book level is invalid")
+        if item["level"] != expected_level:
+            raise ValueError("order-book levels are not contiguous")
+        quantity = _number(item.get("quantity"))
+        if quantity < 0:
+            raise ValueError("order-book quantity is negative")
+        levels.append(
+            OrderBookLevel(
+                level=expected_level,
+                price=_positive_number(item.get("price")),
+                quantity=quantity,
+            )
+        )
+    prices = [item.price for item in levels]
+    if side == "bid" and any(
+        current >= previous
+        for previous, current in zip(prices, prices[1:], strict=False)
+    ):
+        raise ValueError("bid levels are not strictly descending")
+    if side == "ask" and any(
+        current <= previous
+        for previous, current in zip(prices, prices[1:], strict=False)
+    ):
+        raise ValueError("ask levels are not strictly ascending")
+    return tuple(levels)
