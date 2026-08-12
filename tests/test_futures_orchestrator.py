@@ -53,10 +53,15 @@ class FuturesOrchestratorTests(unittest.TestCase):
             ),
             contract_selection=str(metadata["t4_contract_selection"]),
             rolled_from_contract_id=None,
-            bridge_schema_version=4,
+            bridge_schema_version=5,
             futures_evidence=batch.futures_evidence,
             source_batch_hashes=(batch.raw_payload_sha256 or "0" * 64,),
             replay_fingerprint_sha256="f" * 64,
+            environment=str(metadata["t4_environment"]),
+            exchange_id=str(metadata["t4_exchange_id"]),
+            market_id=str(metadata["t4_market_id"]),
+            candle_market_ids=tuple(metadata["t4_candle_market_ids"]),
+            rolled_from_market_id=None,
         )
         selected_policy = RiskPolicy.load(
             PROJECT_ROOT / "configs" / "risk_policy.v1.json"

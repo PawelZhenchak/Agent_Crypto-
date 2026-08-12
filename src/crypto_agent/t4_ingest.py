@@ -37,8 +37,8 @@ from .providers.base import ProviderBatch, ProviderError
 
 T4_SOURCE_ID = "plus500_t4_futures_v1"
 T4_VENUE_ID = "plus500_t4"
-T4_SCHEMA_VERSION = 4
-T4_SUPPORTED_SCHEMA_VERSIONS = frozenset({2, 3, 4})
+T4_SCHEMA_VERSION = 5
+T4_SUPPORTED_SCHEMA_VERSIONS = frozenset({2, 3, 4, 5})
 T4_MAX_RAW_PAYLOAD_BYTES = 4_000_000
 
 
@@ -66,6 +66,14 @@ class T4ReplayResult:
     futures_evidence: FuturesEvidence | None
     source_batch_hashes: tuple[str, ...]
     replay_fingerprint_sha256: str
+    environment: str | None = None
+    exchange_id: str | None = None
+    market_id: str | None = None
+    basis_exchange_id: str | None = None
+    basis_contract_id: str | None = None
+    basis_market_id: str | None = None
+    candle_market_ids: tuple[str, ...] = ()
+    rolled_from_market_id: str | None = None
 
     def as_provider_batch(self) -> ProviderBatch:
         return ProviderBatch(
@@ -89,12 +97,26 @@ class T4ReplayResult:
                 "t4_contract_roll_at": self.contract_roll_at.isoformat(),
                 "t4_contract_selection": self.contract_selection,
                 "t4_rolled_from_contract_id": self.rolled_from_contract_id,
+                **(
+                    {
+                        "t4_environment": self.environment,
+                        "t4_exchange_id": self.exchange_id,
+                        "t4_market_id": self.market_id,
+                        "t4_basis_exchange_id": self.basis_exchange_id,
+                        "t4_basis_contract_id": self.basis_contract_id,
+                        "t4_basis_market_id": self.basis_market_id,
+                        "t4_candle_market_ids": list(self.candle_market_ids),
+                        "t4_rolled_from_market_id": self.rolled_from_market_id,
+                    }
+                    if self.bridge_schema_version == 5
+                    else {}
+                ),
                 "t4_replay": True,
                 "t4_replay_as_of": self.as_of.isoformat(),
                 "t4_replay_fingerprint_sha256": self.replay_fingerprint_sha256,
                 "t4_replay_source_batch_hashes": list(self.source_batch_hashes),
                 "t4_futures_evidence_attested": bool(
-                    self.bridge_schema_version in {3, 4}
+                    self.bridge_schema_version in {3, 4, 5}
                     and self.futures_evidence is not None
                 ),
             },
@@ -121,6 +143,11 @@ class T4IngestRepository:
         reference = _single_reference(batch)
         metadata = batch.metadata
         schema_version = int(envelope["schema_version"])
+        candle_market_ids = (
+            tuple(cast(list[str], metadata["t4_candle_market_ids"]))
+            if schema_version == 5
+            else (None,) * len(candles)
+        )
         observed_at = max(item.close_time for item in candles)
         available_at = max(
             [*(item.available_at for item in candles), reference.available_at]
@@ -172,10 +199,13 @@ class T4IngestRepository:
                         bridge_schema_version, reference_price, reference_event_time,
                         reference_available_at, reference_ingested_at,
                         raw_payload_base64, raw_payload_hash, record_count, status,
-                        observed_at, available_at
+                        observed_at, available_at, environment, exchange_id,
+                        active_market_id, rolled_from_market_id,
+                        basis_exchange_id, basis_contract_id, basis_market_id
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                         %s, %s, %s, %s, %s, %s, %s, %s, 'completed', %s, %s
+                        , %s, %s, %s, %s, %s, %s, %s
                     )
                     ON CONFLICT (raw_payload_hash) DO NOTHING
                     RETURNING t4_batch_id
@@ -188,7 +218,11 @@ class T4IngestRepository:
                         _utc_metadata(metadata, "t4_contract_expires_at"),
                         _utc_metadata(metadata, "t4_contract_roll_at"),
                         metadata["t4_contract_selection"],
-                        metadata["t4_rolled_from_contract_id"],
+                        (
+                            None
+                            if schema_version == 5
+                            else metadata["t4_rolled_from_contract_id"]
+                        ),
                         candles[0].interval_minutes * 60,
                         requested_as_of,
                         schema_version,
@@ -201,23 +235,49 @@ class T4IngestRepository:
                         len(candles),
                         observed_at,
                         available_at,
+                        metadata.get("t4_environment") if schema_version == 5 else None,
+                        metadata.get("t4_exchange_id") if schema_version == 5 else None,
+                        metadata.get("t4_market_id") if schema_version == 5 else None,
+                        (
+                            metadata.get("t4_rolled_from_market_id")
+                            if schema_version == 5
+                            else None
+                        ),
+                        (
+                            metadata.get("t4_basis_exchange_id")
+                            if schema_version == 5
+                            else None
+                        ),
+                        (
+                            metadata.get("t4_basis_contract_id")
+                            if schema_version == 5
+                            else None
+                        ),
+                        (
+                            metadata.get("t4_basis_market_id")
+                            if schema_version == 5
+                            else None
+                        ),
                     ),
                 )
                 inserted_row = db_cursor.fetchone()
                 inserted = inserted_row is not None
                 if inserted:
                     batch_id = int(_row_value(inserted_row, "t4_batch_id", 0))
-                    for candle in candles:
+                    for candle, t4_market_id in zip(
+                        candles, candle_market_ids, strict=True
+                    ):
                         db_cursor.execute(
                             """
                             INSERT INTO crypto_agent.t4_canonical_candles (
-                                t4_batch_id, source_id, market_id, logical_symbol,
-                                contract_id, interval_seconds, open_time, close_time,
+                                t4_batch_id, source_id, registry_market_id,
+                                logical_symbol, contract_id, market_id,
+                                interval_seconds, open_time, close_time,
                                 open_price, high_price, low_price, close_price,
                                 base_volume, available_at, provider_ingested_at,
                                 content_hash
                             ) VALUES (
-                                %s, %s, %s, %s, %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s, %s, %s, %s, %s,
                                 %s, %s, %s, %s, %s, %s, %s, %s
                             )
                             """,
@@ -227,6 +287,7 @@ class T4IngestRepository:
                                 market_id,
                                 candle.symbol,
                                 metadata["t4_contract_id"],
+                                t4_market_id,
                                 candle.interval_minutes * 60,
                                 candle.open_time,
                                 candle.close_time,
@@ -237,10 +298,10 @@ class T4IngestRepository:
                                 candle.volume,
                                 candle.available_at,
                                 candle.ingested_at,
-                                _candle_hash(candle),
+                                _candle_hash(candle, market_id=t4_market_id),
                             ),
                         )
-                    if schema_version in {3, 4}:
+                    if schema_version in {3, 4, 5}:
                         if batch.futures_evidence is None:
                             raise ValueError("T4 schema v3 futures evidence is missing")
                         _persist_futures_evidence(
@@ -250,6 +311,37 @@ class T4IngestRepository:
                             market_id=market_id,
                             logical_symbol=str(envelope["logical_symbol"]),
                             evidence=batch.futures_evidence,
+                            schema_version=schema_version,
+                            exchange_id=(
+                                str(metadata["t4_exchange_id"])
+                                if schema_version == 5
+                                else None
+                            ),
+                            product_contract_id=(
+                                str(metadata["t4_contract_id"])
+                                if schema_version == 5
+                                else None
+                            ),
+                            active_market_id=(
+                                str(metadata["t4_market_id"])
+                                if schema_version == 5
+                                else None
+                            ),
+                            basis_exchange_id=(
+                                str(metadata["t4_basis_exchange_id"])
+                                if schema_version == 5
+                                else None
+                            ),
+                            basis_contract_id=(
+                                str(metadata["t4_basis_contract_id"])
+                                if schema_version == 5
+                                else None
+                            ),
+                            basis_market_id=(
+                                str(metadata["t4_basis_market_id"])
+                                if schema_version == 5
+                                else None
+                            ),
                         )
                 else:
                     db_cursor.execute(
@@ -280,15 +372,16 @@ class T4IngestRepository:
                         (payload_hash,),
                     )
                     existing = db_cursor.fetchone()
-                    expected_snapshot_count = 1 if schema_version in {3, 4} else 0
+                    expected_snapshot_count = 1 if schema_version in {3, 4, 5} else 0
                     expected_level_count = (
                         len(batch.futures_evidence.bids)
                         + len(batch.futures_evidence.asks)
-                        if schema_version in {3, 4} and batch.futures_evidence is not None
+                        if schema_version in {3, 4, 5}
+                        and batch.futures_evidence is not None
                         else 0
                     )
                     expected_transition_count = int(
-                        schema_version in {3, 4}
+                        schema_version in {3, 4, 5}
                         and batch.futures_evidence is not None
                         and batch.futures_evidence.contract_transition is not None
                     )
@@ -377,6 +470,14 @@ class T4IngestRepository:
                                batch.t4_batch_id,
                                batch.raw_payload_base64,
                                candle.content_hash,
+                               batch.environment,
+                               batch.exchange_id,
+                               batch.active_market_id,
+                               batch.rolled_from_market_id,
+                               batch.basis_exchange_id,
+                               batch.basis_contract_id,
+                               batch.basis_market_id,
+                               candle.market_id AS candle_market_id,
                                row_number() OVER (
                                    PARTITION BY candle.open_time
                                    ORDER BY candle.available_at DESC,
@@ -396,7 +497,10 @@ class T4IngestRepository:
                            rolled_from_contract_id, reference_price,
                            reference_event_time, reference_available_at,
                            reference_ingested_at, bridge_schema_version, t4_batch_id
-                           , raw_payload_base64, content_hash
+                           , raw_payload_base64, content_hash, environment,
+                           exchange_id, active_market_id, rolled_from_market_id,
+                           basis_exchange_id, basis_contract_id, basis_market_id,
+                           candle_market_id
                     FROM ranked
                     WHERE replay_rank = 1
                     ORDER BY open_time DESC
@@ -429,7 +533,7 @@ class T4IngestRepository:
                             19,
                         )
                     )
-                    if schema_version_in_transaction in {3, 4}:
+                    if schema_version_in_transaction in {3, 4, 5}:
                         batch_id = int(
                             _row_value(newest_in_transaction, "t4_batch_id", 20)
                         )
@@ -441,7 +545,9 @@ class T4IngestRepository:
                                    basis_reference_type, basis_reference_source,
                                    basis_reference_price, basis_observed_at,
                                    basis_available_at, basis_ingested_at,
-                                   content_hash
+                                   content_hash, exchange_id, product_contract_id,
+                                   active_market_id, basis_exchange_id,
+                                   basis_product_contract_id, basis_market_id
                             FROM crypto_agent.t4_futures_snapshots
                             WHERE t4_batch_id = %s
                               AND available_at <= %s
@@ -469,7 +575,8 @@ class T4IngestRepository:
                             SELECT from_contract_id, to_contract_id, price_type,
                                    from_price, to_price, evidence_source,
                                    observed_at, available_at, provider_ingested_at,
-                                   content_hash
+                                   content_hash, exchange_id, product_contract_id,
+                                   from_market_id, to_market_id
                             FROM crypto_agent.t4_contract_transition_evidence
                             WHERE t4_batch_id = %s
                               AND available_at <= %s
@@ -544,17 +651,90 @@ class T4IngestRepository:
         rolled_from_contract_id = _optional_text(
             _row_value(newest, "rolled_from_contract_id", 14)
         )
+        environment = (
+            _optional_text(_row_value(newest, "environment", 23))
+            if bridge_schema_version == 5
+            else None
+        )
+        exchange_id = (
+            _optional_text(_row_value(newest, "exchange_id", 24))
+            if bridge_schema_version == 5
+            else None
+        )
+        active_market_id = (
+            _optional_text(_row_value(newest, "active_market_id", 25))
+            if bridge_schema_version == 5
+            else None
+        )
+        rolled_from_market_id = (
+            _optional_text(_row_value(newest, "rolled_from_market_id", 26))
+            if bridge_schema_version == 5
+            else None
+        )
+        basis_exchange_id = (
+            _optional_text(_row_value(newest, "basis_exchange_id", 27))
+            if bridge_schema_version == 5
+            else None
+        )
+        basis_contract_id = (
+            _optional_text(_row_value(newest, "basis_contract_id", 28))
+            if bridge_schema_version == 5
+            else None
+        )
+        basis_market_id = (
+            _optional_text(_row_value(newest, "basis_market_id", 29))
+            if bridge_schema_version == 5
+            else None
+        )
+        candle_market_ids = (
+            tuple(
+                str(_row_value(row, "candle_market_id", 30))
+                for row in ordered
+            )
+            if bridge_schema_version == 5
+            else ()
+        )
+        if bridge_schema_version == 5 and (
+            environment not in {"t4_simulator", "live_t4"}
+            or exchange_id is None
+            or active_market_id is None
+            or basis_exchange_id is None
+            or basis_contract_id is None
+            or basis_market_id is None
+            or any(value == "None" for value in candle_market_ids)
+            or candle_market_ids[-1] != active_market_id
+        ):
+            raise ProviderError(
+                "T4 replay schema-v5 identity is invalid",
+                code="T4_REPLAY_EVIDENCE_INVALID",
+            )
         futures_evidence = None
-        if bridge_schema_version in {3, 4}:
+        if bridge_schema_version in {3, 4, 5}:
             futures_evidence = _replay_futures_evidence(
                 snapshot_row=snapshot_row,
                 level_rows=level_rows,
                 transition_row=transition_row,
                 as_of=as_of,
                 expected_symbol=symbol,
-                expected_contract_id=contract_id,
+                expected_contract_id=(
+                    active_market_id
+                    if bridge_schema_version == 5 and active_market_id is not None
+                    else contract_id
+                ),
                 contract_selection=contract_selection,
-                rolled_from_contract_id=rolled_from_contract_id,
+                rolled_from_contract_id=(
+                    rolled_from_market_id
+                    if bridge_schema_version == 5
+                    else rolled_from_contract_id
+                ),
+                schema_version=bridge_schema_version,
+                expected_exchange_id=exchange_id,
+                expected_product_contract_id=(
+                    contract_id if bridge_schema_version == 5 else None
+                ),
+                expected_basis_exchange_id=basis_exchange_id,
+                expected_basis_contract_id=basis_contract_id,
+                expected_basis_market_id=basis_market_id,
             )
         fingerprint = _replay_hash(
             candles,
@@ -567,6 +747,14 @@ class T4IngestRepository:
             rolled_from_contract_id=rolled_from_contract_id,
             bridge_schema_version=bridge_schema_version,
             futures_evidence=futures_evidence,
+            environment=environment,
+            exchange_id=exchange_id,
+            market_id=active_market_id,
+            basis_exchange_id=basis_exchange_id,
+            basis_contract_id=basis_contract_id,
+            basis_market_id=basis_market_id,
+            candle_market_ids=candle_market_ids,
+            rolled_from_market_id=rolled_from_market_id,
         )
         return T4ReplayResult(
             symbol=symbol,
@@ -583,6 +771,14 @@ class T4IngestRepository:
             futures_evidence=futures_evidence,
             source_batch_hashes=source_hashes,
             replay_fingerprint_sha256=fingerprint,
+            environment=environment,
+            exchange_id=exchange_id,
+            market_id=active_market_id,
+            basis_exchange_id=basis_exchange_id,
+            basis_contract_id=basis_contract_id,
+            basis_market_id=basis_market_id,
+            candle_market_ids=candle_market_ids,
+            rolled_from_market_id=rolled_from_market_id,
         )
 
     def _legacy_replay(
@@ -727,6 +923,12 @@ def _replay_futures_evidence(
     expected_contract_id: str,
     contract_selection: str,
     rolled_from_contract_id: str | None,
+    schema_version: int,
+    expected_exchange_id: str | None = None,
+    expected_product_contract_id: str | None = None,
+    expected_basis_exchange_id: str | None = None,
+    expected_basis_contract_id: str | None = None,
+    expected_basis_market_id: str | None = None,
 ) -> FuturesEvidence:
     if snapshot_row is None or not level_rows:
         raise ProviderError(
@@ -734,9 +936,26 @@ def _replay_futures_evidence(
             code="T4_REPLAY_EVIDENCE_INCOMPLETE",
         )
     try:
-        contract_id = str(_row_value(snapshot_row, "contract_id", 1))
+        contract_id = (
+            str(_row_value(snapshot_row, "active_market_id", 17))
+            if schema_version == 5
+            else str(_row_value(snapshot_row, "contract_id", 1))
+        )
         if contract_id != expected_contract_id:
             raise ValueError("contract mismatch")
+        if schema_version == 5 and (
+            str(_row_value(snapshot_row, "exchange_id", 15))
+            != expected_exchange_id
+            or str(_row_value(snapshot_row, "product_contract_id", 16))
+            != expected_product_contract_id
+            or str(_row_value(snapshot_row, "basis_exchange_id", 18))
+            != expected_basis_exchange_id
+            or str(_row_value(snapshot_row, "basis_product_contract_id", 19))
+            != expected_basis_contract_id
+            or str(_row_value(snapshot_row, "basis_market_id", 20))
+            != expected_basis_market_id
+        ):
+            raise ValueError("schema-v5 snapshot identity mismatch")
         bids = tuple(
             OrderBookLevel(
                 level=int(_row_value(row, "level_no", 1)),
@@ -780,7 +999,7 @@ def _replay_futures_evidence(
             available_at=_as_utc(_row_value(snapshot_row, "basis_available_at", 12)),
             ingested_at=_as_utc(_row_value(snapshot_row, "basis_ingested_at", 13)),
         )
-        transition = _replay_transition(transition_row)
+        transition = _replay_transition(transition_row, schema_version=schema_version)
         if (contract_selection == "front_month" and transition is not None) or (
             contract_selection == "rolled"
             and (
@@ -846,12 +1065,26 @@ def _replay_futures_evidence(
         ) from None
 
 
-def _replay_transition(row: object | None) -> ContractTransitionEvidence | None:
+def _replay_transition(
+    row: object | None, *, schema_version: int
+) -> ContractTransitionEvidence | None:
     if row is None:
         return None
     return ContractTransitionEvidence(
-        from_contract_id=str(_row_value(row, "from_contract_id", 0)),
-        to_contract_id=str(_row_value(row, "to_contract_id", 1)),
+        from_contract_id=str(
+            _row_value(
+                row,
+                "from_market_id" if schema_version == 5 else "from_contract_id",
+                12 if schema_version == 5 else 0,
+            )
+        ),
+        to_contract_id=str(
+            _row_value(
+                row,
+                "to_market_id" if schema_version == 5 else "to_contract_id",
+                13 if schema_version == 5 else 1,
+            )
+        ),
         price_type=str(_row_value(row, "price_type", 2)),
         from_price=float(_row_value(row, "from_price", 3)),
         to_price=float(_row_value(row, "to_price", 4)),
@@ -882,7 +1115,18 @@ def _verify_replay_batch_integrity(
         if hashlib.sha256(decoded).hexdigest() != raw_hash:
             raise ValueError("raw payload hash mismatch")
         for row, candle in zip(rows, candles, strict=True):
-            if str(_row_value(row, "content_hash", 22)) != _candle_hash(candle):
+            schema_version = int(
+                _row_value(row, "bridge_schema_version", 19)
+            )
+            candle_market_id = (
+                str(_row_value(row, "candle_market_id", 30))
+                if schema_version == 5
+                else None
+            )
+            if str(_row_value(row, "content_hash", 22)) != _candle_hash(
+                candle,
+                market_id=candle_market_id,
+            ):
                 raise ValueError("candle hash mismatch")
     except (binascii.Error, LookupError, TypeError, ValueError):
         raise ProviderError(
@@ -899,6 +1143,13 @@ def _persist_futures_evidence(
     market_id: int,
     logical_symbol: str,
     evidence: FuturesEvidence,
+    schema_version: int,
+    exchange_id: str | None,
+    product_contract_id: str | None,
+    active_market_id: str | None,
+    basis_exchange_id: str | None,
+    basis_contract_id: str | None,
+    basis_market_id: str | None,
 ) -> None:
     basis = evidence.basis_reference
     canonical = futures_evidence_to_dict(evidence)
@@ -911,10 +1162,13 @@ def _persist_futures_evidence(
             session_status, is_full_snapshot, observed_at, available_at,
             provider_ingested_at, basis_reference_symbol,
             basis_reference_type, basis_reference_source, basis_reference_price,
-            basis_observed_at, basis_available_at, basis_ingested_at, content_hash
+            basis_observed_at, basis_available_at, basis_ingested_at, content_hash,
+            exchange_id, product_contract_id, active_market_id,
+            basis_exchange_id, basis_product_contract_id, basis_market_id
         ) VALUES (
             %s, %s, %s, %s, %s, %s, %s, %s, %s,
-            %s, %s, %s, %s, %s, %s, %s, %s, %s
+            %s, %s, %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s
         )
         RETURNING t4_snapshot_id
         """,
@@ -923,7 +1177,7 @@ def _persist_futures_evidence(
             source_id,
             market_id,
             logical_symbol,
-            evidence.contract_id,
+            product_contract_id if schema_version == 5 else evidence.contract_id,
             evidence.session_status.value,
             evidence.is_full_snapshot,
             evidence.observed_at,
@@ -937,6 +1191,12 @@ def _persist_futures_evidence(
             basis.available_at,
             basis.ingested_at,
             _object_hash(canonical),
+            exchange_id,
+            product_contract_id,
+            active_market_id,
+            basis_exchange_id,
+            basis_contract_id,
+            basis_market_id,
         ),
     )
     snapshot_row = db_cursor.fetchone()
@@ -976,10 +1236,11 @@ def _persist_futures_evidence(
                 t4_batch_id, source_id, market_id, logical_symbol,
                 from_contract_id, to_contract_id, price_type, from_price,
                 to_price, evidence_source, observed_at, available_at,
-                provider_ingested_at, content_hash
+                provider_ingested_at, content_hash, exchange_id,
+                product_contract_id, from_market_id, to_market_id
             ) VALUES (
                 %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s, %s, %s
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
             )
             """,
             (
@@ -997,6 +1258,10 @@ def _persist_futures_evidence(
                 transition.available_at,
                 transition.ingested_at,
                 _object_hash(_transition_payload(transition)),
+                exchange_id,
+                product_contract_id,
+                transition.from_contract_id if schema_version == 5 else None,
+                transition.to_contract_id if schema_version == 5 else None,
             ),
         )
 
@@ -1111,7 +1376,7 @@ def _validated_envelope(
         or metadata.get("t4_bridge_schema_version") != schema_version
     ):
         raise ValueError("T4 raw payload schema is unsupported")
-    required = {
+    required: dict[str, object] = {
         "schema_version": schema_version,
         "source_id": T4_SOURCE_ID,
         "venue_id": T4_VENUE_ID,
@@ -1119,16 +1384,83 @@ def _validated_envelope(
         "order_routes_exposed": False,
         "logical_symbol": batch.candles[0].symbol,
         "interval_minutes": batch.candles[0].interval_minutes,
-        "contract_id": metadata.get("t4_contract_id"),
         "contract_selection": metadata.get("t4_contract_selection"),
-        "rolled_from_contract_id": metadata.get("t4_rolled_from_contract_id"),
     }
+    if schema_version == 5:
+        required.update(
+            {
+                "environment": metadata.get("t4_environment"),
+                "exchange_id": metadata.get("t4_exchange_id"),
+                "contract_id": metadata.get("t4_contract_id"),
+                "market_id": metadata.get("t4_market_id"),
+                "rolled_from_market_id": metadata.get(
+                    "t4_rolled_from_market_id"
+                ),
+            }
+        )
+    else:
+        required.update(
+            {
+                "contract_id": metadata.get("t4_contract_id"),
+                "rolled_from_contract_id": metadata.get(
+                    "t4_rolled_from_contract_id"
+                ),
+            }
+        )
     if any(envelope.get(key) != value for key, value in required.items()):
         raise ValueError("T4 raw payload attestation mismatch")
     if schema_version == 4 and envelope.get("environment") != "live_t4":
         raise ValueError("T4 live environment attestation mismatch")
     if schema_version == 4 and metadata.get("t4_environment") != "live_t4":
         raise ValueError("T4 live environment metadata mismatch")
+    if schema_version == 5:
+        if envelope.get("environment") not in {"t4_simulator", "live_t4"}:
+            raise ValueError("T4 environment attestation mismatch")
+        for key, max_length in (
+            ("exchange_id", 64),
+            ("contract_id", 128),
+            ("market_id", 256),
+        ):
+            if not _valid_opaque_t4_id(envelope.get(key), max_length=max_length):
+                raise ValueError(f"T4 {key} attestation is invalid")
+        rolled_from_market_id = envelope.get("rolled_from_market_id")
+        if (
+            envelope.get("contract_selection") == "front_month"
+            and rolled_from_market_id is not None
+        ) or (
+            envelope.get("contract_selection") == "rolled"
+            and (
+                not _valid_opaque_t4_id(rolled_from_market_id, max_length=256)
+                or rolled_from_market_id == envelope.get("market_id")
+            )
+        ):
+            raise ValueError("T4 roll MarketID attestation mismatch")
+        raw_evidence = envelope.get("futures_evidence")
+        raw_basis = (
+            raw_evidence.get("basis_reference")
+            if isinstance(raw_evidence, dict)
+            else None
+        )
+        if not isinstance(raw_basis, dict):
+            raise ValueError("T4 basis identity is missing")
+        for raw_key, metadata_key, max_length in (
+            ("exchange_id", "t4_basis_exchange_id", 64),
+            ("contract_id", "t4_basis_contract_id", 128),
+            ("market_id", "t4_basis_market_id", 256),
+        ):
+            if (
+                raw_basis.get(raw_key) != metadata.get(metadata_key)
+                or not _valid_opaque_t4_id(
+                    raw_basis.get(raw_key), max_length=max_length
+                )
+            ):
+                raise ValueError("T4 basis identity attestation mismatch")
+        if (
+            raw_basis.get("exchange_id") == envelope.get("exchange_id")
+            and raw_basis.get("contract_id") == envelope.get("contract_id")
+            and raw_basis.get("market_id") == envelope.get("market_id")
+        ):
+            raise ValueError("T4 basis identity is not independent")
     expires_at = _utc_metadata(metadata, "t4_contract_expires_at")
     roll_at = _utc_metadata(metadata, "t4_contract_roll_at")
     if (
@@ -1152,6 +1484,22 @@ def _validated_envelope(
         for raw_item, candle in zip(raw_candles, batch.candles, strict=True)
     ):
         raise ValueError("T4 raw payload differs from normalized candles")
+    if schema_version == 5:
+        candle_market_ids = metadata.get("t4_candle_market_ids")
+        if (
+            not isinstance(candle_market_ids, list)
+            or len(candle_market_ids) != len(raw_candles)
+            or any(
+                not isinstance(raw_item, dict)
+                or raw_item.get("market_id") != market_id
+                or not _valid_opaque_t4_id(market_id, max_length=256)
+                for raw_item, market_id in zip(
+                    raw_candles, candle_market_ids, strict=True
+                )
+            )
+            or candle_market_ids[-1] != required["market_id"]
+        ):
+            raise ValueError("T4 candle MarketID attestation mismatch")
     reference = _single_reference(batch)
     raw_reference = envelope.get("reference_price")
     if (
@@ -1168,16 +1516,30 @@ def _validated_envelope(
         if batch.futures_evidence is not None or "futures_evidence" in envelope:
             raise ValueError("T4 schema v2 cannot contain futures evidence")
     elif not _raw_futures_evidence_matches(
-        envelope.get("futures_evidence"), batch.futures_evidence
+        envelope.get("futures_evidence"),
+        batch.futures_evidence,
+        schema_version=schema_version,
+        exchange_id=required.get("exchange_id"),
+        contract_id=required.get("contract_id"),
+        market_id=required.get("market_id"),
+        basis_exchange_id=metadata.get("t4_basis_exchange_id"),
+        basis_contract_id=metadata.get("t4_basis_contract_id"),
+        basis_market_id=metadata.get("t4_basis_market_id"),
     ):
         raise ValueError("T4 raw futures evidence attestation mismatch")
     elif not validate_futures_evidence_structure(
         batch.futures_evidence,
         as_of=requested_as_of,
         symbol=str(required["logical_symbol"]),
-        contract_id=required["contract_id"],
+        contract_id=(
+            required["market_id"] if schema_version == 5 else required["contract_id"]
+        ),
         contract_selection=required["contract_selection"],
-        rolled_from_contract_id=required["rolled_from_contract_id"],
+        rolled_from_contract_id=(
+            required["rolled_from_market_id"]
+            if schema_version == 5
+            else required["rolled_from_contract_id"]
+        ),
     ):
         raise ValueError("T4 futures evidence semantics are invalid")
     return envelope
@@ -1225,7 +1587,7 @@ def _validate_replay_request(
         raise ProviderError("T4 replay limit is invalid", code="T4_LIMIT_INVALID")
 
 
-def _candle_hash(candle: Candle) -> str:
+def _candle_hash(candle: Candle, *, market_id: str | None = None) -> str:
     payload = {
         "available_at": candle.available_at.isoformat(),
         "close": candle.close,
@@ -1240,6 +1602,8 @@ def _candle_hash(candle: Candle) -> str:
         "symbol": candle.symbol,
         "volume": candle.volume,
     }
+    if market_id is not None:
+        payload["market_id"] = market_id
     return hashlib.sha256(_canonical_json(payload)).hexdigest()
 
 
@@ -1266,13 +1630,29 @@ def _raw_candle_matches(raw: object, candle: Candle) -> bool:
 
 
 def _raw_futures_evidence_matches(
-    raw: object, evidence: FuturesEvidence | None
+    raw: object,
+    evidence: FuturesEvidence | None,
+    *,
+    schema_version: int,
+    exchange_id: object = None,
+    contract_id: object = None,
+    market_id: object = None,
+    basis_exchange_id: object = None,
+    basis_contract_id: object = None,
+    basis_market_id: object = None,
 ) -> bool:
     if not isinstance(raw, dict) or not isinstance(evidence, FuturesEvidence):
         return False
     try:
+        evidence_scope_matches = (
+            raw.get("exchange_id") == exchange_id
+            and raw.get("contract_id") == contract_id
+            and raw.get("market_id") == market_id == evidence.contract_id
+            if schema_version == 5
+            else raw.get("contract_id") == evidence.contract_id
+        )
         if not bool(
-            raw.get("contract_id") == evidence.contract_id
+            evidence_scope_matches
             and raw.get("source_id") == evidence.source
             and raw.get("session_status") == evidence.session_status.value
             and raw.get("is_full_snapshot") is evidence.is_full_snapshot
@@ -1286,6 +1666,14 @@ def _raw_futures_evidence_matches(
         basis = raw.get("basis_reference")
         if not isinstance(basis, dict) or not bool(
             basis.get("symbol") == evidence.basis_reference.symbol
+            and (
+                schema_version != 5
+                or (
+                    basis.get("exchange_id") == basis_exchange_id
+                    and basis.get("contract_id") == basis_contract_id
+                    and basis.get("market_id") == basis_market_id
+                )
+            )
             and basis.get("reference_type") == evidence.basis_reference.reference_type
             and basis.get("source") == evidence.basis_reference.source
             and _same_number(basis.get("price"), evidence.basis_reference.price)
@@ -1298,7 +1686,9 @@ def _raw_futures_evidence_matches(
         ):
             return False
         return _raw_transition_matches(
-            raw.get("contract_transition"), evidence.contract_transition
+            raw.get("contract_transition"),
+            evidence.contract_transition,
+            schema_version=schema_version,
         )
     except (TypeError, ValueError):
         return False
@@ -1321,15 +1711,20 @@ def _raw_levels_match(
 
 
 def _raw_transition_matches(
-    raw: object, transition: ContractTransitionEvidence | None
+    raw: object,
+    transition: ContractTransitionEvidence | None,
+    *,
+    schema_version: int = 4,
 ) -> bool:
     if transition is None:
         return raw is None
     if not isinstance(raw, dict):
         return False
+    from_key = "from_market_id" if schema_version == 5 else "from_contract_id"
+    to_key = "to_market_id" if schema_version == 5 else "to_contract_id"
     return bool(
-        raw.get("from_contract_id") == transition.from_contract_id
-        and raw.get("to_contract_id") == transition.to_contract_id
+        raw.get(from_key) == transition.from_contract_id
+        and raw.get(to_key) == transition.to_contract_id
         and raw.get("price_type") == transition.price_type
         and raw.get("source") == transition.source
         and _same_number(raw.get("from_price"), transition.from_price)
@@ -1337,6 +1732,15 @@ def _raw_transition_matches(
         and _parse_utc_text(raw.get("observed_at")) == transition.observed_at
         and _parse_utc_text(raw.get("available_at")) == transition.available_at
         and _parse_utc_text(raw.get("ingested_at")) == transition.ingested_at
+    )
+
+
+def _valid_opaque_t4_id(value: object, *, max_length: int) -> bool:
+    return bool(
+        isinstance(value, str)
+        and 1 <= len(value) <= max_length
+        and value == value.strip()
+        and not any(ord(character) < 32 or ord(character) == 127 for character in value)
     )
 
 
@@ -1364,10 +1768,28 @@ def _replay_hash(
     rolled_from_contract_id: str | None = None,
     bridge_schema_version: int | None = None,
     futures_evidence: FuturesEvidence | None = None,
+    environment: str | None = None,
+    exchange_id: str | None = None,
+    market_id: str | None = None,
+    basis_exchange_id: str | None = None,
+    basis_contract_id: str | None = None,
+    basis_market_id: str | None = None,
+    candle_market_ids: tuple[str, ...] = (),
+    rolled_from_market_id: str | None = None,
 ) -> str:
+    market_ids: tuple[str | None, ...] = (
+        candle_market_ids
+        if bridge_schema_version == 5
+        else (None,) * len(candles)
+    )
+    if len(market_ids) != len(candles):
+        raise ValueError("T4 replay candle MarketID count mismatch")
     payload = {
         "as_of": as_of.isoformat(),
-        "candles": [_candle_hash(candle) for candle in candles],
+        "candles": [
+            _candle_hash(candle, market_id=candle_market_id)
+            for candle, candle_market_id in zip(candles, market_ids, strict=True)
+        ],
         "source_batch_hashes": source_hashes,
         "contract_lifecycle": {
             "contract_id": contract_id,
@@ -1385,6 +1807,17 @@ def _replay_hash(
         },
         "futures_evidence": futures_evidence_to_dict(futures_evidence),
     }
+    if bridge_schema_version == 5:
+        payload["t4_v5_identity"] = {
+            "environment": environment,
+            "exchange_id": exchange_id,
+            "market_id": market_id,
+            "basis_exchange_id": basis_exchange_id,
+            "basis_contract_id": basis_contract_id,
+            "basis_market_id": basis_market_id,
+            "candle_market_ids": candle_market_ids,
+            "rolled_from_market_id": rolled_from_market_id,
+        }
     return hashlib.sha256(_canonical_json(payload)).hexdigest()
 
 

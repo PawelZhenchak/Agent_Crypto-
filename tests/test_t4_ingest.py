@@ -5,7 +5,8 @@ import hashlib
 import json
 import threading
 import unittest
-from datetime import datetime, timedelta, timezone
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 
 from crypto_agent.domain import (
     BasisReference,
@@ -24,12 +25,11 @@ from crypto_agent.t4_ingest import (
     T4IngestRepository,
     _candle_hash,
     _object_hash,
+    _validated_envelope,
 )
-
 from tests.db_fakes import FakeConnection, SQLStep
 
-
-AS_OF = datetime(2026, 8, 11, tzinfo=timezone.utc)
+AS_OF = datetime(2026, 8, 11, tzinfo=UTC)
 
 
 def _batch(
@@ -71,9 +71,11 @@ def _batch(
             )
         )
     evidence = None
-    if schema_version == 3:
+    if schema_version in {3, 5}:
         evidence = FuturesEvidence(
-            contract_id="CME:MBT:202609",
+            contract_id=(
+                "MBT Sep26 (XCME)" if schema_version == 5 else "CME:MBT:202609"
+            ),
             source="plus500_t4_futures_v1",
             session_status=SessionStatus.OPEN,
             is_full_snapshot=True,
@@ -122,7 +124,38 @@ def _batch(
         },
     }
     if evidence is not None:
-        envelope["futures_evidence"] = futures_evidence_to_dict(evidence)
+        raw_evidence = futures_evidence_to_dict(evidence)
+        assert isinstance(raw_evidence, dict)
+        if schema_version == 5:
+            envelope.update(
+                {
+                    "environment": "live_t4",
+                    "exchange_id": "CME",
+                    "contract_id": "MBT",
+                    "market_id": "MBT Sep26 (XCME)",
+                    "rolled_from_market_id": None,
+                }
+            )
+            envelope.pop("rolled_from_contract_id")
+            for raw_candle in raw_candles:
+                raw_candle["market_id"] = "MBT Sep26 (XCME)"
+            raw_evidence.update(
+                {
+                    "exchange_id": "CME",
+                    "contract_id": "MBT",
+                    "market_id": "MBT Sep26 (XCME)",
+                }
+            )
+            basis = raw_evidence["basis_reference"]
+            assert isinstance(basis, dict)
+            basis.update(
+                {
+                    "exchange_id": "CME",
+                    "contract_id": "BTC-INDEX",
+                    "market_id": "BTC Index (CME)",
+                }
+            )
+        envelope["futures_evidence"] = raw_evidence
     raw_payload = json.dumps(envelope, separators=(",", ":")).encode()
     reference = ReferencePriceSnapshot(
         symbol="BTC/USD",
@@ -153,12 +186,28 @@ def _batch(
             "t4_venue_id": "plus500_t4",
             "t4_order_routes_exposed": False,
             "t4_bridge_schema_version": schema_version,
-            "t4_contract_id": "CME:MBT:202609",
+            "t4_contract_id": (
+                "MBT" if schema_version == 5 else "CME:MBT:202609"
+            ),
             "t4_contract_expires_at": (AS_OF + timedelta(days=30)).isoformat(),
             "t4_contract_roll_at": (AS_OF + timedelta(days=25)).isoformat(),
             "t4_contract_selection": "front_month",
             "t4_rolled_from_contract_id": None,
             "t4_futures_evidence_attested": evidence is not None,
+            **(
+                {
+                    "t4_environment": "live_t4",
+                    "t4_exchange_id": "CME",
+                    "t4_market_id": "MBT Sep26 (XCME)",
+                    "t4_basis_exchange_id": "CME",
+                    "t4_basis_contract_id": "BTC-INDEX",
+                    "t4_basis_market_id": "BTC Index (CME)",
+                    "t4_candle_market_ids": ["MBT Sep26 (XCME)"] * 60,
+                    "t4_rolled_from_market_id": None,
+                }
+                if schema_version == 5
+                else {}
+            ),
         },
         reference_price=reference,
         raw_payload=raw_payload,
@@ -260,6 +309,48 @@ def _v3_snapshot_and_levels() -> tuple[tuple[object, ...], list[tuple[object, ..
 
 
 class T4OperationalIngestTests(unittest.TestCase):
+    def test_schema_v5_envelope_preserves_official_opaque_market_ids(self) -> None:
+        batch = _batch(schema_version=5)
+        envelope = _validated_envelope(batch, requested_as_of=AS_OF)
+        self.assertEqual(envelope["exchange_id"], "CME")
+        self.assertEqual(envelope["contract_id"], "MBT")
+        self.assertEqual(envelope["market_id"], "MBT Sep26 (XCME)")
+
+    def test_schema_v5_simulator_envelope_is_ingestible_but_explicit(self) -> None:
+        batch = _batch(schema_version=5)
+        raw_envelope = json.loads(batch.raw_payload or b"")
+        raw_envelope["environment"] = "t4_simulator"
+        raw_payload = json.dumps(raw_envelope, separators=(",", ":")).encode()
+        simulator = replace(
+            batch,
+            metadata={**batch.metadata, "t4_environment": "t4_simulator"},
+            raw_payload=raw_payload,
+            raw_payload_sha256=hashlib.sha256(raw_payload).hexdigest(),
+        )
+        envelope = _validated_envelope(simulator, requested_as_of=AS_OF)
+        self.assertEqual(envelope["environment"], "t4_simulator")
+        self.assertFalse(simulator.external_delivery_eligible)
+
+    def test_schema_v5_environment_metadata_mismatch_fails_closed(self) -> None:
+        batch = _batch(schema_version=5)
+        mismatched = replace(
+            batch,
+            metadata={**batch.metadata, "t4_environment": "t4_simulator"},
+        )
+        with self.assertRaisesRegex(ValueError, "attestation mismatch"):
+            _validated_envelope(mismatched, requested_as_of=AS_OF)
+
+    def test_schema_v5_candle_market_id_mismatch_fails_closed(self) -> None:
+        batch = _batch(schema_version=5)
+        metadata = dict(batch.metadata)
+        market_ids = list(metadata["t4_candle_market_ids"])
+        market_ids[0] = "MBT Jun26 (XCME)"
+        metadata["t4_candle_market_ids"] = market_ids
+        with self.assertRaisesRegex(ValueError, "candle MarketID"):
+            _validated_envelope(
+                replace(batch, metadata=metadata), requested_as_of=AS_OF
+            )
+
     def test_ingest_is_atomic_and_persists_every_candle(self) -> None:
         connection = FakeConnection(
             [
@@ -404,7 +495,7 @@ class T4OperationalIngestTests(unittest.TestCase):
                     ]
                 )
                 with self.assertRaises(ProviderError) as raised:
-                    T4IngestRepository(lambda: connection).replay(
+                    T4IngestRepository(lambda connection=connection: connection).replay(
                         symbol="BTC/USD",
                         interval_minutes=1440,
                         as_of=AS_OF,
@@ -491,7 +582,7 @@ class T4OperationalIngestTests(unittest.TestCase):
                     ]
                 )
                 with self.assertRaises(ProviderError) as raised:
-                    T4IngestRepository(lambda: connection).replay(
+                    T4IngestRepository(lambda connection=connection: connection).replay(
                         symbol="BTC/USD",
                         interval_minutes=1440,
                         as_of=AS_OF,

@@ -153,16 +153,27 @@ class ResearchOrchestrator:
             required_sources=self.policy.required_source_count,
         )
         provider_metadata = provider_batch.metadata if provider_batch is not None else {}
+        t4_schema_version = provider_metadata.get("t4_bridge_schema_version")
+        lifecycle_contract_id = (
+            provider_metadata.get("t4_market_id")
+            if t4_schema_version == 5
+            else provider_metadata.get("t4_contract_id")
+        )
+        rolled_from_lifecycle_id = (
+            provider_metadata.get("t4_rolled_from_market_id")
+            if t4_schema_version == 5
+            else provider_metadata.get("t4_rolled_from_contract_id")
+        )
         futures_analysis = analyze_futures(
             analytics_candles,
             provider_batch.futures_evidence if provider_batch is not None else None,
             as_of=analysis_time,
             symbol=symbol,
-            contract_id=provider_metadata.get("t4_contract_id"),
+            contract_id=lifecycle_contract_id,
             contract_expires_at=provider_metadata.get("t4_contract_expires_at"),
             contract_roll_at=provider_metadata.get("t4_contract_roll_at"),
             contract_selection=provider_metadata.get("t4_contract_selection"),
-            rolled_from_contract_id=provider_metadata.get("t4_rolled_from_contract_id"),
+            rolled_from_contract_id=rolled_from_lifecycle_id,
             policy=self.futures_policy,
         )
         volume_anomaly_attested = _volume_anomaly_attested(
@@ -385,11 +396,16 @@ def _canonical_evidence(
             "t4_bridge_schema_version",
             "t4_source_id",
             "t4_venue_id",
+            "t4_environment",
+            "t4_exchange_id",
             "t4_contract_id",
+            "t4_market_id",
+            "t4_candle_market_ids",
             "t4_contract_expires_at",
             "t4_contract_roll_at",
             "t4_contract_selection",
             "t4_rolled_from_contract_id",
+            "t4_rolled_from_market_id",
         )
         if any(key in metadata for key in lifecycle_keys):
             records.append(
@@ -448,6 +464,12 @@ def _source_attested(
         source_ids = tuple(item.get("id") for item in batch.sources)
         reference = batch.reference_price
         schema_version = batch.metadata.get("t4_bridge_schema_version")
+        candle_market_ids = batch.metadata.get("t4_candle_market_ids")
+        rolled_from_lifecycle_id = (
+            batch.metadata.get("t4_rolled_from_market_id")
+            if schema_version == 5
+            else batch.metadata.get("t4_rolled_from_contract_id")
+        )
         futures_evidence_valid = bool(
             (
                 schema_version == 2
@@ -455,7 +477,7 @@ def _source_attested(
                 and batch.futures_evidence is None
             )
             or (
-                schema_version in {3, 4}
+                schema_version in {3, 4, 5}
                 and batch.metadata.get("t4_futures_evidence_attested") is True
                 and batch.futures_evidence is not None
             )
@@ -478,26 +500,50 @@ def _source_attested(
             and batch.metadata.get("t4_source_id") == Plus500T4Provider.source_id
             and batch.metadata.get("t4_venue_id") == Plus500T4Provider.venue_id
             and batch.metadata.get("t4_order_routes_exposed") is False
-            and schema_version in {2, 3, 4}
+            and schema_version in {2, 3, 4, 5}
             and futures_evidence_valid
             and isinstance(batch.metadata.get("t4_contract_id"), str)
             and bool(batch.metadata.get("t4_contract_id"))
+            and (
+                schema_version != 5
+                or (
+                    batch.metadata.get("t4_environment")
+                    in {"t4_simulator", "live_t4"}
+                    and isinstance(batch.metadata.get("t4_exchange_id"), str)
+                    and bool(batch.metadata.get("t4_exchange_id"))
+                    and isinstance(batch.metadata.get("t4_market_id"), str)
+                    and bool(batch.metadata.get("t4_market_id"))
+                    and isinstance(candle_market_ids, list)
+                    and len(candle_market_ids) == len(batch.candles)
+                    and all(
+                        isinstance(item, str) and bool(item)
+                        for item in candle_market_ids
+                    )
+                    and candle_market_ids[-1] == batch.metadata.get("t4_market_id")
+                )
+            )
             and isinstance(batch.metadata.get("t4_contract_roll_at"), str)
             and isinstance(batch.metadata.get("t4_contract_expires_at"), str)
             and batch.metadata.get("t4_contract_selection") in {"front_month", "rolled"}
             and (
                 (
                     batch.metadata.get("t4_contract_selection") == "front_month"
-                    and batch.metadata.get("t4_rolled_from_contract_id") is None
+                    and (
+                        batch.metadata.get("t4_rolled_from_market_id") is None
+                        if schema_version == 5
+                        else batch.metadata.get("t4_rolled_from_contract_id") is None
+                    )
                 )
                 or (
                     batch.metadata.get("t4_contract_selection") == "rolled"
-                    and isinstance(
-                        batch.metadata.get("t4_rolled_from_contract_id"), str
+                    and isinstance(rolled_from_lifecycle_id, str)
+                    and bool(rolled_from_lifecycle_id)
+                    and rolled_from_lifecycle_id
+                    != (
+                        batch.metadata.get("t4_market_id")
+                        if schema_version == 5
+                        else batch.metadata.get("t4_contract_id")
                     )
-                    and bool(batch.metadata.get("t4_rolled_from_contract_id"))
-                    and batch.metadata.get("t4_rolled_from_contract_id")
-                    != batch.metadata.get("t4_contract_id")
                 )
             )
         )

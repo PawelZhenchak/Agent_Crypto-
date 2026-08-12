@@ -10,11 +10,16 @@ public sealed class BridgeOptions
     private const int MaximumCatalogBytes = 1_000_000;
     private const int LegacyRollDays = 5;
 
-    private BridgeOptions(int port, string token, FuturesContractCatalog contractCatalog)
+    private BridgeOptions(
+        int port,
+        string token,
+        FuturesContractCatalog contractCatalog,
+        T4ApiOptions api)
     {
         Port = port;
         Token = token;
         ContractCatalog = contractCatalog;
+        Api = api;
     }
 
     public int Port { get; }
@@ -22,6 +27,8 @@ public sealed class BridgeOptions
     public string Token { get; }
 
     public FuturesContractCatalog ContractCatalog { get; }
+
+    public T4ApiOptions Api { get; }
 
     public static BridgeOptions FromEnvironment()
     {
@@ -38,7 +45,8 @@ public sealed class BridgeOptions
             throw new InvalidOperationException("T4_BRIDGE_PORT must be between 1024 and 65535.");
         }
 
-        return new BridgeOptions(port, token, LoadContractCatalog());
+        var catalog = LoadContractCatalog();
+        return new BridgeOptions(port, token, catalog, T4ApiOptions.FromEnvironment(catalog));
     }
 
     private static FuturesContractCatalog LoadContractCatalog()
@@ -70,7 +78,7 @@ public sealed class BridgeOptions
                 "The T4 contract catalog is not valid JSON.", exception);
         }
 
-        if (document is null || document.SchemaVersion != 1 ||
+        if (document is null || document.SchemaVersion is not (1 or 2) ||
             document.DefaultRollDays is < 1 or > 30 || document.Contracts is null)
         {
             throw new InvalidOperationException("The T4 contract catalog schema is invalid.");
@@ -79,7 +87,18 @@ public sealed class BridgeOptions
         return new FuturesContractCatalog(document.Contracts.Select(item =>
         {
             var rollAt = item.RollAt ?? item.ExpiresAt.AddDays(-document.DefaultRollDays);
-            return new FuturesContract(item.LogicalSymbol, item.ContractId, item.ExpiresAt, rollAt);
+            return document.SchemaVersion == 1
+                ? new FuturesContract(item.LogicalSymbol, item.ContractId, item.ExpiresAt, rollAt)
+                : new FuturesContract(
+                    item.LogicalSymbol,
+                    item.ExchangeId ?? string.Empty,
+                    item.ContractId,
+                    item.MarketId ?? string.Empty,
+                    item.ExpiresAt,
+                    rollAt,
+                    item.BasisExchangeId ?? string.Empty,
+                    item.BasisContractId ?? string.Empty,
+                    item.BasisMarketId ?? string.Empty);
         }));
     }
 
@@ -111,6 +130,90 @@ public sealed record ContractCatalogDocument(
 
 public sealed record ContractCatalogItem(
     [property: JsonPropertyName("logical_symbol")] string LogicalSymbol,
+    [property: JsonPropertyName("exchange_id")] string? ExchangeId,
     [property: JsonPropertyName("contract_id")] string ContractId,
+    [property: JsonPropertyName("market_id")] string? MarketId,
     [property: JsonPropertyName("expires_at")] DateTimeOffset ExpiresAt,
-    [property: JsonPropertyName("roll_at")] DateTimeOffset? RollAt);
+    [property: JsonPropertyName("roll_at")] DateTimeOffset? RollAt,
+    [property: JsonPropertyName("basis_exchange_id")] string? BasisExchangeId,
+    [property: JsonPropertyName("basis_contract_id")] string? BasisContractId,
+    [property: JsonPropertyName("basis_market_id")] string? BasisMarketId);
+
+public enum T4ApiEnvironment
+{
+    Pending,
+    Simulator,
+    Live,
+}
+
+public sealed record T4ApiOptions(
+    T4ApiEnvironment Environment,
+    string ApiKey,
+    Uri? WebSocketUri,
+    Uri? RestUri)
+{
+    public const string EnvironmentVariableName = "T4_API_ENVIRONMENT";
+    public const string ApiKeyEnvironmentName = "T4_API_KEY";
+    public const string OfficialProtocolCommit =
+        "1a68b674482194f1cf3b9d7f129ce5fbed8bcb51";
+
+    public bool IsConfigured => Environment is not T4ApiEnvironment.Pending;
+
+    public string AttestedEnvironment => Environment switch
+    {
+        T4ApiEnvironment.Simulator => "t4_simulator",
+        T4ApiEnvironment.Live => "live_t4",
+        _ => "not_configured",
+    };
+
+    public static T4ApiOptions FromEnvironment(FuturesContractCatalog catalog)
+    {
+        var rawEnvironment = System.Environment.GetEnvironmentVariable(EnvironmentVariableName) ??
+            "pending";
+        var environment = rawEnvironment switch
+        {
+            "pending" => T4ApiEnvironment.Pending,
+            "simulator" => T4ApiEnvironment.Simulator,
+            "live" => T4ApiEnvironment.Live,
+            _ => throw new InvalidOperationException(
+                $"{EnvironmentVariableName} must be pending, simulator, or live."),
+        };
+        var apiKey = System.Environment.GetEnvironmentVariable(ApiKeyEnvironmentName) ??
+            string.Empty;
+        if (environment is T4ApiEnvironment.Pending)
+        {
+            if (apiKey.Length > 0)
+            {
+                throw new InvalidOperationException(
+                    $"{ApiKeyEnvironmentName} must not be set while T4 is pending.");
+            }
+            return new T4ApiOptions(environment, string.Empty, null, null);
+        }
+        if (apiKey.Length is < 16 or > 512 || apiKey.Any(char.IsWhiteSpace) ||
+            apiKey.Any(char.IsControl))
+        {
+            throw new InvalidOperationException(
+                $"{ApiKeyEnvironmentName} must contain 16-512 non-whitespace characters.");
+        }
+        if (!catalog.IsOfficiallyAddressable)
+        {
+            throw new InvalidOperationException(
+                "The schema v2 T4 contract catalog is required for an official session.");
+        }
+
+        return environment switch
+        {
+            T4ApiEnvironment.Simulator => new T4ApiOptions(
+                environment,
+                apiKey,
+                new Uri("wss://wss-sim.t4login.com/v1"),
+                new Uri("https://api-sim.t4login.com/")),
+            T4ApiEnvironment.Live => new T4ApiOptions(
+                environment,
+                apiKey,
+                new Uri("wss://wss.t4login.com/v1"),
+                new Uri("https://api.t4login.com/")),
+            _ => throw new InvalidOperationException("Unsupported T4 API environment."),
+        };
+    }
+}

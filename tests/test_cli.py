@@ -5,19 +5,105 @@ import json
 import os
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from crypto_agent.cli import build_parser, main
 from crypto_agent.monitoring import DeliveryResult, MonitoringError
+from crypto_agent.observation import (
+    CriterionResult,
+    CriterionStatus,
+    ObservationCyclePlan,
+    ObservationCycleRunResult,
+    ObservationQualityReport,
+)
+from crypto_agent.observation_policy import ObservationPolicy
 from crypto_agent.postgres import PostgresUnavailableError
+from crypto_agent.providers.base import ProviderBatch
 
 
 class _BrokenDriver:
     @staticmethod
     def connect(*args: object, **kwargs: object) -> object:
         raise RuntimeError("opaque-driver-sensitive-marker")
+
+
+_OBSERVATION_POLICY = ObservationPolicy.load("configs/observation_policy.v1.json")
+_CAMPAIGN_ID = "6d18efb9-c1ee-47bd-a122-351482b1410e"
+_DATABASE_NOW = datetime(2026, 8, 12, 16, 0, tzinfo=UTC)
+
+
+@dataclass(frozen=True)
+class _MinimalObservationRisk:
+    assessment_id: str
+
+
+@dataclass(frozen=True)
+class _MinimalObservationReport:
+    decision_id: str
+    trace_id: str
+    as_of: datetime
+    data_snapshot_id: str
+    metadata: dict[str, object]
+    risk: _MinimalObservationRisk
+
+
+def _quality_report(
+    *,
+    elapsed_seconds: int,
+    overall_status: CriterionStatus = CriterionStatus.NOT_OBSERVED,
+    gate_passed: bool = False,
+) -> ObservationQualityReport:
+    return ObservationQualityReport(
+        campaign_id=_CAMPAIGN_ID,
+        generated_at=_DATABASE_NOW,
+        observed_until=_DATABASE_NOW,
+        elapsed_seconds=elapsed_seconds,
+        overall_status=overall_status,
+        v1_gate_passed=gate_passed,
+        policy_id=_OBSERVATION_POLICY.policy_id,
+        policy_hash_sha256=_OBSERVATION_POLICY.policy_hash_sha256,
+        frozen_baseline_hash_sha256="d" * 64,
+        criteria=(
+            CriterionResult(
+                criterion_id="real_elapsed_time",
+                status=overall_status,
+                actual=elapsed_seconds,
+                threshold=_OBSERVATION_POLICY.minimum_elapsed_seconds,
+            ),
+        ),
+    )
+
+
+def _live_preflight_batch() -> ProviderBatch:
+    raw_payload = b'{"schema_version":5,"environment":"live_t4"}'
+    import hashlib
+
+    return ProviderBatch(
+        candles=(),
+        input_candles=(),
+        sources=(
+            {
+                "id": "plus500_t4_futures_v1",
+                "kind": "futures_market_data",
+                "trust": "authenticated_external_data",
+            },
+        ),
+        metadata={
+            "t4_bridge_schema_version": 5,
+            "t4_environment": "live_t4",
+            "t4_read_only_attested": True,
+            "t4_order_routes_exposed": False,
+            "t4_source_id": "plus500_t4_futures_v1",
+            "t4_venue_id": "plus500_t4",
+        },
+        raw_payload=raw_payload,
+        raw_payload_sha256=hashlib.sha256(raw_payload).hexdigest(),
+        external_delivery_eligible=True,
+    )
 
 
 class CliTests(unittest.TestCase):
@@ -76,6 +162,398 @@ class CliTests(unittest.TestCase):
 
         status = parser.parse_args(["monitoring-status"])
         self.assertEqual(status.command, "monitoring-status")
+
+    def test_parser_exposes_observation_commands_without_caller_cutoff(self) -> None:
+        parser = build_parser()
+
+        start = parser.parse_args(["observe-start"])
+        self.assertEqual(start.command, "observe-start")
+        self.assertEqual(start.cycle_interval_seconds, 300)
+        status = parser.parse_args(
+            ["observe-status", "--campaign-id", _CAMPAIGN_ID]
+        )
+        self.assertEqual(status.command, "observe-status")
+        report = parser.parse_args(
+            ["observe-report", "--campaign-id", _CAMPAIGN_ID]
+        )
+        self.assertEqual(report.command, "observe-report")
+        run = parser.parse_args(
+            [
+                "observe-run",
+                "--campaign-id",
+                _CAMPAIGN_ID,
+                "--scope",
+                "BTC/USD:240m",
+            ]
+        )
+        self.assertEqual(run.command, "observe-run")
+        self.assertEqual(run.limit, 120)
+
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(
+                ["observe-start", "--started-at", "2020-01-01T00:00:00Z"]
+            )
+
+    def test_observation_start_uses_database_time_and_freezes_baseline(self) -> None:
+        repository = SimpleNamespace(
+            policy=_OBSERVATION_POLICY,
+            create_campaign=Mock(return_value="e" * 64),
+        )
+        provider = SimpleNamespace(fetch_batch=Mock(return_value=_live_preflight_batch()))
+        output = io.StringIO()
+        with (
+            patch(
+                "crypto_agent.cli._observation_repository",
+                return_value=repository,
+            ),
+            patch(
+                "crypto_agent.cli._observation_database_now",
+                return_value=_DATABASE_NOW,
+            ),
+            patch("crypto_agent.cli._t4_provider", return_value=provider),
+            redirect_stdout(output),
+        ):
+            exit_code = main(
+                [
+                    "observe-start",
+                    "--campaign-id",
+                    _CAMPAIGN_ID,
+                    "--code-commit-hash",
+                    "a" * 64,
+                    "--t4-protocol-commit-hash",
+                    "b" * 64,
+                    "--runtime-config-hash",
+                    "c" * 64,
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        campaign = repository.create_campaign.call_args.args[0]
+        self.assertEqual(campaign.started_at, _DATABASE_NOW)
+        self.assertEqual(
+            int((campaign.planned_ends_at - campaign.started_at).total_seconds()),
+            _OBSERVATION_POLICY.minimum_elapsed_seconds,
+        )
+        self.assertEqual(
+            campaign.scope_manifest,
+            ("BTC/USD:240m", "ETH/USD:240m"),
+        )
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["status"], "started")
+        self.assertEqual(payload["minimum_elapsed_hours"], 672)
+        self.assertEqual(payload["live_t4_preflight_scope_count"], 2)
+        self.assertTrue(payload["read_only"])
+        self.assertFalse(payload["execution_enabled"])
+        self.assertEqual(provider.fetch_batch.call_count, 2)
+        for call in provider.fetch_batch.call_args_list:
+            self.assertEqual(call.kwargs["as_of"], _DATABASE_NOW)
+            self.assertEqual(call.kwargs["limit"], 60)
+
+    def test_observation_start_rejects_non_live_preflight_before_campaign(self) -> None:
+        repository = SimpleNamespace(
+            policy=_OBSERVATION_POLICY,
+            create_campaign=Mock(),
+        )
+        simulator = _live_preflight_batch()
+        simulator.metadata["t4_environment"] = "t4_simulator"
+        simulator = ProviderBatch(
+            candles=simulator.candles,
+            input_candles=simulator.input_candles,
+            sources=simulator.sources,
+            metadata=simulator.metadata,
+            raw_payload=simulator.raw_payload,
+            raw_payload_sha256=simulator.raw_payload_sha256,
+            external_delivery_eligible=False,
+        )
+        provider = SimpleNamespace(fetch_batch=Mock(return_value=simulator))
+        output = io.StringIO()
+
+        with (
+            patch("crypto_agent.cli._observation_repository", return_value=repository),
+            patch(
+                "crypto_agent.cli._observation_database_now",
+                return_value=_DATABASE_NOW,
+            ),
+            patch("crypto_agent.cli._t4_provider", return_value=provider),
+            redirect_stdout(output),
+        ):
+            exit_code = main(
+                [
+                    "observe-start",
+                    "--campaign-id",
+                    _CAMPAIGN_ID,
+                    "--code-commit-hash",
+                    "a" * 64,
+                    "--t4-protocol-commit-hash",
+                    "b" * 64,
+                    "--runtime-config-hash",
+                    "c" * 64,
+                ]
+            )
+
+        self.assertEqual(exit_code, 1)
+        repository.create_campaign.assert_not_called()
+        self.assertEqual(
+            json.loads(output.getvalue())["error_code"],
+            "OBSERVATION_START_FAILED",
+        )
+
+    def test_observe_run_ingests_and_analyzes_the_exact_single_fetched_batch(self) -> None:
+        batch = _live_preflight_batch()
+        provider_fetch = Mock(return_value=batch)
+        provider = SimpleNamespace(fetch_batch=provider_fetch)
+        ingestion = SimpleNamespace(
+            batch_id=41,
+            payload_sha256=batch.raw_payload_sha256,
+        )
+        ingestion_repository = SimpleNamespace(ingest=Mock(return_value=ingestion))
+        observed: dict[str, object] = {}
+        trace_id = "11d7fe5d-f946-571a-8107-e31b872f96d7"
+        plan = ObservationCyclePlan(
+            campaign_id=_CAMPAIGN_ID,
+            scope_key="BTC/USD:240m",
+            sequence_no=1,
+            expected_at=_DATABASE_NOW,
+            started_at=_DATABASE_NOW,
+            trace_id=trace_id,
+        )
+
+        def orchestrator_factory(*, provider, policy):  # type: ignore[no-untyped-def]
+            del policy
+
+            def analyze(**kwargs):  # type: ignore[no-untyped-def]
+                observed["analysis_batch"] = provider.fetch_batch(
+                    symbol=kwargs["symbol"],
+                    interval_minutes=kwargs["interval_minutes"],
+                    as_of=kwargs["as_of"],
+                    limit=kwargs["limit"],
+                )
+                return _MinimalObservationReport(
+                    decision_id="old",
+                    trace_id=kwargs["trace_id"],
+                    as_of=kwargs["as_of"],
+                    data_snapshot_id=f"sha256:{'c' * 64}",
+                    metadata={
+                        "t4_bridge_schema_version": 5,
+                        "t4_environment": "live_t4",
+                        "plus500_t4_source_attested": True,
+                        "external_delivery_eligible": True,
+                        "provider_error_code": None,
+                        "input_fingerprint_sha256": "c" * 64,
+                    },
+                    risk=_MinimalObservationRisk(assessment_id="old"),
+                )
+
+            return SimpleNamespace(analyze=analyze)
+
+        def monitored(
+            analyze,
+            monitoring,
+            **kwargs,
+        ):  # type: ignore[no-untyped-def]
+            del monitoring
+            report = analyze(**{
+                "symbol": kwargs["symbol"],
+                "interval_minutes": kwargs["interval_minutes"],
+                "as_of": kwargs["as_of"],
+                "limit": kwargs["limit"],
+                "trace_id": kwargs["trace_id"],
+            })
+            observed["report"] = report
+            return report, SimpleNamespace(
+                trace_id=kwargs["trace_id"],
+                research_run_id=73,
+                status="completed",
+            )
+
+        def run_cycle(campaign_id, scope, execute):  # type: ignore[no-untyped-def]
+            self.assertEqual(campaign_id, _CAMPAIGN_ID)
+            self.assertEqual(scope, "BTC/USD:240m")
+            evidence = execute(plan)
+            observed["evidence"] = evidence
+            return ObservationCycleRunResult(
+                campaign_id=campaign_id,
+                scope_key=scope,
+                sequence_no=1,
+                expected_at=plan.expected_at,
+                outcome="success",
+                trace_id=trace_id,
+                content_hash="f" * 64,
+                missed_cycles_recorded=0,
+                t4_batch_id=evidence.t4_batch_id,
+                research_run_id=evidence.research_run_id,
+            )
+
+        observation_repository = SimpleNamespace(run_cycle=Mock(side_effect=run_cycle))
+        output = io.StringIO()
+        with (
+            patch("crypto_agent.cli._observation_repository", return_value=observation_repository),
+            patch("crypto_agent.cli._t4_provider", return_value=provider),
+            patch("crypto_agent.cli._t4_repository", return_value=ingestion_repository),
+            patch(
+                "crypto_agent.orchestrator.ResearchOrchestrator",
+                side_effect=orchestrator_factory,
+            ),
+            patch("crypto_agent.cli.build_monitoring_repository", return_value=object()),
+            patch("crypto_agent.cli.run_monitored_analysis", side_effect=monitored),
+            redirect_stdout(output),
+        ):
+            exit_code = main(
+                [
+                    "observe-run",
+                    "--campaign-id",
+                    _CAMPAIGN_ID,
+                    "--scope",
+                    "BTC/USD:240m",
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        provider_fetch.assert_called_once_with(
+            symbol="BTC/USD",
+            interval_minutes=240,
+            as_of=_DATABASE_NOW,
+            limit=120,
+        )
+        ingestion_repository.ingest.assert_called_once_with(
+            batch,
+            requested_as_of=_DATABASE_NOW,
+        )
+        self.assertIs(observed["analysis_batch"], batch)
+        monitored_report = observed["report"]
+        self.assertNotEqual(monitored_report.decision_id, "old")  # type: ignore[union-attr]
+        self.assertNotEqual(
+            monitored_report.risk.assessment_id,  # type: ignore[union-attr]
+            "old",
+        )
+        evidence = observed["evidence"]
+        self.assertEqual(evidence.t4_batch_id, 41)  # type: ignore[union-attr]
+        self.assertEqual(evidence.research_run_id, 73)  # type: ignore[union-attr]
+        self.assertEqual(evidence.analysis_input_hash, "c" * 64)  # type: ignore[union-attr]
+        self.assertEqual(json.loads(output.getvalue())["outcome"], "success")
+
+    def test_observation_status_reports_remaining_real_time(self) -> None:
+        report = _quality_report(elapsed_seconds=3600)
+        repository = SimpleNamespace(
+            policy=_OBSERVATION_POLICY,
+            build_quality_report=Mock(return_value=report),
+        )
+        output = io.StringIO()
+        with (
+            patch(
+                "crypto_agent.cli._observation_repository",
+                return_value=repository,
+            ),
+            patch(
+                "crypto_agent.cli._observation_database_now",
+                return_value=_DATABASE_NOW,
+            ),
+            redirect_stdout(output),
+        ):
+            exit_code = main(
+                ["observe-status", "--campaign-id", _CAMPAIGN_ID]
+            )
+
+        self.assertEqual(exit_code, 0)
+        repository.build_quality_report.assert_called_once_with(
+            _CAMPAIGN_ID,
+            observed_until=_DATABASE_NOW,
+        )
+        payload = json.loads(output.getvalue())
+        self.assertEqual(
+            payload["remaining_seconds"],
+            _OBSERVATION_POLICY.minimum_elapsed_seconds - 3600,
+        )
+        self.assertFalse(payload["final_report_eligible"])
+        self.assertEqual(payload["overall_status"], "NOT_OBSERVED")
+
+    def test_final_observation_report_is_blocked_before_28_real_days(self) -> None:
+        report = _quality_report(elapsed_seconds=3600)
+        repository = SimpleNamespace(
+            policy=_OBSERVATION_POLICY,
+            build_quality_report=Mock(return_value=report),
+            store_final_report=Mock(),
+        )
+        output = io.StringIO()
+        with (
+            patch(
+                "crypto_agent.cli._observation_repository",
+                return_value=repository,
+            ),
+            patch(
+                "crypto_agent.cli._observation_database_now",
+                return_value=_DATABASE_NOW,
+            ),
+            redirect_stdout(output),
+        ):
+            exit_code = main(
+                ["observe-report", "--campaign-id", _CAMPAIGN_ID]
+            )
+
+        self.assertEqual(exit_code, 1)
+        repository.store_final_report.assert_not_called()
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["error_code"], "OBSERVATION_WINDOW_INCOMPLETE")
+        self.assertGreater(payload["remaining_seconds"], 0)
+
+    def test_final_observation_report_stores_quality_failure_and_returns_nonzero(
+        self,
+    ) -> None:
+        report = _quality_report(
+            elapsed_seconds=_OBSERVATION_POLICY.minimum_elapsed_seconds,
+            overall_status=CriterionStatus.FAIL,
+        )
+        repository = SimpleNamespace(
+            policy=_OBSERVATION_POLICY,
+            build_quality_report=Mock(return_value=report),
+            store_final_report=Mock(return_value=report.report_hash_sha256),
+        )
+        output = io.StringIO()
+        with (
+            patch(
+                "crypto_agent.cli._observation_repository",
+                return_value=repository,
+            ),
+            patch(
+                "crypto_agent.cli._observation_database_now",
+                return_value=_DATABASE_NOW,
+            ),
+            redirect_stdout(output),
+        ):
+            exit_code = main(
+                ["observe-report", "--campaign-id", _CAMPAIGN_ID]
+            )
+
+        self.assertEqual(exit_code, 3)
+        repository.store_final_report.assert_called_once_with(report)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["status"], "stored")
+        self.assertEqual(payload["overall_status"], "FAIL")
+        self.assertFalse(payload["v1_gate_passed"])
+
+    def test_observation_runtime_failures_are_secret_safe_stable_json(self) -> None:
+        for command in (
+            ["observe-start"],
+            ["observe-status", "--campaign-id", _CAMPAIGN_ID],
+            ["observe-report", "--campaign-id", _CAMPAIGN_ID],
+        ):
+            with self.subTest(command=command[0]):
+                output = io.StringIO()
+                with (
+                    patch(
+                        "crypto_agent.cli._observation_repository",
+                        side_effect=RuntimeError("opaque-secret-marker"),
+                    ),
+                    redirect_stdout(output),
+                ):
+                    exit_code = main(command)
+
+                self.assertNotEqual(exit_code, 0)
+                payload = json.loads(output.getvalue())
+                self.assertEqual(payload["status"], "error")
+                self.assertTrue(payload["error_code"].startswith("OBSERVATION_"))
+                self.assertNotIn("opaque", output.getvalue())
+                self.assertNotIn("secret", output.getvalue())
 
     def test_invalid_monitor_poll_interval_fails_before_runtime_access(self) -> None:
         for value in ("nan", "inf", "0", "86401"):

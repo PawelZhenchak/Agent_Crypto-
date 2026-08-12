@@ -2,94 +2,98 @@
 
 ```mermaid
 flowchart TD
-    A["Plus500 Futures T4 API"] --> B["Odizolowany worker .NET"]
-    B --> C["Loopback bridge live schema v4 / environment=live_t4"]
-    C --> D["Walidacja futures evidence"]
-    D --> E["Analityka i risk gate"]
-    E --> F["ALERT lub NO_SIGNAL"]
-    D --> G["Append-only ingest PostgreSQL 16"]
-    G --> H["Replay i analyze-replay"]
-    F --> I["Trace, artifact i incident log"]
-    I --> J["Alert + event + transactional outbox"]
-    J --> K["stdout_json / process_stdout"]
-    I --> L["Lokalny dashboard i read-only API"]
+    W["T4 WebSocket / Protobuf"] --> B["Odizolowany worker .NET 8"]
+    R["T4 Chart REST"] --> B
+    B --> C["Loopback bridge schema v5"]
+    C --> D["Walidacja point-in-time i futures evidence"]
+    D --> E["Append-only ingest PostgreSQL 16"]
+    E --> F["Analityka i risk gate"]
+    F --> G["ALERT albo NO_SIGNAL"]
+    G --> H["Trace, incident, alert i trwały outbox"]
+    H --> I["stdout JSON — at-least-once"]
+    E --> J["Replay / analyze-replay"]
+    E --> K["Kampania 28 dni i raport V1"]
 ```
 
-Worker .NET jest przygotowaną granicą dla połączenia SSL do T4 i prywatnych danych
-sesji. Oficjalny klient nie jest jeszcze podłączony: bieżący
-`T4ApplicationRegistrationPendingReader` zwraca `503`. Agent Python widzi jedynie
-znormalizowane dane rynkowe i metadane atestacji. Endpointy zleceń nie mogą być
-wystawione przez most.
+## Granica T4
 
-Most jest dostępny tylko przez loopback i wymaga osobnego tokenu. Adapter odrzuca
-zdalny host, credentials w URL, redirect, błędny source ID, brak rzeczywistego
-contract ID, wygasły kontrakt, niepełną historię i nie-UTC timestamps.
+Worker .NET 8 korzysta z oficjalnych `Plus500US.T4Proto` `1.0.73` i
+`Plus500US.T4ChartDecoder` `1.0.97` oraz publicznego protokołu przypiętego do
+commita
+`1a68b674482194f1cf3b9d7f129ce5fbed8bcb51`. WebSocket dostarcza logowanie,
+heartbeat i Market By Price depth; binarna odpowiedź Chart REST jest dekodowana
+oficjalnym decoderem do zamkniętych świec.
 
-Katalog kontraktów jest wczytywany lokalnie przez worker. Resolver sortuje serie
-według wygaśnięcia, używa front-month wyłącznie przed jego `roll_at` i od tej
-granicy wymaga następnej bezpiecznej serii. Historyczny payload schema v3
-przenosi `contract_roll_at`, typ wyboru, `rolled_from_contract_id` oraz
-`futures_evidence`. Bieżący kontrakt live schema v4 zachowuje te dowody i dodaje
-wymaganą atestację `environment=live_t4`. Evidence wiąże batch z pełnym snapshotem
-order booka, statusem sesji, typed basis reference i opcjonalnym dowodem przejścia
-kontraktu.
+Reader ma ograniczoną listę wiadomości wychodzących: login, heartbeat i
+subskrypcja depth. Nie ma order routes. Po rozłączeniu czyści cache, łączy się
+ponownie i odtwarza subskrypcje. Health staje się `READY` dopiero po uwierzytelnieniu,
+potwierdzeniu uprawnień i prewarmie danych futures, indeksu oraz historii.
 
-Oficjalna dokumentacja wymaga rejestracji aplikacji przed logowaniem do T4 API.
-Dlatego host pozostaje `NOT_READY` i zwraca `503`, dopóki oficjalny klient nie
-zostanie podłączony. Ten stan prowadzi w agencie do `NO_SIGNAL` i lokalnego,
-deduplikowanego incydentu. Fixture’y testowe nie są źródłem live i nie omijają tej
-granicy.
+`T4_API_ENVIRONMENT` wybiera jeden z wbudowanych endpointów `simulator`, `live`
+albo bezpieczny stan `pending`. Odpowiednio atestowany envelope ma
+`t4_simulator`, `live_t4` lub nie jest dostępny. Simulator nie jest live i nie
+może tworzyć zewnętrznej dostawy alertu.
 
-PostgreSQL rozdziela historię migracji od aktywnej polityki. `t4_runtime_config`
-jest append-only i jednoznacznie wymusza wyłączone order routes.
+Implementacja nie zastępuje testu na przydzielonym koncie. Klucz API,
+uprawnienia, rzeczywiste identyfikatory rynków oraz niezależny indeks basis są
+zależnościami zewnętrznymi. Brak któregokolwiek elementu prowadzi do `503` i
+`NO_SIGNAL`, a nie do danych zastępczych.
 
-Warstwa 0.5.0 zapisuje dokładne bajty odpowiedzi bridge’a wraz z SHA-256 oraz
-znormalizowane świece w jednej transakcji. Konflikt identycznego hasha zwraca
-istniejący batch, nie tworząc kolejnych świec. Replay otwiera transakcję tylko do
-odczytu i uwzględnia wyłącznie rekordy znane w zadanym `as_of`; brak pełnego okna
-kończy się `T4_REPLAY_INCOMPLETE`, a nie częściowym wynikiem.
+## Schema v5 i tożsamość rynku
 
-Warstwa 0.6.0 waliduje schema v3 i oblicza deterministycznie spread, depth,
-imbalance, basis, annualized basis, metryki wolumenu, ryzyko expiry i wpływ rollu.
-Basis może korzystać wyłącznie z referencji typu `index` o source ID
-`plus500_t4_index_v1`; zwykła cena futures nie może jej zastąpić. Brak, stary lub
-niespójny dowód kończy się `NO_SIGNAL`.
+Schema bridge `v5` rozdziela `ExchangeID`, produktowy `ContractID` i
+nieprzezroczysty `MarketID` handlowalnej serii. Katalog kontraktów przechowuje
+bieżące oraz następne serie i niezależną tożsamość rynku indeksowego. `MarketID`
+nie jest parsowany ani konstruowany, a każda świeca zachowuje własną wartość
+zwróconą przez Chart REST. Dzięki temu historia obejmująca roll nie przypisuje
+starej świecy do bieżącej serii.
 
-Migracja `0015` zapisuje snapshot, poziomy order booka i dowód przejścia kontraktu
-jako append-only, wraz z hashami kanonicznej treści. Point-in-time replay odtwarza
-ten sam evidence i obejmuje go fingerprintem wejścia; `analyze-replay` przepuszcza
-go przez ten sam silnik co analiza bieżąca. Historyczne batche schema v2 i v3 są
-nadal odczytywalne. V2 bez futures evidence nie może przejść bramki analitycznej;
-v3 może odtworzyć analizę, lecz replay nigdy nie uzyskuje kwalifikacji do external
-delivery.
+Resolver wybiera serię wyłącznie przed jej `roll_at`, a potem wymaga następnej.
+W ograniczonym oknie rollu evidence wiąże zsynchronizowane snapshoty starego i
+nowego `MarketID`. Basis wymaga osobnego rynku typu `index` ze źródła
+`plus500_t4_index_v1`; cena lub tożsamość futures nie może zastępować indeksu.
 
-Warstwa 0.7.0 nadaje kanoniczny `trace_id` przed analizą, zapisuje bezpieczny
-artifact raportu, przebieg runu i incydenty w istniejącym modelu badawczym.
-Provider error, timeout albo odrzucony raport są rejestrowane bez surowego wyjątku,
-URL, nagłówków, credentials lub pełnego payloadu dostawcy.
+Walidacja point-in-time obejmuje `observed_at`, `available_at`, `ingested_at`,
+cutoff zapytania, pełny nieprzecięty order book, status sesji i zgodność wszystkich
+tożsamości. Niepełny cache, spóźnione dane, brak indeksu lub niespójny roll kończą
+się fail-closed.
 
-Tylko niewygasła decyzja `ALERT` z operacji live T4, bridge schema v4,
-`environment=live_t4`, zatwierdzoną proweniencją, kompletnym futures evidence i
-przejściem risk gate może utworzyć delivery outbox.
-`NO_SIGNAL`, veto, dane stare, synthetic, fixture i replay nigdy nie są kierowane
-do dostarczenia. Migracja `0016` dodaje immutable outbox i append-only próby
-dostarczenia z idempotency key, hashami payloadu, łańcuchem hashy prób, limitem
-prób, backoffem oraz terminalnym stanem po dostarczeniu, błędzie lub expiry.
+## Ingest, replay i monitoring
 
-Granica atomowości monitoringu obejmuje w PostgreSQL: research run/artifact,
-alert, alert event oraz outbox utworzone w jednej transakcji. SQLite pozostaje
-osobnym historycznym magazynem raportów; system nie deklaruje transakcji
-rozproszonej pomiędzy SQLite i PostgreSQL.
+Migracje `0014`–`0017` tworzą append-only ścieżkę danych. Batch zachowuje dokładny
+payload i SHA-256, świece zachowują `MarketID`, a snapshot, poziomy order booka i
+transition evidence mają osobne hashe. Replay korzysta tylko z rekordów
+`available_at <= as_of`; brak pełnego okna oznacza `T4_REPLAY_INCOMPLETE`.
+Historyczne schema v2-v4 pozostają odczytywalne zgodnie z ich ograniczeniami, ale
+replay nigdy nie kwalifikuje się do external delivery.
 
-Delivery jest celowo lokalne: jedyna trasa to `stdout_json` → `process_stdout`.
-Nie istnieje dowolny webhook ani integracja Slack, Telegram, e-mail lub SMS.
-Trwały outbox daje semantykę at-least-once; odbiorca stdout deduplikuje po
-`idempotency_key`, ponieważ granica procesu nie zapewnia exactly-once.
-Dashboard jest statycznym HTML bez JavaScriptu, formularzy, linków i zasobów
-zdalnych. API działa wyłącznie na loopback, bez CORS i bez endpointów dokumentacji,
-oraz dodaje restrykcyjne nagłówki bezpieczeństwa. Analiza, która zapisuje trace,
-jest wyłącznie operacją `POST /v1/analyze` i wymaga nagłówka
-`X-Crypto-Agent-Request: analyze-v1`; nie ma wariantu GET z efektem ubocznym.
+Tylko niewygasła decyzja `ALERT` z schema v5, `environment=live_t4`, kompletnym
+evidence i przejściem risk gate może utworzyć rekord outboxa. `NO_SIGNAL`, veto,
+stale, synthetic, fixture, replay, Simulator i provider error są wykluczone.
 
-`v1_gate_passed=false`; następną warstwą jest odbiór z punktu 8, w tym test live T4
-i minimum cztery tygodnie obserwacji read-only.
+Research run/artifact, alert, event i outbox powstają w jednej transakcji
+PostgreSQL. Wyjście `stdout_json` → `process_stdout` ma semantykę at-least-once;
+odbiorca deduplikuje po `idempotency_key`. System nie obiecuje exactly-once na
+granicy procesu.
+
+## Odbiór V1
+
+Migracja `0017` dodaje niezmienny baseline kampanii, append-only cykle i zdarzenia
+sesji, ochronę przed deklarowaniem cykli z wyprzedzeniem/backfillem oraz niezmienny
+raport końcowy. Czas startu, statusu i końca pochodzi z PostgreSQL.
+
+Polityka wymaga minimum `672` godzin czasu rzeczywistego, pokrycia zamrożonych
+scope’ów, progów prób i sukcesu, limitów luk i RTT, braku naruszeń read-only oraz
+zaliczenia obowiązkowych scenariuszy. Raport można finalizować dopiero po
+`planned_ends_at + cycle_interval_seconds`. Status każdego kryterium to `PASS`,
+`FAIL` albo `NOT_OBSERVED`, ale schema `0.8.0` celowo blokuje scenariusz `PASS` i
+`v1_gate_passed=true` do późniejszej migracji z obiektywnymi referencjami dowodów.
+
+Zakres kampanii `0.8.0` jest obecnie zamrożony na BTC/ETH 4h. Standardowy
+dwutygodniowy Simulator nie pokrywa 28 dni. `observe-start` wykonuje live preflight
+każdego scope’u. `observe-run` pobiera dokładnie jeden live batch należnego slotu,
+utrwala go i analizuje ten sam zamknięty obiekt; wygasłe sloty zapisuje wyłącznie
+jako `missed`, bez backfillu.
+
+Provisioning, rzeczywiste testy Simulator/live i kampania nie zostały wykonane;
+`v1_gate_passed=false`.

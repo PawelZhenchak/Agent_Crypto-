@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import re
 import threading
 import time
 from contextlib import suppress
@@ -66,8 +65,8 @@ class Plus500T4Provider:
     _allowed_intervals = frozenset({240, 1440, 10080})
     _allowed_symbols = frozenset({"BTC/USD", "ETH/USD"})
     _max_response_bytes = 4_000_000
-    _bridge_schema_version = 4
-    _contract_id_pattern = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{2,127}$")
+    _bridge_schema_version = 5
+    _allowed_environments = frozenset({"t4_simulator", "live_t4"})
 
     def __init__(
         self,
@@ -185,9 +184,18 @@ class Plus500T4Provider:
                 raise ValueError("payload is not an object")
             contract_expires_at = _utc(payload["contract_expires_at"])
             contract_roll_at = _utc(payload["contract_roll_at"])
-            contract_id = payload.get("contract_id")
+            environment = payload.get("environment")
+            exchange_id = _opaque_t4_id(
+                payload.get("exchange_id"), field="exchange_id", max_length=64
+            )
+            contract_id = _opaque_t4_id(
+                payload.get("contract_id"), field="contract_id", max_length=128
+            )
+            market_id = _opaque_t4_id(
+                payload.get("market_id"), field="market_id", max_length=256
+            )
             contract_selection = payload.get("contract_selection")
-            rolled_from_contract_id = payload.get("rolled_from_contract_id")
+            rolled_from_market_id = payload.get("rolled_from_market_id")
             if (
                 type(payload.get("schema_version")) is not int
                 or payload.get("schema_version") != self._bridge_schema_version
@@ -195,41 +203,77 @@ class Plus500T4Provider:
                 or payload.get("venue_id") != self.venue_id
                 or payload.get("read_only") is not True
                 or payload.get("order_routes_exposed") is not False
-                or payload.get("environment") != "live_t4"
+                or environment not in self._allowed_environments
                 or payload.get("logical_symbol") != symbol
                 or type(payload.get("interval_minutes")) is not int
                 or payload.get("interval_minutes") != interval_minutes
-                or not isinstance(contract_id, str)
-                or self._contract_id_pattern.fullmatch(contract_id) is None
                 or contract_selection not in {"front_month", "rolled"}
                 or (
                     contract_selection == "front_month"
-                    and rolled_from_contract_id is not None
+                    and rolled_from_market_id is not None
                 )
                 or (
                     contract_selection == "rolled"
                     and (
-                        not isinstance(rolled_from_contract_id, str)
-                        or self._contract_id_pattern.fullmatch(rolled_from_contract_id)
-                        is None
-                        or rolled_from_contract_id == contract_id
+                        _opaque_t4_id(
+                            rolled_from_market_id,
+                            field="rolled_from_market_id",
+                            max_length=256,
+                        )
+                        == market_id
                     )
                 )
                 or not as_of < contract_roll_at < contract_expires_at
             ):
                 raise ValueError("bridge attestation mismatch")
+            raw_candles = payload["candles"]
+            if not isinstance(raw_candles, list) or not raw_candles:
+                raise ValueError("candles are missing")
+            candle_market_ids = tuple(
+                _opaque_t4_id(
+                    item.get("market_id") if isinstance(item, dict) else None,
+                    field="candle.market_id",
+                    max_length=256,
+                )
+                for item in raw_candles
+            )
+            if candle_market_ids[-1] != market_id:
+                raise ValueError("latest candle market does not match active market")
             candles = tuple(
                 self._parse_candle(item, symbol, interval_minutes)
-                for item in payload["candles"]
+                for item in raw_candles
             )
             reference = self._parse_reference(payload["reference_price"], symbol)
             futures_evidence = self._parse_futures_evidence(
                 payload["futures_evidence"],
                 symbol=symbol,
+                exchange_id=exchange_id,
                 contract_id=contract_id,
+                market_id=market_id,
                 contract_selection=contract_selection,
-                rolled_from_contract_id=rolled_from_contract_id,
+                rolled_from_market_id=rolled_from_market_id,
                 as_of=as_of,
+            )
+            raw_futures = payload.get("futures_evidence")
+            if not isinstance(raw_futures, dict):
+                raise ValueError("futures evidence is missing")
+            basis_item = raw_futures.get("basis_reference")
+            if not isinstance(basis_item, dict):
+                raise ValueError("basis reference is missing")
+            basis_exchange_id = _opaque_t4_id(
+                basis_item.get("exchange_id"),
+                field="basis_reference.exchange_id",
+                max_length=64,
+            )
+            basis_contract_id = _opaque_t4_id(
+                basis_item.get("contract_id"),
+                field="basis_reference.contract_id",
+                max_length=128,
+            )
+            basis_market_id = _opaque_t4_id(
+                basis_item.get("market_id"),
+                field="basis_reference.market_id",
+                max_length=256,
             )
         except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ProviderError("T4 payload is invalid", code="T4_PAYLOAD_INVALID") from exc
@@ -253,13 +297,19 @@ class Plus500T4Provider:
                 "t4_venue_id": payload.get("venue_id"),
                 "t4_order_routes_exposed": payload.get("order_routes_exposed"),
                 "t4_environment": payload.get("environment"),
+                "t4_exchange_id": exchange_id,
                 "t4_volume_zscore": payload.get("volume_zscore"),
                 "t4_bridge_schema_version": payload.get("schema_version"),
-                "t4_contract_id": payload.get("contract_id"),
+                "t4_contract_id": contract_id,
+                "t4_market_id": market_id,
+                "t4_basis_exchange_id": basis_exchange_id,
+                "t4_basis_contract_id": basis_contract_id,
+                "t4_basis_market_id": basis_market_id,
+                "t4_candle_market_ids": list(candle_market_ids[-limit:]),
                 "t4_contract_expires_at": contract_expires_at.isoformat(),
                 "t4_contract_roll_at": contract_roll_at.isoformat(),
                 "t4_contract_selection": contract_selection,
-                "t4_rolled_from_contract_id": rolled_from_contract_id,
+                "t4_rolled_from_market_id": rolled_from_market_id,
                 "t4_futures_evidence_attested": True,
             },
             reference_price=ReferencePriceSnapshot(
@@ -268,7 +318,7 @@ class Plus500T4Provider:
             raw_payload=payload_bytes,
             raw_payload_sha256=hashlib.sha256(payload_bytes).hexdigest(),
             futures_evidence=futures_evidence,
-            external_delivery_eligible=True,
+            external_delivery_eligible=environment == "live_t4",
         )
 
     def _read_response_with_timeout(self, response: object) -> bytes:
@@ -348,15 +398,19 @@ class Plus500T4Provider:
         item: object,
         *,
         symbol: str,
+        exchange_id: str,
         contract_id: str,
+        market_id: str,
         contract_selection: str,
-        rolled_from_contract_id: object,
+        rolled_from_market_id: object,
         as_of: datetime,
     ) -> FuturesEvidence:
         if not isinstance(item, dict):
             raise ValueError("futures evidence is not an object")
         if (
-            item.get("contract_id") != contract_id
+            item.get("exchange_id") != exchange_id
+            or item.get("contract_id") != contract_id
+            or item.get("market_id") != market_id
             or item.get("source_id") != self.source_id
             or item.get("is_full_snapshot") is not True
         ):
@@ -381,10 +435,30 @@ class Plus500T4Provider:
         if not isinstance(basis_item, dict):
             raise ValueError("basis reference is missing")
         basis_source = basis_item.get("source")
+        basis_exchange_id = _opaque_t4_id(
+            basis_item.get("exchange_id"),
+            field="basis_reference.exchange_id",
+            max_length=64,
+        )
+        basis_contract_id = _opaque_t4_id(
+            basis_item.get("contract_id"),
+            field="basis_reference.contract_id",
+            max_length=128,
+        )
+        basis_market_id = _opaque_t4_id(
+            basis_item.get("market_id"),
+            field="basis_reference.market_id",
+            max_length=256,
+        )
         if (
             basis_item.get("symbol") != symbol
             or basis_item.get("reference_type") != APPROVED_BASIS_REFERENCE_TYPE
             or basis_source != APPROVED_BASIS_SOURCE_ID
+            or (
+                basis_exchange_id == exchange_id
+                and basis_contract_id == contract_id
+                and basis_market_id == market_id
+            )
         ):
             raise ValueError("basis reference scope is invalid")
         basis_observed_at = _utc(basis_item["observed_at"])
@@ -415,8 +489,8 @@ class Plus500T4Provider:
             transition_available_at = _utc(transition_item["available_at"])
             transition_ingested_at = _utc(transition_item["ingested_at"])
             if not (
-                transition_item.get("from_contract_id") == rolled_from_contract_id
-                and transition_item.get("to_contract_id") == contract_id
+                transition_item.get("from_market_id") == rolled_from_market_id
+                and transition_item.get("to_market_id") == market_id
                 and transition_item.get("price_type") == "mid"
                 and transition_item.get("source") == self.source_id
                 and math.isclose(
@@ -432,8 +506,10 @@ class Plus500T4Provider:
             ):
                 raise ValueError("roll transition evidence is invalid")
             transition = ContractTransitionEvidence(
-                from_contract_id=str(transition_item["from_contract_id"]),
-                to_contract_id=contract_id,
+                # The domain class retains its legacy names for compatibility,
+                # but schema v5 values are explicitly opaque T4 MarketIDs.
+                from_contract_id=str(transition_item["from_market_id"]),
+                to_contract_id=market_id,
                 price_type="mid",
                 from_price=_positive_number(transition_item["from_price"]),
                 to_price=_positive_number(transition_item["to_price"]),
@@ -444,7 +520,9 @@ class Plus500T4Provider:
             )
 
         return FuturesEvidence(
-            contract_id=contract_id,
+            # Microstructure evidence belongs to one tradable MarketID, not to
+            # the product-level ContractID.
+            contract_id=market_id,
             source=self.source_id,
             session_status=session_status,
             is_full_snapshot=True,
@@ -456,6 +534,19 @@ class Plus500T4Provider:
             basis_reference=basis,
             contract_transition=transition,
         )
+
+
+def _opaque_t4_id(value: object, *, field: str, max_length: int) -> str:
+    """Validate an official opaque identifier without parsing its structure."""
+
+    if (
+        not isinstance(value, str)
+        or not 1 <= len(value) <= max_length
+        or value != value.strip()
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise ValueError(f"{field} is invalid")
+    return value
 
 
 def _utc(value: object) -> datetime:

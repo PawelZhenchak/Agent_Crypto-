@@ -1,0 +1,20 @@
+{
+  "policy_id": "t4-observation-v1-2026-08-12",
+  "schema_version": 1,
+  "required_bridge_schema_version": 5,
+  "minimum_elapsed_hours": 672,
+  "minimum_cycle_attempt_rate": 0.99,
+  "minimum_cycle_success_rate": 0.99,
+  "maximum_unexplained_gap_multiplier": 3.0,
+  "maximum_bridge_rtt_p95_seconds": 5.0,
+  "maximum_bridge_rtt_p99_seconds": 10.0,
+  "mandatory_scenarios": [
+    "bridge_restart",
+    "missing_data",
+    "rate_limit",
+    "reconnect",
+    "replay_blocked",
+    "roll_transition",
+    "stale_data"
+  ]
+}

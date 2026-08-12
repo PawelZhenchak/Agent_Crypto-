@@ -7,14 +7,17 @@ Aktywny rejestr zawiera:
 - binding `BTC/USD` → `BTC-FUTURES-FRONT`;
 - binding `ETH/USD` → `ETH-FUTURES-FRONT`;
 - runtime protocol: `loopback_http_json_v1`;
-- operacyjny envelope live schema: `4` z `contract_roll_at`,
-  `contract_selection`, `rolled_from_contract_id`, `futures_evidence` i
-  `environment=live_t4`;
+- operacyjny envelope schema: `5` z `exchange_id`, produktowym `contract_id`,
+  nieprzezroczystym `market_id`, `rolled_from_market_id`, per-candle `market_id`,
+  niezależną tożsamością indeksu, `futures_evidence` i jawnym środowiskiem
+  `t4_simulator` albo `live_t4`;
 - `read_only=true` i `order_routes_enabled=false`.
 
-Nazwy `*-FUTURES-FRONT` są logicznymi aliasami. Worker musi utrwalać rzeczywisty
-identyfikator kontraktu T4 i regułę roll w każdym batchu. Bez tej proweniencji batch
-nie może zostać uznany za operacyjny.
+Nazwy `*-FUTURES-FRONT` są logicznymi aliasami. `ContractID` identyfikuje produkt,
+a `MarketID` konkretną handlowalną serię/expiry. Worker zachowuje wartość
+`MarketID` dokładnie tak, jak zwróciło ją T4, także osobno dla każdej świecy. Nie
+wolno jej parsować ani konstruować. Bez tej proweniencji batch nie może zostać
+uznany za operacyjny.
 
 Stare tabele canonical/reference z migracji `0011/0012` pozostają tylko dla
 reprodukowalności poprzedniego prototypu. Nowy ingest T4 ma osobny kontrakt w
@@ -48,8 +51,9 @@ wejścia analizy. Komenda `analyze-replay` używa tego samego risk gate co anali
 bieżąca, ale wynik replayu nigdy nie kwalifikuje się do external delivery. Schema
 v2 pozostaje obsługiwana tylko dla historycznego odczytu: nie ma wierszy evidence
 z migracji `0015`, więc metryki mają status `UNAVAILABLE`, a decyzja musi być
-`NO_SIGNAL`. Tylko bieżący payload schema v4 z `environment=live_t4` może wejść do
-kwalifikacji live alertu.
+`NO_SIGNAL`. W wersji 0.8.0 tylko bieżący payload schema v5 z pełną tożsamością,
+niezależnym indeksem i `environment=live_t4` może wejść do kwalifikacji live
+alertu. `t4_simulator` jest zawsze wykluczony.
 
 Raport futures rozróżnia `AVAILABLE`, `UNAVAILABLE`, `INVALID` oraz
 `NOT_APPLICABLE`; brakująca wartość nigdy nie jest kodowana jako zero. Model
@@ -91,3 +95,37 @@ rekordów przez worker delivery.
 Outbox jest trwały, ale granica zapisu do stdout ma semantykę at-least-once.
 Konsument musi deduplikować po `idempotency_key`; model nie obiecuje exactly-once
 między bazą a procesem odbiorcy.
+
+## T4 schema v5 i kampania odbiorowa 0.8.0
+
+Migracja `0017` rozszerza batch, świece i futures evidence o pełną tożsamość T4:
+
+- batch przechowuje środowisko, `exchange_id`, produktowy `contract_id`, aktywny
+  i poprzedni `market_id` oraz tożsamość niezależnego rynku basis;
+- każda świeca przechowuje `market_id` zwrócony przez Chart REST;
+- snapshot wiąże futures oraz indeks z dokładnym batchem i ich tożsamościami;
+- transition evidence wiąże `from_market_id` i `to_market_id`, nie domyślone nazwy
+  kontraktów;
+- append-only triggery nadal blokują `UPDATE`, `DELETE` i `TRUNCATE`.
+
+Ta sama migracja dodaje cztery zbiory odbiorowe:
+
+- `t4_observation_campaigns` — niezmienny baseline: czas startu/końca, scope,
+  interwał cyklu oraz hashe polityki, kodu, protokołu i konfiguracji;
+- `t4_observation_cycles` — append-only wynik każdego planowego cyklu z hash
+  chain oraz powiązaniem udanego odczytu z batchem i runem analizy;
+- `t4_observation_session_events` — append-only zdarzenia i kontrolowane
+  scenariusze z osobnym hash chain;
+- `t4_observation_quality_reports` — niezmienny raport końcowy i decyzja bramki.
+
+Triggery wykorzystują czas bazy i blokują deklarowanie cykli z wyprzedzeniem oraz
+backfill. Raport rozróżnia `PASS`, `FAIL` i `NOT_OBSERVED`, a jego finalizacja
+jest dozwolona dopiero po `planned_ends_at + cycle_interval_seconds`. Schema
+`0.8.0` celowo akceptuje dla scenariusza wyłącznie `fail` i odrzuca
+`v1_gate_passed=true`, ponieważ nie ma jeszcze obiektywnych referencji dowodów
+scenariuszy. Późniejsza migracja musi dodać te referencje i ich walidację, zanim
+wynik dodatni stanie się osiągalny.
+
+Provisioning i rzeczywiste testy Simulator/live nie zostały wykonane, kampania nie
+została rozpoczęta; zakres odbioru 0.8.0 to BTC/ETH 4h, a
+`v1_gate_passed=false`.

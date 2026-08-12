@@ -5,13 +5,15 @@
 - tylko jedna zatwierdzona proweniencja: Plus500 Futures T4;
 - dane logowania są zabronione w procesie analitycznym;
 - most działa tylko na loopback, wymaga tokenu i nie wystawia order routes;
-- logiczny symbol musi wskazywać skonfigurowany, rzeczywisty i niewygasły kontrakt;
+- logiczny symbol musi wskazywać skonfigurowane `ExchangeID`, produktowy
+  `ContractID` oraz rzeczywisty i niewygasły, nieprzezroczysty `MarketID`;
 - wymagane są 120 świec, prawidłowe UTC i cena nie starsza niż 300 sekund;
-- kwalifikacja bieżącej analizy live i delivery wymaga schema v4,
-  `environment=live_t4`, pełnego snapshotu order booka i statusu sesji `OPEN`;
+- kwalifikacja bieżącej analizy live i delivery wymaga schema v5,
+  `environment=live_t4`, pełnego snapshotu order booka, per-candle `MarketID` i
+  statusu sesji `OPEN`; `t4_simulator` jest zawsze wykluczony;
 - basis może używać wyłącznie referencji typu `index` o source ID dokładnie
   `plus500_t4_index_v1`; ceny futures ani anonimowej ceny referencyjnej nie wolno
-  użyć jako basis;
+  użyć jako basis, a tożsamość rynku indeksu musi być niezależna od futures;
 - spread, depth, imbalance, basis, annualized basis, wolumen, expiry i roll muszą
   wynikać z atestowanych dowodów, a nie z wartości zastępczych;
 - brak danych, zła struktura, zły source ID, stary kontrakt, niepełny/stary order
@@ -25,7 +27,7 @@
 - `NO_SIGNAL`, synthetic, fixture, replay, veto, stale, provider error i expiry
   nigdy nie są dostarczane;
 - jedyną trasą jest lokalne `stdout_json` → `process_stdout`; dowolny webhook,
-  Slack, Telegram, e-mail i SMS są niedozwolone w 0.7.0;
+  Slack, Telegram, e-mail i SMS są niedozwolone w 0.8.0;
 - outbox i próby są append-only, hashowane, idempotentne i mają ograniczony retry;
   stdout działa at-least-once, więc konsument deduplikuje po `idempotency_key`;
   exactly-once nie jest gwarantowane;
@@ -43,7 +45,15 @@ decyzji T4-only i musi być uwzględniony w odbiorze jakościowym V1.
 Atomowość alertowania obejmuje jedną transakcję PostgreSQL dla run/artifact,
 alertu, alert eventu i outboxa. Nie obejmuje osobnego magazynu SQLite.
 
-Oficjalny klient T4 nie jest jeszcze podłączony. Reader pending zwraca `503`, a
-fixture’y służą wyłącznie testom offline i nie mogą być przedstawiane jako dane
-live. `v1_gate_passed=false`; ukończenie punktu 7 offline nie otwiera wykonywania
-zleceń ani nie zamyka odbioru V1.
+Oficjalny read-only reader jest zaimplementowany na `Plus500US.T4Proto` 1.0.73 i
+`Plus500US.T4ChartDecoder` 1.0.97, ale nie został jeszcze potwierdzony na
+provisionowanej sesji. Stan `pending`, brak
+klucza/uprawnień/identyfikatorów albo niepełny prewarm zwraca `503`. Fixture’y i
+Simulator nie mogą być przedstawiane jako dane live.
+
+Provisioning, rzeczywiste testy Simulator/live i kampania 28-dniowa nie zostały
+wykonane. Baseline i cykle są append-only, czas pochodzi z PostgreSQL, backfill
+jest zabroniony, a końcowy raport przed
+`planned_ends_at + cycle_interval_seconds` jest odrzucany. Schema `0.8.0` blokuje
+scenariusz `PASS` i `v1_gate_passed=true` do późniejszej migracji z obiektywnymi
+referencjami dowodów oraz ich walidacją.

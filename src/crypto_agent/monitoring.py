@@ -1663,7 +1663,7 @@ def _eligible_for_delivery(
         and report.as_of <= now < report.expires_at
         and metadata.get("plus500_t4_source_attested") is True
         and metadata.get("external_delivery_eligible") is True
-        and metadata.get("t4_bridge_schema_version") == 4
+        and metadata.get("t4_bridge_schema_version") == 5
         and metadata.get("t4_environment") == "live_t4"
         and metadata.get("futures_gate_passed") is True
         and metadata.get("provider_error_code") is None

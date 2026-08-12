@@ -4,10 +4,15 @@ namespace CryptoAgent.T4Bridge;
 
 public sealed record MarketDataRequest(
     string LogicalSymbol,
+    string ExchangeId,
     string ContractId,
+    string MarketId,
     DateTimeOffset ContractExpiresAt,
     DateTimeOffset ContractRollAt,
-    string? RolledFromContractId,
+    string? RolledFromMarketId,
+    string BasisExchangeId,
+    string BasisContractId,
+    string BasisMarketId,
     int IntervalMinutes,
     DateTimeOffset AsOf,
     int Limit);
@@ -21,11 +26,13 @@ public sealed record MarketDataEnvelope(
     [property: JsonPropertyName("environment")] string Environment,
     [property: JsonPropertyName("logical_symbol")] string LogicalSymbol,
     [property: JsonPropertyName("interval_minutes")] int IntervalMinutes,
+    [property: JsonPropertyName("exchange_id")] string ExchangeId,
     [property: JsonPropertyName("contract_id")] string ContractId,
+    [property: JsonPropertyName("market_id")] string MarketId,
     [property: JsonPropertyName("contract_expires_at")] DateTimeOffset ContractExpiresAt,
     [property: JsonPropertyName("contract_roll_at")] DateTimeOffset ContractRollAt,
     [property: JsonPropertyName("contract_selection")] string ContractSelection,
-    [property: JsonPropertyName("rolled_from_contract_id")] string? RolledFromContractId,
+    [property: JsonPropertyName("rolled_from_market_id")] string? RolledFromMarketId,
     [property: JsonPropertyName("volume_zscore")] double? VolumeZScore,
     [property: JsonPropertyName("candles")] IReadOnlyList<CandleEnvelope> Candles,
     [property: JsonPropertyName("reference_price")] ReferencePriceEnvelope ReferencePrice,
@@ -41,6 +48,7 @@ public sealed record CandleEnvelope(
     [property: JsonPropertyName("low")] double Low,
     [property: JsonPropertyName("close")] double Close,
     [property: JsonPropertyName("volume")] double Volume,
+    [property: JsonPropertyName("market_id")] string MarketId,
     [property: JsonPropertyName("source")] string Source,
     [property: JsonPropertyName("available_at")] DateTimeOffset AvailableAt,
     [property: JsonPropertyName("ingested_at")] DateTimeOffset IngestedAt);
@@ -48,13 +56,18 @@ public sealed record CandleEnvelope(
 public sealed record ReferencePriceEnvelope(
     [property: JsonPropertyName("symbol")] string Symbol,
     [property: JsonPropertyName("source")] string Source,
+    [property: JsonPropertyName("exchange_id")] string ExchangeId,
+    [property: JsonPropertyName("contract_id")] string ContractId,
+    [property: JsonPropertyName("market_id")] string MarketId,
     [property: JsonPropertyName("price")] double Price,
     [property: JsonPropertyName("event_time")] DateTimeOffset EventTime,
     [property: JsonPropertyName("available_at")] DateTimeOffset AvailableAt,
     [property: JsonPropertyName("ingested_at")] DateTimeOffset IngestedAt);
 
 public sealed record FuturesEvidenceEnvelope(
+    [property: JsonPropertyName("exchange_id")] string ExchangeId,
     [property: JsonPropertyName("contract_id")] string ContractId,
+    [property: JsonPropertyName("market_id")] string MarketId,
     [property: JsonPropertyName("source_id")] string SourceId,
     [property: JsonPropertyName("session_status")] string SessionStatus,
     [property: JsonPropertyName("is_full_snapshot")] bool IsFullSnapshot,
@@ -75,14 +88,17 @@ public sealed record BasisReferenceEnvelope(
     [property: JsonPropertyName("symbol")] string Symbol,
     [property: JsonPropertyName("reference_type")] string ReferenceType,
     [property: JsonPropertyName("source")] string Source,
+    [property: JsonPropertyName("exchange_id")] string ExchangeId,
+    [property: JsonPropertyName("contract_id")] string ContractId,
+    [property: JsonPropertyName("market_id")] string MarketId,
     [property: JsonPropertyName("price")] double Price,
     [property: JsonPropertyName("observed_at")] DateTimeOffset ObservedAt,
     [property: JsonPropertyName("available_at")] DateTimeOffset AvailableAt,
     [property: JsonPropertyName("ingested_at")] DateTimeOffset IngestedAt);
 
 public sealed record ContractTransitionEnvelope(
-    [property: JsonPropertyName("from_contract_id")] string FromContractId,
-    [property: JsonPropertyName("to_contract_id")] string ToContractId,
+    [property: JsonPropertyName("from_market_id")] string FromMarketId,
+    [property: JsonPropertyName("to_market_id")] string ToMarketId,
     [property: JsonPropertyName("price_type")] string PriceType,
     [property: JsonPropertyName("from_price")] double FromPrice,
     [property: JsonPropertyName("to_price")] double ToPrice,
