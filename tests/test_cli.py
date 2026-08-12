@@ -26,6 +26,19 @@ class CliTests(unittest.TestCase):
             with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 parser.parse_args(["analyze", "--provider", removed])
 
+    def test_parser_exposes_read_only_ingest_and_exact_cutoff_replay(self) -> None:
+        parser = build_parser()
+        ingest = parser.parse_args(
+            ["ingest", "--symbol", "ETH/USD", "--interval", "240", "--watch"]
+        )
+        self.assertEqual(ingest.command, "ingest")
+        self.assertTrue(ingest.watch)
+        replay = parser.parse_args(
+            ["replay", "--as-of", "2026-08-11T00:00:00+00:00"]
+        )
+        self.assertEqual(replay.command, "replay")
+        self.assertEqual(replay.limit, 120)
+
     def test_database_failure_never_prints_dsn(self) -> None:
         secret = "cli-secret-value"
         output = io.StringIO()

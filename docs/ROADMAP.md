@@ -7,8 +7,10 @@
    Simulator i aktualny pakiet/przykłady API.
 4. **Cykl życia kontraktów futures offline** — wdrożony w 0.4.0; katalog serii,
    wybór front-month, granica wygaśnięcia, kontrolowany roll i jego proweniencja.
-5. **Operacyjny ingest i live contract tests** — batch, raw payload hash, replay,
-   reconnect, sesja, głębokość rynku i braki danych.
+5. **Operacyjny ingest i replay** — część offline wdrożona w 0.5.0: atomowy batch,
+   dokładny raw payload hash, idempotencja, append-only candles, scheduler i
+   deterministyczny point-in-time replay. Live contract tests, reconnect, sesja i
+   głębokość rynku pozostają zablokowane do czasu dostępu T4 z punktu 3.
 6. **Analiza futures** — spread, volume, depth, roll, basis i expiry risk.
 7. **Monitoring i alert delivery** — dashboard, trace, incident log.
 8. **Odbiór V1** — minimum cztery tygodnie read-only i raport jakości.

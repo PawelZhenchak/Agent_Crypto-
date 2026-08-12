@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -114,6 +115,11 @@ class Plus500T4ProviderTests(unittest.TestCase):
         self.assertEqual(batch.sources[0]["id"], "plus500_t4_futures_v1")
         self.assertTrue(batch.metadata["t4_read_only_attested"])
         self.assertFalse(batch.metadata["t4_order_routes_exposed"])
+        self.assertIsInstance(batch.raw_payload, bytes)
+        self.assertEqual(
+            batch.raw_payload_sha256,
+            hashlib.sha256(batch.raw_payload or b"").hexdigest(),
+        )
         self.assertEqual(
             opener.request.get_header("X-crypto-agent-bridge-token"),
             _BRIDGE_TOKEN,

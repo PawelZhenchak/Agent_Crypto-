@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from datetime import datetime, timedelta
@@ -208,6 +209,8 @@ class Plus500T4Provider:
             reference_price=ReferencePriceSnapshot(
                 symbol=symbol, observations=(reference,)
             ),
+            raw_payload=payload_bytes,
+            raw_payload_sha256=hashlib.sha256(payload_bytes).hexdigest(),
         )
 
     def _parse_candle(

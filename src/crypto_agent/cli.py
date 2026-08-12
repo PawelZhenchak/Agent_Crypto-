@@ -3,13 +3,18 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
+import threading
 from dataclasses import replace
+from datetime import datetime
 from typing import Sequence
 
 from .factory import build_orchestrator
 from .narrator import OpenAINarrator
+from .providers.t4 import Plus500T4Provider
 from .resource_paths import default_migration_directory, default_v1_seed_path
+from .t4_ingest import T4IngestionReceipt, T4IngestionScheduler, T4IngestRepository
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -40,6 +45,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Directory containing checksummed SQL migrations",
     )
+
+    ingest = subparsers.add_parser(
+        "ingest", help="Persist read-only T4 bridge batches in PostgreSQL"
+    )
+    ingest.add_argument("--symbol", default="BTC/USD", choices=("BTC/USD", "ETH/USD"))
+    ingest.add_argument("--interval", type=int, default=1440, choices=(240, 1440, 10080))
+    ingest.add_argument("--limit", type=int, default=120)
+    ingest.add_argument("--watch", action="store_true")
+    ingest.add_argument("--poll-seconds", type=float, default=300.0)
+
+    replay = subparsers.add_parser(
+        "replay", help="Replay immutable T4 data from PostgreSQL at an exact cutoff"
+    )
+    replay.add_argument("--symbol", default="BTC/USD", choices=("BTC/USD", "ETH/USD"))
+    replay.add_argument("--interval", type=int, default=1440, choices=(240, 1440, 10080))
+    replay.add_argument("--limit", type=int, default=120)
+    replay.add_argument("--as-of", required=True)
     return parser
 
 
@@ -56,7 +78,106 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command == "db":
         return _run_database_command(args.action, args.migrations)
+    if args.command == "ingest":
+        return _run_ingest_command(args)
+    if args.command == "replay":
+        return _run_replay_command(args)
     return 2
+
+
+def _t4_repository() -> T4IngestRepository:
+    from .postgres import PostgresSettings, PsycopgConnectionFactory
+
+    return T4IngestRepository(PsycopgConnectionFactory(PostgresSettings.from_env()))
+
+
+def _t4_provider() -> Plus500T4Provider:
+    return Plus500T4Provider(
+        bridge_url=os.getenv("CRYPTO_AGENT_T4_BRIDGE_URL", "http://127.0.0.1:8784"),
+        bridge_token=os.getenv("CRYPTO_AGENT_T4_BRIDGE_TOKEN", ""),
+        timeout_seconds=float(os.getenv("CRYPTO_AGENT_T4_TIMEOUT_SECONDS", "10")),
+    )
+
+
+def _run_ingest_command(args: argparse.Namespace) -> int:
+    from .postgres import PostgresError
+    from .providers.base import ProviderError
+    try:
+        provider = _t4_provider()
+        repository = _t4_repository()
+
+        def fetch_and_persist(
+            symbol: str, interval: int, cutoff: datetime
+        ) -> T4IngestionReceipt:
+            batch = provider.fetch_batch(
+                symbol=symbol,
+                interval_minutes=interval,
+                as_of=cutoff,
+                limit=args.limit,
+            )
+            return repository.ingest(batch, requested_as_of=cutoff)
+
+        scheduler = T4IngestionScheduler(
+            fetch_and_persist, poll_seconds=args.poll_seconds
+        )
+        if args.watch:
+            stop_event = threading.Event()
+            try:
+                scheduler.run_forever(
+                    stop_event,
+                    symbols=(args.symbol,),
+                    intervals=(args.interval,),
+                )
+            except KeyboardInterrupt:
+                stop_event.set()
+            return 0
+        receipt = scheduler.run_once(
+            symbols=(args.symbol,), intervals=(args.interval,)
+        )[0]
+        payload: dict[str, object] = {
+            "status": "stored" if receipt.inserted else "duplicate",
+            "batch_id": receipt.batch_id,
+            "payload_sha256": receipt.payload_sha256,
+            "candle_count": receipt.candle_count,
+            "read_only": True,
+        }
+        exit_code = 0
+    except (PostgresError, ProviderError, RuntimeError, ValueError) as exc:
+        payload = {"status": "error", "error": str(exc), "read_only": True}
+        exit_code = 1
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return exit_code
+
+
+def _run_replay_command(args: argparse.Namespace) -> int:
+    from .postgres import PostgresError
+    from .providers.base import ProviderError
+
+    try:
+        cutoff = datetime.fromisoformat(args.as_of.replace("Z", "+00:00"))
+        result = _t4_repository().replay(
+            symbol=args.symbol,
+            interval_minutes=args.interval,
+            as_of=cutoff,
+            limit=args.limit,
+        )
+        payload: dict[str, object] = {
+            "status": "ok",
+            "symbol": result.symbol,
+            "interval_minutes": result.interval_minutes,
+            "as_of": result.as_of.isoformat(),
+            "candle_count": len(result.candles),
+            "contract_id": result.contract_id,
+            "source_batch_hashes": list(result.source_batch_hashes),
+            "replay_fingerprint_sha256": result.replay_fingerprint_sha256,
+            "read_only": True,
+        }
+        exit_code = 0
+    except (PostgresError, ProviderError, RuntimeError, ValueError) as exc:
+        payload = {"status": "error", "error": str(exc), "read_only": True}
+        exit_code = 1
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return exit_code
 
 
 def _run_database_command(action: str, migration_directory: str | None) -> int:

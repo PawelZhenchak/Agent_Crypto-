@@ -7,7 +7,8 @@ flowchart TD
     C --> D["Agent Python read-only"]
     D --> E["Risk gate"]
     E --> F["ALERT lub NO_SIGNAL"]
-    D --> G["PostgreSQL 16"]
+    D --> G["Append-only ingest PostgreSQL 16"]
+    G --> H["Point-in-time replay"]
 ```
 
 Worker .NET ma połączenie SSL do T4 i prywatne dane sesji. Agent Python widzi
@@ -30,3 +31,9 @@ nie zostanie podłączony. Ten stan prowadzi w agencie do `NO_SIGNAL`.
 
 PostgreSQL rozdziela historię migracji od aktywnej polityki. `t4_runtime_config`
 jest append-only i jednoznacznie wymusza wyłączone order routes.
+
+Warstwa 0.5.0 zapisuje dokładne bajty odpowiedzi bridge’a wraz z SHA-256 oraz
+znormalizowane świece w jednej transakcji. Konflikt identycznego hasha zwraca
+istniejący batch, nie tworząc kolejnych świec. Replay otwiera transakcję tylko do
+odczytu i uwzględnia wyłącznie rekordy znane w zadanym `as_of`; brak pełnego okna
+kończy się `T4_REPLAY_INCOMPLETE`, a nie częściowym wynikiem.
