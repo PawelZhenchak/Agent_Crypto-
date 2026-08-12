@@ -900,8 +900,8 @@ _OPERATIONAL_CONSTRAINT_REQUIREMENTS = (
         "alert_delivery_outbox_payload_check1",
         "c",
         """
-        CHECK (((payload ?& ARRAY[
-            'schema_version'::text, 'alert_type'::text, 'decision'::text,
+        CHECK (((payload ?& ARRAY['schema_version'::text,
+            'alert_type'::text, 'decision'::text,
             'decision_id'::text, 'trace_id'::text, 'asset_id'::text,
             'instrument_id'::text, 'horizon'::text, 'as_of'::text,
             'expires_at'::text, 'reason_codes'::text, 'data_snapshot_id'::text,
@@ -910,9 +910,9 @@ _OPERATIONAL_CONSTRAINT_REQUIREMENTS = (
             'environment'::text, 'external_delivery'::text, 'read_only'::text,
             'execution_enabled'::text, 'not_financial_advice'::text,
             'monitoring_policy_id'::text,
-            'monitoring_policy_hash_sha256'::text, 'retention_days'::text
-        ]) AND ((payload - ARRAY[
-            'schema_version'::text, 'alert_type'::text, 'decision'::text,
+            'monitoring_policy_hash_sha256'::text, 'retention_days'::text])
+        AND ((payload - ARRAY['schema_version'::text,
+            'alert_type'::text, 'decision'::text,
             'decision_id'::text, 'trace_id'::text, 'asset_id'::text,
             'instrument_id'::text, 'horizon'::text, 'as_of'::text,
             'expires_at'::text, 'reason_codes'::text, 'data_snapshot_id'::text,
@@ -921,8 +921,8 @@ _OPERATIONAL_CONSTRAINT_REQUIREMENTS = (
             'environment'::text, 'external_delivery'::text, 'read_only'::text,
             'execution_enabled'::text, 'not_financial_advice'::text,
             'monitoring_policy_id'::text,
-            'monitoring_policy_hash_sha256'::text, 'retention_days'::text
-        ]) = '{}'::jsonb)))
+            'monitoring_policy_hash_sha256'::text, 'retention_days'::text])
+        = '{}'::jsonb)))
         """,
     ),
     _CatalogDefinitionRequirement(
@@ -1284,6 +1284,12 @@ def check_postgres_health(
     try:
         with transaction(connection_factory) as connection, cursor(connection) as db_cursor:
             db_cursor.execute("SET TRANSACTION READ ONLY")
+            # Catalog deparsers such as pg_get_constraintdef() use search_path
+            # when deciding whether to qualify object names.  A CI role named
+            # ``crypto_agent`` implicitly exposes the same-named schema through
+            # ``\"$user\"`` and would otherwise make equivalent constraints look
+            # different.  Keep health attestation deterministic across roles.
+            db_cursor.execute("SET LOCAL search_path TO pg_catalog")
             db_cursor.execute(
                 """
                 SELECT current_setting('server_version_num'),

@@ -122,6 +122,7 @@ def _health_steps(
     series_rows = postgres_module._EXPECTED_CANONICAL_SERIES if series is None else series
     return [
         SQLStep("SET TRANSACTION READ ONLY"),
+        SQLStep("SET LOCAL search_path TO pg_catalog"),
         SQLStep(
             "server_version_num",
             [(server_version_num, server_version, session_replication_role)],
@@ -519,7 +520,10 @@ class PostgresV11Tests(unittest.TestCase):
 
     def test_health_check_rejects_view_substituted_for_required_table(self) -> None:
         steps = _health_steps()
-        steps[3].rows = [
+        base_relations_step = next(
+            step for step in steps if step.contains == "FROM pg_catalog.pg_class AS rel"
+        )
+        base_relations_step.rows = [
             (name, "v" if name == "candles" else "r") for name in postgres_module._BASE_TABLES
         ]
         connection = FakeConnection(steps)
@@ -567,6 +571,27 @@ class PostgresV11Tests(unittest.TestCase):
                     f"constraint:alert_delivery_outbox.{name}",
                     health.missing_schema_objects,
                 )
+
+    def test_health_check_uses_deterministic_catalog_search_path(self) -> None:
+        connection = FakeConnection(_health_steps())
+
+        health = check_postgres_health(lambda: connection)
+
+        self.assertTrue(health.healthy)
+        queries = [query for query, _ in connection.scripted_cursor.executions]
+        self.assertEqual(queries[0], "SET TRANSACTION READ ONLY")
+        self.assertEqual(queries[1], "SET LOCAL search_path TO pg_catalog")
+        payload_requirement = next(
+            item
+            for item in postgres_module._OPERATIONAL_CONSTRAINT_REQUIREMENTS
+            if item.name == "alert_delivery_outbox_payload_check1"
+        )
+        normalized = postgres_module._normalize_catalog_definition(
+            payload_requirement.definition
+        )
+        self.assertIn("ARRAY['schema_version'::text", normalized)
+        self.assertIn("'retention_days'::text]", normalized)
+        self.assertNotIn("ARRAY[ 'schema_version'::text", normalized)
 
     def test_health_check_rejects_changed_or_unvalidated_constraint(self) -> None:
         rows = _constraint_rows(postgres_module._OPERATIONAL_CONSTRAINT_REQUIREMENTS)
