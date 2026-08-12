@@ -267,6 +267,8 @@ _MIGRATED_TABLES = (
     "reference_price_manifests",
     "reference_price_provenance",
     "t4_runtime_config",
+    "t4_ingestion_batches",
+    "t4_canonical_candles",
 )
 _BASE_TRIGGER_FUNCTIONS = (
     "forbid_append_only_change",
@@ -424,6 +426,63 @@ _MIGRATED_COLUMN_REQUIREMENTS = (
             ("observed_at", "timestamptz"),
             ("available_at", "timestamptz"),
             ("ingested_at", "timestamptz"),
+            ("content_hash", "sha256_hex"),
+        ),
+    )
+    + _column_requirements(
+        "t4_ingestion_batches",
+        (
+            ("t4_batch_id", "int8"),
+            ("source_id", "int8"),
+            ("market_id", "int8"),
+            ("logical_symbol", "text"),
+            ("contract_id", "text"),
+            ("contract_expires_at", "timestamptz"),
+            ("contract_roll_at", "timestamptz"),
+            ("contract_selection", "text"),
+            ("interval_seconds", "int4"),
+            ("requested_as_of", "timestamptz"),
+            ("bridge_schema_version", "int4"),
+            ("reference_price", "numeric"),
+            ("reference_event_time", "timestamptz"),
+            ("reference_available_at", "timestamptz"),
+            ("reference_ingested_at", "timestamptz"),
+            ("raw_payload_base64", "text"),
+            ("raw_payload_hash", "sha256_hex"),
+            ("record_count", "int4"),
+            ("status", "text"),
+            ("observed_at", "timestamptz"),
+            ("available_at", "timestamptz"),
+            ("ingested_at", "timestamptz"),
+        ),
+    )
+    + (
+        _ColumnRequirement(
+            table="t4_ingestion_batches",
+            name="rolled_from_contract_id",
+            type_name="text",
+            not_null=False,
+        ),
+    )
+    + _column_requirements(
+        "t4_canonical_candles",
+        (
+            ("t4_candle_id", "int8"),
+            ("t4_batch_id", "int8"),
+            ("source_id", "int8"),
+            ("market_id", "int8"),
+            ("logical_symbol", "text"),
+            ("contract_id", "text"),
+            ("interval_seconds", "int4"),
+            ("open_time", "timestamptz"),
+            ("close_time", "timestamptz"),
+            ("open_price", "numeric"),
+            ("high_price", "numeric"),
+            ("low_price", "numeric"),
+            ("close_price", "numeric"),
+            ("base_volume", "numeric"),
+            ("available_at", "timestamptz"),
+            ("provider_ingested_at", "timestamptz"),
             ("content_hash", "sha256_hex"),
         ),
     )

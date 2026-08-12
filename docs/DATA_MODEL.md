@@ -16,5 +16,14 @@ identyfikator kontraktu T4 i regułę roll w każdym batchu. Bez tej proweniencj
 nie może zostać uznany za operacyjny.
 
 Stare tabele canonical/reference z migracji `0011/0012` pozostają tylko dla
-reprodukowalności poprzedniego prototypu. Nowy ingest T4 otrzyma osobny, wersjonowany
-kontrakt w kolejnym etapie.
+reprodukowalności poprzedniego prototypu. Nowy ingest T4 ma osobny kontrakt w
+migracji `0014`:
+
+- `t4_ingestion_batches` zachowuje dokładny payload bridge’a w base64, SHA-256,
+  rzeczywisty kontrakt, roll, cutoff i cenę referencyjną;
+- `t4_canonical_candles` zachowuje znormalizowane świece oraz hash każdego rekordu;
+- oba zbiory są append-only;
+- `raw_payload_hash` jest unikalny, więc ponowny odbiór tego samego batcha nie
+  tworzy duplikatów;
+- replay wybiera wyłącznie rekordy `available_at <= as_of`, rozstrzyga rewizje
+  deterministycznie i zwraca fingerprint SHA-256 całego wyniku.

@@ -1,4 +1,4 @@
-# Aktualny stan — 0.4.0
+# Aktualny stan — 0.5.0
 
 ## Gotowe
 
@@ -18,6 +18,13 @@
 - granica `roll_at` wymusza kontrolowane przejście na następną serię;
 - schema bridge v2 zachowuje contract ID, expiry, roll i poprzednią serię;
 - brak bezpiecznej kolejnej serii kończy się `NOT_READY` / `NO_SIGNAL`.
+- migracja `0014` dodaje atomowy, append-only ingest T4;
+- każdy batch zachowuje dokładny payload base64 i jego SHA-256;
+- rzeczywisty kontrakt, expiry, roll i cena referencyjna są trwale związane z batchem;
+- ponowny identyczny payload jest idempotentny i nie duplikuje świec;
+- replay respektuje historyczne `as_of`, działa w transakcji read-only i ma
+  deterministyczny fingerprint;
+- dostępne są pojedyncze i cykliczne uruchomienia ingestu przez CLI.
 
 ## Świadomie zachowana historia
 
@@ -30,8 +37,8 @@ Nie są aktywną konfiguracją ani źródłami runtime.
 - rejestracja aplikacji T4 u Plus500 Futures Technologies/CTS;
 - adapter oficjalnego klienta T4 po otrzymaniu aktualnego pakietu i przykładów API;
 - konto T4 Simulator i test live contract;
-- operacyjny zapis danych T4 i replay w PostgreSQL;
-- ponowny test migracji `0013` na prawdziwym PostgreSQL 16 w GitHub Actions;
+- live contract test ingestu po uzyskaniu konta Simulator i oficjalnego klienta;
+- reconnect sesji oraz snapshoty głębokości rynku z prawdziwego T4;
 - wielotygodniowy odbiór read-only V1.
 
 Do czasu podłączenia workera T4 system ma zwracać `NO_SIGNAL`, a nie dane zastępcze.

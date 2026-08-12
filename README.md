@@ -1,6 +1,6 @@
 # Plus500 Futures T4 Research Agent
 
-Wersja `0.4.0` analizuje wyłącznie dane futures z **Plus500 Futures / T4**.
+Wersja `0.5.0` analizuje wyłącznie dane futures z **Plus500 Futures / T4**.
 System działa tylko w trybie odczytu i może zwrócić `ALERT` lub `NO_SIGNAL`.
 Nie loguje się do innych platform i nie składa, nie zmienia ani nie anuluje zleceń.
 
@@ -61,7 +61,22 @@ crypto-agent db health
 
 Prawidłowy wynik końcowy to `READY`. Migracje `0011` i `0012` są zachowane bez
 zmian jako historia wcześniejszego prototypu. Migracja `0013` ustanawia T4 jako
-jedyne operacyjne źródło. Nowy seed nie zawiera konfiguracji innych platform.
+jedyne operacyjne źródło, a `0014` dodaje append-only ingest i point-in-time
+replay. Nowy seed nie zawiera konfiguracji innych platform.
+
+Po podłączeniu oficjalnego klienta T4 pojedynczy batch można zapisać poleceniem:
+
+```bash
+crypto-agent ingest --symbol BTC/USD --interval 1440
+```
+
+Tryb cykliczny dodaje `--watch --poll-seconds 300`. Replay nie łączy się z T4 i
+odtwarza wyłącznie dane dostępne w zadanym czasie:
+
+```bash
+crypto-agent replay --symbol BTC/USD --interval 1440 \
+  --as-of 2026-08-11T00:00:00+00:00
+```
 
 Szczegóły: [instrukcja uruchomienia](docs/INSTRUKCJA_URUCHOMIENIA.md),
 [architektura](docs/ARCHITECTURE.md), [stan projektu](docs/CURRENT_STATUS.md).

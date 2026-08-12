@@ -42,6 +42,8 @@ class ProviderBatch:
     sources: tuple[dict[str, str], ...]
     metadata: dict[str, Any] = field(default_factory=dict)
     reference_price: ReferencePriceSnapshot | None = None
+    raw_payload: bytes | None = field(default=None, repr=False)
+    raw_payload_sha256: str | None = None
 
 
 class CandleProvider(Protocol):

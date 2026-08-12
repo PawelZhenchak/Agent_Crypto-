@@ -31,7 +31,7 @@ crypto-agent db seed
 crypto-agent db health
 ```
 
-Health wymaga PostgreSQL 16, migracji `0011`–`0013`, dwóch bindingów T4 oraz
+Health wymaga PostgreSQL 16, migracji `0011`–`0014`, dwóch bindingów T4 oraz
 jednego runtime config z wyłączonymi trasami zleceń.
 
 ## 4. T4 Simulator
@@ -71,3 +71,24 @@ Most musi potwierdzić `read_only=true`, `order_routes_exposed=false`, właściw
 source/venue ID, rzeczywisty i niewygasły contract ID, `roll_at`, proweniencję
 ewentualnego przełączenia, 120 świec oraz świeżą cenę. Każda niezgodność kończy
 się `NO_SIGNAL`.
+
+## 5. Ingest i replay
+
+Po uruchomieniu prawdziwej sesji T4 zapisz pojedynczy batch:
+
+```bash
+crypto-agent ingest --symbol BTC/USD --interval 1440
+```
+
+Scheduler można uruchomić przez `--watch --poll-seconds 300`. Każdy batch trafia
+do PostgreSQL atomowo; identyczny SHA-256 jest rozpoznawany jako duplikat.
+
+Historyczny replay działa bez połączenia z T4:
+
+```bash
+crypto-agent replay --symbol BTC/USD --interval 1440 \
+  --as-of 2026-08-11T00:00:00+00:00
+```
+
+Replay nie zwraca niepełnego okna. Jeśli przed cutoffem nie ma wymaganej liczby
+świec, kończy się bezpiecznym `T4_REPLAY_INCOMPLETE`.
