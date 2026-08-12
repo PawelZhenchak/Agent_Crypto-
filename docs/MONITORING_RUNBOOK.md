@@ -1,36 +1,40 @@
 # Runbook monitoringu i lokalnego dostarczania alertów
 
-## Zakres 0.7.0
+## Zakres 0.8.0
 
 Monitoring działa read-only i przechowuje w PostgreSQL trace, bezpieczne artifacts,
 incydenty, alerty oraz delivery outbox. Jedynym kanałem jest kanoniczny JSON
 zapisany do stdout (`stdout_json` → `process_stdout`). Wersja nie wysyła danych do
 webhooka, Slacka, Telegrama, e-maila ani SMS.
 
-Oficjalny reader T4 pozostaje pending i zwraca `503`. Jest to spodziewany stan
-fail-closed: cykl live daje `NO_SIGNAL` i lokalny incydent, a nie przesyłkę.
+Oficjalny reader oparty o `Plus500US.T4Proto` 1.0.73 oraz
+`Plus500US.T4ChartDecoder` 1.0.97 jest zaimplementowany, ale provisioning i
+rzeczywiste testy Simulator/live nie zostały wykonane. Nadal potrzebne są
+uprawnienia oraz prawidłowe identyfikatory rynku i niezależnego indeksu. Stan
+`pending` albo niegotowy prewarm zwraca `503`: cykl daje `NO_SIGNAL` i lokalny
+incydent, a nie przesyłkę.
 
 ## Wymagania
 
 1. Skonfiguruj `CRYPTO_AGENT_POSTGRES_DSN` bez commitowania credentials.
-2. Zastosuj migracje `0011`–`0016` i seed.
+2. Zastosuj migracje `0011`–`0017` i seed.
 3. Sprawdź `crypto-agent db health`; wynik musi być `READY`.
-4. Dla realnego cyklu skonfiguruj prywatny token i lokalny bridge T4. Delivery
-   live wymaga schema v4 oraz `environment=live_t4`; v2/v3 służą wyłącznie
-   historycznemu replayowi.
+4. Dla realnego cyklu skonfiguruj prywatny token, katalog schema v2 i lokalny
+   bridge T4. Delivery live wymaga schema v5 oraz `environment=live_t4`;
+   `t4_simulator` i replay są zawsze wykluczone.
 
 ## Procesy
 
 Jednorazowy cykl monitoringu:
 
 ```bash
-crypto-agent monitor --symbol BTC/USD --interval 1440
+crypto-agent monitor --symbol BTC/USD --interval 240
 ```
 
 Ciągły monitoring:
 
 ```bash
-crypto-agent monitor --symbol BTC/USD --interval 1440 \
+crypto-agent monitor --symbol BTC/USD --interval 240 \
   --watch --poll-seconds 300
 ```
 
@@ -54,7 +58,8 @@ trafia do stderr, dlatego supervisor powinien zbierać te strumienie oddzielnie.
 Outbox powstaje tylko wtedy, gdy wszystkie warunki są spełnione:
 
 - operacja jest analizą live T4;
-- bridge potwierdził schema v4 oraz `environment=live_t4`;
+- bridge potwierdził schema v5, pełną tożsamość T4 oraz
+  `environment=live_t4`;
 - decyzja to `ALERT` i risk gate nie zgłosił veto;
 - źródło i instrument mają zatwierdzoną atestację T4;
 - futures evidence jest kompletne i bieżące;
@@ -62,8 +67,8 @@ Outbox powstaje tylko wtedy, gdy wszystkie warunki są spełnione:
 - raport nie wygasł i nadal mieści się w oknie delivery;
 - execution pozostaje wyłączone.
 
-`NO_SIGNAL`, synthetic, fixture, replay v2/v3, veto, stale, provider error i wynik
-po expiry nigdy nie są dostarczane. Replay może zostać zapisany jako trace
+`NO_SIGNAL`, synthetic, fixture, Simulator, replay, veto, stale, provider error i
+wynik po expiry nigdy nie są dostarczane. Replay może zostać zapisany jako trace
 badawczy, ale nie może utworzyć outboxa.
 
 ## Retry, idempotencja i trwałość
@@ -108,8 +113,9 @@ istnieje; analiza nie jest operacją GET ze skutkiem ubocznym.
 
 ## Reakcja na stan awaryjny
 
-- `T4_BRIDGE_UNAVAILABLE` / HTTP `503`: oczekiwane do podłączenia oficjalnego
-  klienta; potwierdź incydent w dashboardzie, nie obchodź readera fixture’em.
+- `T4_BRIDGE_UNAVAILABLE` / HTTP `503`: sprawdź provisioning, środowisko, klucz,
+  katalog, uprawnienia i prewarm; potwierdź incydent w dashboardzie, nie obchodź
+  readera fixture’em.
 - `MONITORING_CYCLE_FAILED`: sprawdź health PostgreSQL, komplet migracji i prywatną
   konfigurację bridge’a. Szczegóły nie są wypisywane celowo.
 - `ALERT_DELIVERY_FAILED`: zatrzymaj worker, sprawdź PostgreSQL i integralność
@@ -133,5 +139,6 @@ W jednej transakcji PostgreSQL powstają run/artifact, alert, alert event i outb
 SQLite jest odrębnym historycznym magazynem raportów i nie uczestniczy w tej
 transakcji. Nie należy deklarować atomowości między tymi bazami.
 
-`v1_gate_passed=false`. Runbook opisuje odbiór offline; test live T4 i minimum
-cztery tygodnie obserwacji read-only należą do punktu 8.
+`v1_gate_passed=false`. Monitoring nie zastępuje kampanii punktu 8. Rzeczywisty
+test live, zatwierdzony runner cykli i minimum 672 godziny obserwacji BTC/ETH 4h
+nie zostały jeszcze wykonane.

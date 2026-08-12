@@ -119,11 +119,11 @@ def _operational_batch() -> tuple[ProviderBatch, datetime]:
     candles: list[Candle] = []
     raw_candles: list[dict[str, object]] = []
     for index in range(120):
-        close_time = as_of - timedelta(days=119 - index)
+        close_time = as_of - timedelta(hours=4 * (119 - index))
         raw = {
             "symbol": "BTC/USD",
-            "interval_minutes": 1440,
-            "open_time": (close_time - timedelta(days=1)).isoformat(),
+            "interval_minutes": 240,
+            "open_time": (close_time - timedelta(hours=4)).isoformat(),
             "close_time": close_time.isoformat(),
             "open": 100.0 + index,
             "high": 102.0 + index,
@@ -131,6 +131,7 @@ def _operational_batch() -> tuple[ProviderBatch, datetime]:
             "close": 101.0 + index,
             "volume": 1000.0 + index,
             "source": "plus500_t4_futures_v1",
+            "market_id": "MBT Sep26 (XCME)",
             "available_at": close_time.isoformat(),
             "ingested_at": as_of.isoformat(),
         }
@@ -138,8 +139,8 @@ def _operational_batch() -> tuple[ProviderBatch, datetime]:
         candles.append(
             Candle(
                 symbol="BTC/USD",
-                interval_minutes=1440,
-                open_time=close_time - timedelta(days=1),
+                interval_minutes=240,
+                open_time=close_time - timedelta(hours=4),
                 close_time=close_time,
                 open=float(raw["open"]),
                 high=float(raw["high"]),
@@ -152,7 +153,7 @@ def _operational_batch() -> tuple[ProviderBatch, datetime]:
             )
         )
     evidence = FuturesEvidence(
-        contract_id="CME:MBT:202609",
+        contract_id="MBT Sep26 (XCME)",
         source="plus500_t4_futures_v1",
         session_status=SessionStatus.OPEN,
         is_full_snapshot=True,
@@ -178,7 +179,9 @@ def _operational_batch() -> tuple[ProviderBatch, datetime]:
         ),
     )
     futures_evidence = {
-        "contract_id": evidence.contract_id,
+        "exchange_id": "CME",
+        "contract_id": "MBT",
+        "market_id": evidence.contract_id,
         "source_id": evidence.source,
         "session_status": evidence.session_status.value,
         "is_full_snapshot": evidence.is_full_snapshot,
@@ -195,6 +198,9 @@ def _operational_batch() -> tuple[ProviderBatch, datetime]:
         ],
         "basis_reference": {
             "symbol": evidence.basis_reference.symbol,
+            "exchange_id": "CME",
+            "contract_id": "BTC-INDEX",
+            "market_id": "BTC Index (CME)",
             "reference_type": evidence.basis_reference.reference_type,
             "source": evidence.basis_reference.source,
             "price": evidence.basis_reference.price,
@@ -205,19 +211,21 @@ def _operational_batch() -> tuple[ProviderBatch, datetime]:
         "contract_transition": None,
     }
     envelope = {
-        "schema_version": 4,
+        "schema_version": 5,
         "source_id": "plus500_t4_futures_v1",
         "venue_id": "plus500_t4",
         "read_only": True,
         "order_routes_exposed": False,
         "environment": "live_t4",
         "logical_symbol": "BTC/USD",
-        "interval_minutes": 1440,
-        "contract_id": "CME:MBT:202609",
+        "interval_minutes": 240,
+        "exchange_id": "CME",
+        "contract_id": "MBT",
+        "market_id": "MBT Sep26 (XCME)",
         "contract_expires_at": (as_of + timedelta(days=30)).isoformat(),
         "contract_roll_at": (as_of + timedelta(days=25)).isoformat(),
         "contract_selection": "front_month",
-        "rolled_from_contract_id": None,
+        "rolled_from_market_id": None,
         "candles": raw_candles,
         "reference_price": {
             "symbol": "BTC/USD",
@@ -239,13 +247,19 @@ def _operational_batch() -> tuple[ProviderBatch, datetime]:
             "t4_source_id": "plus500_t4_futures_v1",
             "t4_venue_id": "plus500_t4",
             "t4_order_routes_exposed": False,
-            "t4_bridge_schema_version": 4,
+            "t4_bridge_schema_version": 5,
             "t4_environment": "live_t4",
-            "t4_contract_id": "CME:MBT:202609",
+            "t4_exchange_id": "CME",
+            "t4_contract_id": "MBT",
+            "t4_market_id": "MBT Sep26 (XCME)",
+            "t4_basis_exchange_id": "CME",
+            "t4_basis_contract_id": "BTC-INDEX",
+            "t4_basis_market_id": "BTC Index (CME)",
+            "t4_candle_market_ids": ["MBT Sep26 (XCME)"] * 120,
             "t4_contract_expires_at": (as_of + timedelta(days=30)).isoformat(),
             "t4_contract_roll_at": (as_of + timedelta(days=25)).isoformat(),
             "t4_contract_selection": "front_month",
-            "t4_rolled_from_contract_id": None,
+            "t4_rolled_from_market_id": None,
             "t4_futures_evidence_attested": True,
         },
         reference_price=ReferencePriceSnapshot(
@@ -286,10 +300,10 @@ def _assert_operational_ingest_and_replay() -> None:
         raise AssertionError("expected ten immutable T4 order-book levels")
     replay_as_of = datetime.now(UTC)
     replay_a = repository.replay(
-        symbol="BTC/USD", interval_minutes=1440, as_of=replay_as_of, limit=120
+        symbol="BTC/USD", interval_minutes=240, as_of=replay_as_of, limit=120
     )
     replay_b = repository.replay(
-        symbol="BTC/USD", interval_minutes=1440, as_of=replay_as_of, limit=120
+        symbol="BTC/USD", interval_minutes=240, as_of=replay_as_of, limit=120
     )
     if replay_a.replay_fingerprint_sha256 != replay_b.replay_fingerprint_sha256:
         raise AssertionError("T4 point-in-time replay is not deterministic")
@@ -375,8 +389,8 @@ def _operational_alert_report(
         as_of=observed_at - timedelta(seconds=1),
         expires_at=expires_at,
         asset_id="bip122:000000000019d6689c085ae165831e93:native",
-        instrument_id="plus500_t4_futures_v1:BTC/USD:1440m",
-        horizon="1d",
+        instrument_id="plus500_t4_futures_v1:BTC/USD:240m",
+        horizon="4h",
         decision=Decision.ALERT,
         reason_codes=("VOLUME_ANOMALY",),
         regime_probabilities=(),
@@ -400,14 +414,14 @@ def _operational_alert_report(
         metrics=None,
         futures_metrics=None,
         metadata={
-            "system_version": "0.7.0-plus500-t4-v1",
+            "system_version": "0.8.0-plus500-t4-v1",
             "mode": "V1_READ_ONLY",
             "execution_enabled": False,
             "not_financial_advice": True,
             "v1_gate_passed": False,
             "plus500_t4_source_attested": True,
             "external_delivery_eligible": True,
-            "t4_bridge_schema_version": 4,
+            "t4_bridge_schema_version": 5,
             "t4_environment": "live_t4",
             "futures_gate_passed": True,
             "futures_policy_id": "futures-analysis-v1-2026-08-12",
@@ -585,6 +599,96 @@ def _assert_operational_alert_guards() -> None:
     )
 
 
+def _assert_observation_ledger() -> None:
+    connection = _factory()()
+    try:
+        with connection.cursor() as db_cursor:
+            db_cursor.execute(
+                """
+                INSERT INTO crypto_agent.t4_observation_campaigns (
+                    campaign_id, environment, started_at, planned_ends_at,
+                    cycle_interval_seconds, observation_policy_id,
+                    observation_policy_hash, code_commit_hash,
+                    t4_protocol_commit_hash, runtime_config_hash,
+                    scope_manifest, scope_manifest_hash, frozen_baseline_hash,
+                    read_only, execution_enabled, content_hash
+                ) VALUES (
+                    '581ef534-1f26-4f06-95ce-5873911044d6', 'live_t4',
+                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP + interval '672 hours',
+                    3600, 't4-v1-observation-2026-08-12',
+                    repeat('1', 64), repeat('2', 64), repeat('3', 64),
+                    repeat('4', 64), '["BTC/USD:240m"]'::jsonb,
+                    repeat('5', 64), repeat('6', 64), TRUE, FALSE,
+                    repeat('7', 64)
+                )
+                """
+            )
+            db_cursor.execute(
+                """
+                INSERT INTO crypto_agent.t4_observation_session_events (
+                    campaign_id, sequence_no, event_at, event_type, outcome,
+                    scenario_code, detail_code, read_only, execution_enabled,
+                    previous_event_hash, content_hash
+                ) VALUES (
+                    '581ef534-1f26-4f06-95ce-5873911044d6', 1,
+                    CURRENT_TIMESTAMP, 'campaign_started', 'pass', NULL, NULL,
+                    TRUE, FALSE, NULL, repeat('8', 64)
+                )
+                """
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+    if _scalar("SELECT COUNT(*) FROM crypto_agent.t4_observation_campaigns") != 1:
+        raise AssertionError("expected one immutable T4 observation campaign")
+    if _scalar("SELECT COUNT(*) FROM crypto_agent.t4_observation_session_events") != 1:
+        raise AssertionError("expected one hash-chained T4 observation session event")
+    if _scalar("SELECT COUNT(*) FROM crypto_agent.t4_observation_research_inputs") != 0:
+        raise AssertionError("unexpected unverified T4 observation research input")
+
+    _expect_sqlstate(
+        """
+        INSERT INTO crypto_agent.t4_observation_research_inputs (
+            campaign_id, scope_key, sequence_no, expected_at, t4_batch_id,
+            research_run_id, raw_payload_hash, analysis_input_hash, trace_id,
+            content_hash
+        )
+        SELECT campaign.campaign_id, 'BTC/USD:240m', 1,
+               campaign.started_at + interval '1 hour', batch.t4_batch_id,
+               run.research_run_id, batch.raw_payload_hash, repeat('e', 64),
+               'ba66e0e1-147e-4b99-885e-ddbb26ce05c6'::uuid, repeat('f', 64)
+        FROM crypto_agent.t4_observation_campaigns AS campaign
+        CROSS JOIN LATERAL (
+            SELECT * FROM crypto_agent.t4_ingestion_batches
+            ORDER BY t4_batch_id LIMIT 1
+        ) AS batch
+        CROSS JOIN LATERAL (
+            SELECT * FROM crypto_agent.research_runs
+            ORDER BY research_run_id LIMIT 1
+        ) AS run
+        WHERE campaign.campaign_id = '581ef534-1f26-4f06-95ce-5873911044d6'
+        """,
+        "22023",
+    )
+
+    _expect_sqlstate(
+        "UPDATE crypto_agent.t4_observation_campaigns "
+        "SET planned_ends_at = planned_ends_at + interval '1 hour'",
+        "55000",
+    )
+    _expect_sqlstate(
+        "UPDATE crypto_agent.t4_observation_session_events SET outcome = 'fail'",
+        "55000",
+    )
+    _expect_sqlstate("TRUNCATE crypto_agent.t4_observation_cycles", "55000")
+    _expect_sqlstate(
+        "TRUNCATE crypto_agent.t4_observation_research_inputs, "
+        "crypto_agent.t4_observation_cycles",
+        "55000",
+    )
+
+
 def _assert_operational_persistence() -> None:
     if _scalar("SELECT COUNT(*) FROM crypto_agent.t4_ingestion_batches") != 1:
         raise AssertionError("T4 ingest batch did not survive PostgreSQL restart")
@@ -622,6 +726,12 @@ def _assert_operational_persistence() -> None:
         "AND event.event_type IN ('created', 'delivered')"
     ) != 2:
         raise AssertionError("alert events did not survive PostgreSQL restart")
+    if _scalar("SELECT COUNT(*) FROM crypto_agent.t4_observation_campaigns") != 1:
+        raise AssertionError("T4 observation campaign did not survive PostgreSQL restart")
+    if _scalar("SELECT COUNT(*) FROM crypto_agent.t4_observation_session_events") != 1:
+        raise AssertionError("T4 observation event did not survive PostgreSQL restart")
+    if _scalar("SELECT COUNT(*) FROM crypto_agent.t4_observation_research_inputs") != 0:
+        raise AssertionError("unverified observation research input survived restart")
 
 
 def bootstrap_and_test() -> None:
@@ -634,14 +744,16 @@ def bootstrap_and_test() -> None:
         "0014",
         "0015",
         "0016",
+        "0017",
     ):
-        raise AssertionError("clean PostgreSQL 16 did not apply migrations 0011-0016")
+        raise AssertionError("clean PostgreSQL 16 did not apply migrations 0011-0017")
     apply_v1_seeds(_factory(), default_v1_seed_path())
     apply_v1_seeds(_factory(), default_v1_seed_path())
     _assert_ready()
     _assert_operational_ingest_and_replay()
     _assert_operational_alert_outbox()
     _assert_operational_alert_guards()
+    _assert_observation_ledger()
 
     _expect_sqlstate(
         "UPDATE crypto_agent.data_sources SET display_name = 'tampered' "

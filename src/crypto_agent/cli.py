@@ -2,20 +2,28 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
+import re
 import sys
 import threading
+import time
 from collections.abc import Sequence
 from dataclasses import replace
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import TYPE_CHECKING
+from uuid import UUID, uuid4, uuid5
 
 from .factory import build_monitoring_repository, build_orchestrator
 from .monitoring import run_monitored_analysis
 from .narrator import OpenAINarrator
+from .providers.base import ProviderBatch, ProviderError
 from .providers.t4 import Plus500T4Provider
 from .resource_paths import (
     default_migration_directory,
+    default_observation_policy_path,
     default_risk_policy_path,
     default_v1_seed_path,
 )
@@ -25,6 +33,9 @@ from .t4_ingest import (
     T4IngestRepository,
     T4ReplayProvider,
 )
+
+if TYPE_CHECKING:
+    from .observation import ObservationRepository
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -107,6 +118,42 @@ def build_parser() -> argparse.ArgumentParser:
         "monitoring-status",
         help="Read the local monitoring dashboard projection as JSON",
     )
+
+    observation_start = subparsers.add_parser(
+        "observe-start",
+        help="Freeze and start the real-time 28-day live-T4 observation baseline",
+    )
+    observation_start.add_argument("--campaign-id", default=None)
+    observation_start.add_argument("--cycle-interval-seconds", type=int, default=300)
+    observation_start.add_argument(
+        "--scope",
+        action="append",
+        default=None,
+        help="Repeat for each frozen scope (default: BTC/USD:240m and ETH/USD:240m)",
+    )
+    observation_start.add_argument("--code-commit-hash", default=None)
+    observation_start.add_argument("--t4-protocol-commit-hash", default=None)
+    observation_start.add_argument("--runtime-config-hash", default=None)
+
+    observation_status = subparsers.add_parser(
+        "observe-status",
+        help="Evaluate a campaign at the PostgreSQL server's current time",
+    )
+    observation_status.add_argument("--campaign-id", required=True)
+
+    observation_report = subparsers.add_parser(
+        "observe-report",
+        help="Store the immutable final V1 quality report after the real 28-day window",
+    )
+    observation_report.add_argument("--campaign-id", required=True)
+
+    observation_run = subparsers.add_parser(
+        "observe-run",
+        help="Run exactly one due frozen-scope live-T4 observation cycle",
+    )
+    observation_run.add_argument("--campaign-id", required=True)
+    observation_run.add_argument("--scope", required=True)
+    observation_run.add_argument("--limit", type=int, default=120)
     return parser
 
 
@@ -135,6 +182,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_alert_delivery_command(args)
     if args.command == "monitoring-status":
         return _run_monitoring_status_command()
+    if args.command == "observe-start":
+        return _run_observation_start_command(args)
+    if args.command == "observe-status":
+        return _run_observation_status_command(args)
+    if args.command == "observe-report":
+        return _run_observation_report_command(args)
+    if args.command == "observe-run":
+        return _run_observation_cycle_command(args)
     return 2
 
 
@@ -375,6 +430,478 @@ def _run_monitoring_status_command() -> int:
         exit_code = 1
     print(json.dumps(payload, indent=2, ensure_ascii=False))
     return exit_code
+
+
+def _observation_repository() -> ObservationRepository:
+    from .observation import ObservationRepository
+    from .observation_policy import ObservationPolicy
+    from .postgres import PostgresSettings, PsycopgConnectionFactory
+
+    configured_path = os.getenv("CRYPTO_AGENT_OBSERVATION_POLICY_PATH")
+    policy_path = (
+        Path(configured_path)
+        if configured_path is not None
+        else default_observation_policy_path()
+    )
+    return ObservationRepository(
+        PsycopgConnectionFactory(PostgresSettings.from_env()),
+        ObservationPolicy.load(policy_path),
+    )
+
+
+def _observation_database_now(repository: ObservationRepository) -> datetime:
+    """Use PostgreSQL time so the CLI cannot accept a caller-supplied cutoff."""
+
+    from .postgres import cursor, transaction
+
+    with (
+        transaction(repository.connection_factory) as connection,
+        cursor(connection) as db_cursor,
+    ):
+        db_cursor.execute("SET TRANSACTION READ ONLY")
+        db_cursor.execute("SELECT CURRENT_TIMESTAMP")
+        row = db_cursor.fetchone()
+    if (
+        not isinstance(row, Sequence)
+        or isinstance(row, (str, bytes))
+        or len(row) != 1
+        or not isinstance(row[0], datetime)
+        or row[0].tzinfo is None
+        or row[0].utcoffset() is None
+    ):
+        raise RuntimeError("Observation database clock is unavailable")
+    return row[0].astimezone(UTC)
+
+
+def _run_observation_start_command(args: argparse.Namespace) -> int:
+    from .observation import ObservationCampaign
+
+    try:
+        repository = _observation_repository()
+        policy = repository.policy
+        started_at = _observation_database_now(repository)
+        scopes = tuple(sorted(args.scope or ("BTC/USD:240m", "ETH/USD:240m")))
+        campaign = ObservationCampaign(
+            campaign_id=args.campaign_id or str(uuid4()),
+            started_at=started_at,
+            planned_ends_at=started_at
+            + timedelta(seconds=policy.minimum_elapsed_seconds),
+            cycle_interval_seconds=args.cycle_interval_seconds,
+            code_commit_hash=(
+                args.code_commit_hash
+                or os.getenv("CRYPTO_AGENT_CODE_COMMIT_HASH", "")
+            ),
+            t4_protocol_commit_hash=(
+                args.t4_protocol_commit_hash
+                or os.getenv("CRYPTO_AGENT_T4_PROTOCOL_COMMIT_HASH", "")
+            ),
+            runtime_config_hash=(
+                args.runtime_config_hash
+                or os.getenv("CRYPTO_AGENT_RUNTIME_CONFIG_HASH", "")
+            ),
+            scope_manifest=scopes,
+        )
+        campaign.validate(policy)
+        live_provider = _t4_provider()
+        for scope_key in campaign.scope_manifest:
+            symbol, interval_minutes = _parse_observation_scope(scope_key)
+            preflight_batch = live_provider.fetch_batch(
+                symbol=symbol,
+                interval_minutes=interval_minutes,
+                as_of=started_at,
+                limit=60,
+            )
+            _validate_live_observation_batch(preflight_batch)
+        frozen_baseline_hash = repository.create_campaign(campaign)
+        payload: dict[str, object] = {
+            "schema_version": 1,
+            "status": "started",
+            "campaign_id": campaign.campaign_id,
+            "started_at": campaign.started_at.isoformat(),
+            "planned_ends_at": campaign.planned_ends_at.isoformat(),
+            "cycle_interval_seconds": campaign.cycle_interval_seconds,
+            "minimum_elapsed_hours": policy.minimum_elapsed_hours,
+            "scope_manifest": list(campaign.scope_manifest),
+            "live_t4_preflight_scope_count": len(campaign.scope_manifest),
+            "policy_id": policy.policy_id,
+            "policy_hash_sha256": policy.policy_hash_sha256,
+            "frozen_baseline_hash_sha256": frozen_baseline_hash,
+            "read_only": True,
+            "execution_enabled": False,
+        }
+        exit_code = 0
+    except Exception:
+        payload = {
+            "schema_version": 1,
+            "status": "error",
+            "error_code": "OBSERVATION_START_FAILED",
+            "read_only": True,
+            "execution_enabled": False,
+        }
+        exit_code = 1
+    _print_observation_json(payload)
+    return exit_code
+
+
+class _SingleObservationBatchProvider:
+    """Analysis adapter that can return only the already-fetched batch once."""
+
+    source_id = Plus500T4Provider.source_id
+
+    def __init__(
+        self,
+        batch: ProviderBatch,
+        *,
+        symbol: str,
+        interval_minutes: int,
+        as_of: datetime,
+        limit: int,
+    ) -> None:
+        self._batch = batch
+        self._symbol = symbol
+        self._interval_minutes = interval_minutes
+        self._as_of = as_of
+        self._limit = limit
+        self.calls = 0
+
+    def fetch_batch(
+        self,
+        *,
+        symbol: str,
+        interval_minutes: int,
+        as_of: datetime,
+        limit: int,
+    ) -> ProviderBatch:
+        self.calls += 1
+        if (
+            self.calls != 1
+            or symbol != self._symbol
+            or interval_minutes != self._interval_minutes
+            or as_of != self._as_of
+            or limit != self._limit
+        ):
+            raise ProviderError(
+                "Observation batch request does not match its frozen slot",
+                code="T4_OBSERVATION_BATCH_MISMATCH",
+            )
+        return self._batch
+
+
+def _run_observation_cycle_command(args: argparse.Namespace) -> int:
+    from .observation import (
+        ObservationCycleExecution,
+        ObservationCyclePlan,
+    )
+    from .orchestrator import ResearchOrchestrator
+    from .policy import RiskPolicy
+
+    try:
+        if type(args.limit) is not int or not 60 <= args.limit <= 720:
+            raise ValueError("invalid observation limit")
+        symbol, interval_minutes = _parse_observation_scope(args.scope)
+        observation_repository = _observation_repository()
+
+        def execute(plan: ObservationCyclePlan) -> ObservationCycleExecution:
+            provider = _t4_provider()
+            fetch_started = time.monotonic_ns()
+            batch = provider.fetch_batch(
+                symbol=symbol,
+                interval_minutes=interval_minutes,
+                as_of=plan.expected_at,
+                limit=args.limit,
+            )
+            bridge_rtt_milliseconds = max(
+                0, (time.monotonic_ns() - fetch_started) // 1_000_000
+            )
+            _validate_live_observation_batch(batch)
+
+            ingestion = _t4_repository().ingest(
+                batch,
+                requested_as_of=plan.expected_at,
+            )
+            if ingestion.payload_sha256 != batch.raw_payload_sha256:
+                raise RuntimeError("observation ingestion linkage mismatch")
+
+            sealed_provider = _SingleObservationBatchProvider(
+                batch,
+                symbol=symbol,
+                interval_minutes=interval_minutes,
+                as_of=plan.expected_at,
+                limit=args.limit,
+            )
+            provider.fetch_batch = sealed_provider.fetch_batch  # type: ignore[method-assign]
+            orchestrator = ResearchOrchestrator(
+                provider=provider,
+                policy=RiskPolicy.load(default_risk_policy_path()),
+            )
+
+            def analyze_exact_batch(**kwargs: object):  # type: ignore[no-untyped-def]
+                report = orchestrator.analyze(**kwargs)  # type: ignore[arg-type]
+                return replace(
+                    report,
+                    decision_id=str(
+                        uuid5(UUID(plan.trace_id), "observation-research-decision")
+                    ),
+                    risk=replace(
+                        report.risk,
+                        assessment_id=str(
+                            uuid5(
+                                UUID(plan.trace_id),
+                                "observation-risk-assessment",
+                            )
+                        ),
+                    ),
+                )
+
+            report, monitoring_receipt = run_monitored_analysis(
+                analyze_exact_batch,
+                build_monitoring_repository(),
+                operation="live_t4_analysis",
+                symbol=symbol,
+                interval_minutes=interval_minutes,
+                as_of=plan.expected_at,
+                limit=args.limit,
+                trace_id=plan.trace_id,
+            )
+            if (
+                sealed_provider.calls != 1
+                or monitoring_receipt.trace_id != plan.trace_id
+                or monitoring_receipt.status != "completed"
+                or report.trace_id != plan.trace_id
+                or report.as_of != plan.expected_at
+                or report.metadata.get("t4_bridge_schema_version") != 5
+                or report.metadata.get("t4_environment") != "live_t4"
+                or report.metadata.get("plus500_t4_source_attested") is not True
+                or report.metadata.get("external_delivery_eligible") is not True
+                or report.metadata.get("provider_error_code") is not None
+            ):
+                raise RuntimeError("observation analysis linkage mismatch")
+            analysis_input_hash = report.metadata.get("input_fingerprint_sha256")
+            if (
+                not isinstance(analysis_input_hash, str)
+                or re.fullmatch(r"[0-9a-f]{64}", analysis_input_hash) is None
+                or report.data_snapshot_id != f"sha256:{analysis_input_hash}"
+            ):
+                raise RuntimeError("observation analysis input attestation mismatch")
+            metadata = batch.metadata
+            return ObservationCycleExecution(
+                t4_batch_id=ingestion.batch_id,
+                research_run_id=monitoring_receipt.research_run_id,
+                analysis_input_hash=analysis_input_hash,
+                bridge_schema_version=int(metadata["t4_bridge_schema_version"]),
+                raw_payload_hash=ingestion.payload_sha256,
+                bridge_rtt_milliseconds=int(bridge_rtt_milliseconds),
+                trace_id=plan.trace_id,
+                environment=str(metadata["t4_environment"]),
+                external_delivery_eligible=batch.external_delivery_eligible,
+                replay=metadata.get("t4_replay") is True,
+                synthetic=any(
+                    source.get("kind") == "synthetic_fixture"
+                    for source in batch.sources
+                ),
+            )
+
+        result = observation_repository.run_cycle(
+            args.campaign_id,
+            args.scope,
+            execute,
+        )
+        payload: dict[str, object] = {
+            "schema_version": 1,
+            "status": "recorded",
+            "campaign_id": result.campaign_id,
+            "scope": result.scope_key,
+            "sequence_no": result.sequence_no,
+            "expected_at": (
+                None if result.expected_at is None else result.expected_at.isoformat()
+            ),
+            "outcome": result.outcome,
+            "trace_id": result.trace_id,
+            "t4_batch_id": result.t4_batch_id,
+            "research_run_id": result.research_run_id,
+            "cycle_content_hash": result.content_hash,
+            "missed_cycles_recorded": result.missed_cycles_recorded,
+            "read_only": True,
+            "execution_enabled": False,
+        }
+        exit_code = 0 if result.outcome in {"success", "missed"} else 1
+    except Exception as exc:
+        from .observation import ObservationError
+
+        payload = {
+            "schema_version": 1,
+            "status": "error",
+            "error_code": (
+                exc.code
+                if isinstance(exc, ObservationError)
+                else "OBSERVATION_CYCLE_FAILED"
+            ),
+            "read_only": True,
+            "execution_enabled": False,
+        }
+        exit_code = 1
+    _print_observation_json(payload)
+    return exit_code
+
+
+def _parse_observation_scope(scope_key: object) -> tuple[str, int]:
+    if not isinstance(scope_key, str):
+        raise ValueError("invalid observation scope")
+    try:
+        symbol, interval_text = scope_key.rsplit(":", 1)
+        if not interval_text.endswith("m"):
+            raise ValueError
+        interval_minutes = int(interval_text[:-1])
+    except (TypeError, ValueError):
+        raise ValueError("invalid observation scope") from None
+    if symbol not in {"BTC/USD", "ETH/USD"} or interval_minutes not in {
+        240,
+        1440,
+        10080,
+    }:
+        raise ValueError("invalid observation scope")
+    return symbol, interval_minutes
+
+
+def _validate_live_observation_batch(batch: object) -> ProviderBatch:
+    if not isinstance(batch, ProviderBatch):
+        raise RuntimeError("live T4 preflight failed")
+    metadata = batch.metadata
+    payload = batch.raw_payload
+    payload_hash = batch.raw_payload_sha256
+    if (
+        metadata.get("t4_bridge_schema_version") != 5
+        or metadata.get("t4_environment") != "live_t4"
+        or metadata.get("t4_read_only_attested") is not True
+        or metadata.get("t4_order_routes_exposed") is not False
+        or metadata.get("t4_source_id") != Plus500T4Provider.source_id
+        or metadata.get("t4_venue_id") != Plus500T4Provider.venue_id
+        or metadata.get("t4_replay") is True
+        or tuple(source.get("id") for source in batch.sources)
+        != (Plus500T4Provider.source_id,)
+        or batch.external_delivery_eligible is not True
+        or not isinstance(payload, bytes)
+        or not isinstance(payload_hash, str)
+        or hashlib.sha256(payload).hexdigest() != payload_hash
+    ):
+        raise RuntimeError("live T4 preflight failed")
+    return batch
+
+
+def _run_observation_status_command(args: argparse.Namespace) -> int:
+    try:
+        repository = _observation_repository()
+        observed_until = _observation_database_now(repository)
+        report = repository.build_quality_report(
+            args.campaign_id,
+            observed_until=observed_until,
+        )
+        remaining_seconds = max(
+            0,
+            repository.policy.minimum_elapsed_seconds - report.elapsed_seconds,
+        )
+        payload: dict[str, object] = {
+            "schema_version": 1,
+            "status": "ok",
+            "campaign_id": report.campaign_id,
+            "observed_until": report.observed_until.isoformat(),
+            "elapsed_seconds": report.elapsed_seconds,
+            "remaining_seconds": remaining_seconds,
+            "overall_status": report.overall_status.value,
+            "v1_gate_passed": report.v1_gate_passed,
+            "final_report_eligible": remaining_seconds == 0,
+            "report_hash_sha256": report.report_hash_sha256,
+            "criteria": [criterion.as_payload() for criterion in report.criteria],
+            "read_only": True,
+            "execution_enabled": False,
+        }
+        exit_code = 0
+    except Exception:
+        payload = {
+            "schema_version": 1,
+            "status": "error",
+            "error_code": "OBSERVATION_STATUS_UNAVAILABLE",
+            "read_only": True,
+            "execution_enabled": False,
+        }
+        exit_code = 1
+    _print_observation_json(payload)
+    return exit_code
+
+
+def _run_observation_report_command(args: argparse.Namespace) -> int:
+    try:
+        repository = _observation_repository()
+        observed_until = _observation_database_now(repository)
+        report = repository.build_quality_report(
+            args.campaign_id,
+            observed_until=observed_until,
+        )
+        remaining_seconds = max(
+            0,
+            repository.policy.minimum_elapsed_seconds - report.elapsed_seconds,
+        )
+        if remaining_seconds:
+            payload: dict[str, object] = {
+                "schema_version": 1,
+                "status": "error",
+                "error_code": "OBSERVATION_WINDOW_INCOMPLETE",
+                "campaign_id": report.campaign_id,
+                "observed_until": report.observed_until.isoformat(),
+                "elapsed_seconds": report.elapsed_seconds,
+                "remaining_seconds": remaining_seconds,
+                "overall_status": report.overall_status.value,
+                "v1_gate_passed": False,
+                "read_only": True,
+                "execution_enabled": False,
+            }
+            exit_code = 1
+        else:
+            stored_hash = repository.store_final_report(report)
+            payload = {
+                "schema_version": 1,
+                "status": "stored",
+                "campaign_id": report.campaign_id,
+                "observed_until": report.observed_until.isoformat(),
+                "elapsed_seconds": report.elapsed_seconds,
+                "overall_status": report.overall_status.value,
+                "v1_gate_passed": report.v1_gate_passed,
+                "policy_id": report.policy_id,
+                "policy_hash_sha256": report.policy_hash_sha256,
+                "frozen_baseline_hash_sha256": (
+                    report.frozen_baseline_hash_sha256
+                ),
+                "report_hash_sha256": stored_hash,
+                "criteria": [
+                    criterion.as_payload() for criterion in report.criteria
+                ],
+                "read_only": True,
+                "execution_enabled": False,
+            }
+            exit_code = 0 if report.v1_gate_passed else 3
+    except Exception:
+        payload = {
+            "schema_version": 1,
+            "status": "error",
+            "error_code": "OBSERVATION_REPORT_FAILED",
+            "read_only": True,
+            "execution_enabled": False,
+        }
+        exit_code = 1
+    _print_observation_json(payload)
+    return exit_code
+
+
+def _print_observation_json(payload: dict[str, object]) -> None:
+    print(
+        json.dumps(
+            payload,
+            indent=2,
+            ensure_ascii=False,
+            sort_keys=True,
+            allow_nan=False,
+        )
+    )
 
 
 def _valid_poll_seconds(value: object, *, minimum: float) -> bool:

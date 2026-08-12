@@ -1,32 +1,57 @@
 # Plus500 Futures T4 Research Agent
 
-Wersja `0.7.0` analizuje wyłącznie dane futures z **Plus500 Futures / T4**.
-System działa tylko w trybie odczytu i może zwrócić `ALERT` albo `NO_SIGNAL`.
-Nie loguje się do innych platform i nie składa, nie zmienia ani nie anuluje zleceń.
+Wersja `0.8.0` przygotowuje punkt 8: oficjalny, wyłącznie odczytowy klient
+**Plus500 Futures / T4**, schema bridge `v5` oraz audytowalną kampanię odbiorową
+V1. System analizuje tylko dane futures i może zwrócić `ALERT` albo `NO_SIGNAL`.
+Nie składa, nie zmienia i nie anuluje zleceń.
 
-## Źródło danych
+To wydanie nie oznacza jeszcze odbioru V1. Provisioning oraz testy na prawdziwym
+Simulator/live nie zostały wykonane, a rzeczywista 28-dniowa obserwacja nie
+została rozpoczęta. W `0.8.0` `v1_gate_passed=false` jest dodatkowo wymuszane
+przez bazę do czasu późniejszej migracji, która doda weryfikowalne, obiektywne
+referencje dowodów dla obowiązkowych scenariuszy.
 
-Proces analityczny łączy się wyłącznie z lokalnym mostem T4 pod
-`http://127.0.0.1:8784`. Most .NET jest granicą dla docelowej sesji oficjalnego
-T4 API i wystawia wyłącznie dane rynkowe. Dane logowania T4 nigdy nie trafiają do
-procesu Python. Połączenie loopback wymaga dodatkowo wspólnego, losowego tokenu.
+## Oficjalne połączenie T4
 
-Oficjalny klient T4 nie jest jeszcze podłączony. Bieżący
-`T4ApplicationRegistrationPendingReader` zwraca `503`, więc próba analizy live
-kończy się bezpiecznym `NO_SIGNAL` i rejestracją lokalnego incydentu. Dane fixture
-używane w testach nie są danymi live i nie potwierdzają połączenia z T4 Simulator.
+Odizolowany worker .NET 8 korzysta z oficjalnych pakietów
+`Plus500US.T4Proto` `1.0.73` i `Plus500US.T4ChartDecoder` `1.0.97`; protokół jest
+przypięty do publicznego stanu T4
+`1a68b674482194f1cf3b9d7f129ce5fbed8bcb51`. Dane bieżące i snapshoty depth są
+odbierane przez T4 WebSocket/Protobuf, a binarna odpowiedź Chart REST jest
+dekodowana oficjalnym decoderem do zamkniętych świec. Worker nasłuchuje wyłącznie
+na `127.0.0.1`, wymaga osobnego tokenu i nie wystawia tras zleceń. Klucz API
+pozostaje tylko w procesie .NET.
 
-Obsługiwany zakres V1:
+Środowisko jest jawne i wybiera stałe oficjalne endpointy:
 
-- logiczny front-month Bitcoin futures: `BTC-FUTURES-FRONT`;
-- logiczny front-month Ether futures: `ETH-FUTURES-FRONT`;
-- interwały 4h, 1d i 1w;
-- minimum 120 świec oraz pełny snapshot order booka;
-- metryki wolumenu, spreadu, depth, imbalance, basis, annualized basis, expiry i
-  wpływu rollu;
-- jedna zatwierdzona proweniencja futures: `plus500_t4_futures_v1`;
-- jedyna zatwierdzona referencja basis: typ `index` ze źródła
-  `plus500_t4_index_v1`.
+- `T4_API_ENVIRONMENT=simulator` — `wss-sim.t4login.com` i
+  `api-sim.t4login.com`, envelope `t4_simulator`;
+- `T4_API_ENVIRONMENT=live` — `wss.t4login.com` i `api.t4login.com`, envelope
+  `live_t4`;
+- `T4_API_ENVIRONMENT=pending` — bez klucza, stan fail-closed `NOT_READY`.
+
+Simulator nie jest live i nigdy nie kwalifikuje alertu do zewnętrznego delivery.
+Standardowy publiczny dostęp Simulator trwa dwa tygodnie, więc sam nie wystarcza
+do obowiązkowej obserwacji co najmniej `672` godzin; potrzebne jest przedłużenie
+lub odpowiednio udostępnione środowisko live.
+
+## Kontrakt danych v5
+
+Schema `v5` rozdziela:
+
+- `ExchangeID` — giełdę;
+- `ContractID` — produkt;
+- `MarketID` — konkretną, handlowalną serię/expiry;
+- niezależne identyfikatory indeksu używanego do basis.
+
+`MarketID` jest nieprzezroczystym identyfikatorem T4: nie wolno go konstruować,
+parsować ani wyprowadzać z symbolu. Każda świeca zachowuje własny `MarketID`, co
+pozwala udowodnić zmianę serii w historii Chart REST. Basis wymaga niezależnego
+rynku indeksowego typu `index` ze źródła `plus500_t4_index_v1`; cena futures nie
+może go zastąpić.
+
+Parser i bridge nadal rozpoznają interwały 4h, 1d i 1w, ale zamrożony zakres
+odbioru live V1 w `0.8.0` obejmuje obecnie tylko 4h (`240` minut) dla BTC i ETH.
 
 ## Szybki test offline
 
@@ -34,108 +59,92 @@ Obsługiwany zakres V1:
 python -m venv .venv
 . .venv/bin/activate
 pip install -e .
-crypto-agent analyze --provider synthetic --symbol BTC/USD --interval 1440
+crypto-agent analyze --provider synthetic --symbol BTC/USD --interval 240
 ```
 
-Tryb `synthetic` służy wyłącznie testom i zawsze pozostaje diagnostyczny. Jego
-wyniki, podobnie jak replay i fixture, nigdy nie trafiają do delivery outboxa.
+Synthetic, fixture, replay i Simulator są diagnostyczne. Nie potwierdzają danych
+live i nigdy nie otwierają bramki V1.
 
-## Uruchomienie z T4
+## Uruchomienie T4
 
-1. Skopiuj `.env.example` do `.env`.
-2. Ustaw ten sam, losowy `T4_BRIDGE_TOKEN` w workerze i
-   `CRYPTO_AGENT_T4_BRIDGE_TOKEN` w procesie Python.
-3. Ustaw `T4_CONTRACT_CATALOG_PATH` na prywatną kopię katalogu opartą na
-   `configs/t4-contract-catalog.example.json` i wpisz rzeczywiste serie T4.
-4. Uruchom odizolowany worker T4 .NET na loopback `127.0.0.1:8784`.
-5. Ustaw `CRYPTO_AGENT_DATA_PROVIDER=t4`.
-6. Uruchom:
+1. Skopiuj `.env.example` do prywatnego `.env`.
+2. Ustaw losowy `T4_BRIDGE_TOKEN` w workerze oraz tę samą wartość jako
+   `CRYPTO_AGENT_T4_BRIDGE_TOKEN` w Pythonie.
+3. Przygotuj prywatny katalog schema `v2` na podstawie
+   `configs/t4-contract-catalog.example.json`. Wpisz rzeczywiste `ExchangeID`,
+   produktowe `ContractID`, nieprzezroczyste `MarketID` oraz niezależny rynek
+   indeksu dla każdej serii.
+4. Ustaw `T4_CONTRACT_CATALOG_PATH`, `T4_API_ENVIRONMENT` i prywatny `T4_API_KEY`.
+5. Uruchom worker:
 
 ```bash
-crypto-agent analyze --provider t4 --symbol BTC/USD --interval 1440
+dotnet run --project t4-bridge/CryptoAgent.T4Bridge.csproj
 ```
 
-Host bridge i kontrakt live schema v4 są zbudowane. Payload kwalifikowany jako
-live musi dodatkowo zawierać `environment=live_t4`. Do czasu zarejestrowania
-aplikacji T4 i podłączenia oficjalnego klienta polecenie bezpiecznie zwróci
-`NO_SIGNAL` z kodem `T4_BRIDGE_UNAVAILABLE`.
+6. Dopiero po stanie `READY` uruchom test odczytu:
 
-## PostgreSQL 16
+```bash
+crypto-agent analyze --provider t4 --symbol BTC/USD --interval 240
+```
+
+Provisioning klucza API, rzeczywiste identyfikatory rynków, uprawnienia depth oraz
+dostęp do niezależnego indeksu są zależnościami zewnętrznymi. Ich brak kończy się
+`503`/`NO_SIGNAL`, bez danych zastępczych.
+
+## PostgreSQL, monitoring i alerty
 
 ```bash
 docker compose up -d postgres
-crypto-agent db plan
 crypto-agent db migrate
 crypto-agent db seed
 crypto-agent db health
-```
 
-Prawidłowy wynik końcowy to `READY`. Migracje `0011` i `0012` są zachowane bez
-zmian jako historia wcześniejszego prototypu. Migracja `0013` ustanawia T4 jako
-jedyne operacyjne źródło, `0014` dodaje append-only ingest i point-in-time replay,
-`0015` utrwala futures evidence, a `0016` dodaje trwały, append-only outbox alertów
-i historię prób dostarczenia. Nowy seed nie zawiera konfiguracji innych platform.
-
-Po podłączeniu oficjalnego klienta T4 pojedynczy batch można zapisać poleceniem:
-
-```bash
-crypto-agent ingest --symbol BTC/USD --interval 1440
-```
-
-Tryb cykliczny dodaje `--watch --poll-seconds 300`. Replay nie łączy się z T4 i
-odtwarza wyłącznie dane dostępne w zadanym czasie:
-
-```bash
-crypto-agent replay --symbol BTC/USD --interval 1440 \
-  --as-of 2026-08-11T00:00:00+00:00
-```
-
-Deterministyczną analizę tego samego replayu uruchamia:
-
-```bash
-crypto-agent analyze-replay --symbol BTC/USD --interval 1440 \
-  --as-of 2026-08-11T00:00:00+00:00
-```
-
-Historyczne batche schema v2 i v3 pozostają odczytywalne przez replay. Schema v2
-nie zawiera pełnego futures evidence i dlatego analiza zawsze kończy się
-`NO_SIGNAL`; schema v3 zachowuje pełny evidence, ale jako dane replay nigdy nie
-kwalifikuje się do external delivery. Operacyjny alert live wymaga schema v4,
-`environment=live_t4` i jawnej atestacji kwalifikacji do delivery.
-
-## Monitoring i lokalne dostarczanie alertów
-
-Punkt 7 jest ukończony w zakresie offline. Cykliczny monitoring T4, lokalny
-dashboard, trace, deduplikowane incydenty oraz trwały delivery outbox uruchamiają:
-
-```bash
-crypto-agent monitor --symbol BTC/USD --interval 1440 --watch --poll-seconds 300
+crypto-agent ingest --symbol BTC/USD --interval 240
+crypto-agent monitor --symbol BTC/USD --interval 240 --watch --poll-seconds 300
 crypto-agent deliver-alerts --watch --poll-seconds 5
 crypto-agent monitoring-status
 ```
 
-Jedynym zatwierdzonym kanałem w `0.7.0` jest kanoniczny JSON zapisany do stdout
-(`stdout_json` → `process_stdout`). Komunikaty stanu workera delivery trafiają do
-stderr. Nie ma webhooków ani integracji Slack, Telegram, e-mail lub SMS.
-Dashboard i read-only API są dostępne wyłącznie na loopback; interfejs OpenAPI,
-Swagger i ReDoc są wyłączone. Szczegóły operacyjne opisuje
-[runbook monitoringu](docs/MONITORING_RUNBOOK.md).
+Migracja `0017` utrwala schema v5 oraz append-only kampanie, cykle, zdarzenia
+sesji i końcowe raporty odbiorowe. Jedyny kanał alertów to kanoniczny JSON
+`stdout_json` → `process_stdout`. Trwały outbox ma semantykę at-least-once;
+konsument musi deduplikować po `idempotency_key`. System nie deklaruje
+exactly-once.
 
-Outbox jest trwały, a zapis do stdout ma semantykę at-least-once. Konsument musi
-deduplikować rekordy po polu `idempotency_key`; system nie deklaruje exactly-once
-na granicy procesu.
+## Kampania obserwacyjna V1
 
-Analiza przez API zapisuje trace i dlatego jest dostępna wyłącznie jako
-`POST /v1/analyze` z wymaganym nagłówkiem
-`X-Crypto-Agent-Request: analyze-v1`. Wariant `GET /v1/analyze` nie istnieje.
+Po potwierdzonym teście live i zamrożeniu kodu, polityki oraz konfiguracji:
 
-Zapis run/artifact + alert + alert event + outbox jest atomowy w jednej transakcji
-PostgreSQL. Nie oznacza to transakcji rozproszonej z historycznym magazynem SQLite.
+```bash
+crypto-agent observe-start \
+  --code-commit-hash <sha256> \
+  --t4-protocol-commit-hash <sha256> \
+  --runtime-config-hash <sha256>
 
-`v1_gate_passed=false`. Następny etap to punkt 8: test live po otrzymaniu dostępu
-T4, minimum cztery tygodnie obserwacji read-only i raport jakości.
+crypto-agent observe-run --campaign-id <uuid> --scope BTC/USD:240m --limit 120
+crypto-agent observe-run --campaign-id <uuid> --scope ETH/USD:240m --limit 120
+crypto-agent observe-status --campaign-id <uuid>
+crypto-agent observe-report --campaign-id <uuid>
+```
 
-Szczegóły: [instrukcja uruchomienia](docs/INSTRUKCJA_URUCHOMIENIA.md),
+`observe-start` wykonuje live preflight schema v5 dla każdego scope’u, zanim
+utworzy kampanię. `observe-run` wybiera z PostgreSQL dokładnie jeden należny slot,
+pobiera batch T4 tylko raz, zapisuje go i podaje ten sam zamknięty obiekt do
+analizy. Retry przed następnym slotem nie pobiera danych; wygasłe sloty są
+zapisywane uczciwie jako `missed`, nigdy backfillowane sukcesem.
+
+Komendy obserwacyjne nie handlują i nie pozwalają podać historycznego czasu startu
+— używany jest zegar PostgreSQL. `observe-report` finalizuje kampanię dopiero po
+`planned_ends_at + cycle_interval_seconds`, czyli po dodatkowym okresie grace na
+zapis ostatniego slotu. W `0.8.0` wynik może być `FAIL` albo `NOT_OBSERVED`;
+schema celowo odrzuca `PASS` scenariusza i `v1_gate_passed=true`, dopóki późniejsza
+migracja nie doda obiektywnych referencji dowodów oraz ich walidacji w bazie.
+
+Pełna procedura: [runbook obserwacji](docs/T4_OBSERVATION_RUNBOOK.md).
+Pozostałe materiały: [instrukcja uruchomienia](docs/INSTRUKCJA_URUCHOMIENIA.md),
 [architektura](docs/ARCHITECTURE.md), [stan projektu](docs/CURRENT_STATUS.md).
 
-Oficjalne informacje o API: [Plus500 Futures T4 API](https://futures-technologies.plus500.com/api/).
+Oficjalne informacje: [Plus500 Futures T4 API](https://futures-technologies.plus500.com/api/),
+[T4 API tools](https://github.com/CTS-Futures/t4-api-tools/tree/1a68b674482194f1cf3b9d7f129ce5fbed8bcb51),
+[`Plus500US.T4Proto` 1.0.73](https://www.nuget.org/packages/Plus500US.T4Proto/1.0.73),
+[`Plus500US.T4ChartDecoder` 1.0.97](https://www.nuget.org/packages/Plus500US.T4ChartDecoder/1.0.97).

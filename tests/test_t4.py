@@ -41,6 +41,8 @@ class _Opener:
 
 def _payload() -> dict[str, object]:
     as_of = datetime(2026, 8, 11, tzinfo=UTC)
+    active_market_id = "MBT Sep26 (XCME)"
+    previous_market_id = "MBT Jun26 (XCME)"
     candles = []
     for index in range(120):
         close_time = as_of - timedelta(days=119 - index)
@@ -56,12 +58,15 @@ def _payload() -> dict[str, object]:
                 "close": 101.0 + index,
                 "volume": 1000.0 + index,
                 "source": "plus500_t4_futures_v1",
+                "market_id": (
+                    previous_market_id if index < 90 else active_market_id
+                ),
                 "available_at": close_time.isoformat(),
                 "ingested_at": as_of.isoformat(),
             }
         )
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "source_id": "plus500_t4_futures_v1",
         "venue_id": "plus500_t4",
         "read_only": True,
@@ -69,11 +74,13 @@ def _payload() -> dict[str, object]:
         "environment": "live_t4",
         "logical_symbol": "BTC/USD",
         "interval_minutes": 1440,
-        "contract_id": "CME:MBT:202609",
+        "exchange_id": "CME",
+        "contract_id": "MBT",
+        "market_id": active_market_id,
         "contract_expires_at": (as_of + timedelta(days=30)).isoformat(),
         "contract_roll_at": (as_of + timedelta(days=25)).isoformat(),
         "contract_selection": "front_month",
-        "rolled_from_contract_id": None,
+        "rolled_from_market_id": None,
         "volume_zscore": 3.5,
         "candles": candles,
         "reference_price": {
@@ -85,7 +92,9 @@ def _payload() -> dict[str, object]:
             "ingested_at": as_of.isoformat(),
         },
         "futures_evidence": {
-            "contract_id": "CME:MBT:202609",
+            "exchange_id": "CME",
+            "contract_id": "MBT",
+            "market_id": active_market_id,
             "source_id": "plus500_t4_futures_v1",
             "session_status": "OPEN",
             "is_full_snapshot": True,
@@ -102,6 +111,9 @@ def _payload() -> dict[str, object]:
             ],
             "basis_reference": {
                 "symbol": "BTC/USD",
+                "exchange_id": "CME",
+                "contract_id": "BTC-INDEX",
+                "market_id": "BTC Index (CME)",
                 "reference_type": "index",
                 "source": "plus500_t4_index_v1",
                 "price": 219.5,
@@ -147,6 +159,10 @@ class Plus500T4ProviderTests(unittest.TestCase):
         self.assertTrue(batch.metadata["t4_read_only_attested"])
         self.assertFalse(batch.metadata["t4_order_routes_exposed"])
         self.assertEqual(batch.metadata["t4_environment"], "live_t4")
+        self.assertEqual(batch.metadata["t4_exchange_id"], "CME")
+        self.assertEqual(batch.metadata["t4_contract_id"], "MBT")
+        self.assertEqual(batch.metadata["t4_market_id"], "MBT Sep26 (XCME)")
+        self.assertEqual(len(batch.metadata["t4_candle_market_ids"]), 120)
         self.assertTrue(batch.external_delivery_eligible)
         self.assertIsInstance(batch.raw_payload, bytes)
         self.assertEqual(
@@ -174,7 +190,7 @@ class Plus500T4ProviderTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.code, "T4_PAYLOAD_INVALID")
 
-    def test_non_live_environment_fails_closed(self) -> None:
+    def test_unknown_environment_fails_closed(self) -> None:
         payload = _payload()
         payload["environment"] = "fixture"
         with patch(
@@ -188,6 +204,22 @@ class Plus500T4ProviderTests(unittest.TestCase):
                 limit=120,
             )
         self.assertEqual(raised.exception.code, "T4_PAYLOAD_INVALID")
+
+    def test_simulator_is_accepted_but_never_delivery_eligible(self) -> None:
+        payload = _payload()
+        payload["environment"] = "t4_simulator"
+        with patch(
+            "crypto_agent.providers.t4.build_opener",
+            return_value=_Opener(payload),
+        ):
+            batch = Plus500T4Provider(bridge_token=_BRIDGE_TOKEN).fetch_batch(
+                symbol="BTC/USD",
+                interval_minutes=1440,
+                as_of=datetime(2026, 8, 11, tzinfo=UTC),
+                limit=120,
+            )
+        self.assertEqual(batch.metadata["t4_environment"], "t4_simulator")
+        self.assertFalse(batch.external_delivery_eligible)
 
     def test_unapproved_basis_source_fails_closed(self) -> None:
         payload = _payload()
@@ -209,7 +241,7 @@ class Plus500T4ProviderTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "T4_PAYLOAD_INVALID")
 
     def test_old_bridge_schema_fails_closed(self) -> None:
-        for schema_version in (1, 2, 3):
+        for schema_version in (1, 2, 3, 4):
             with self.subTest(schema_version=schema_version):
                 payload = _payload()
                 payload["schema_version"] = schema_version
@@ -272,15 +304,13 @@ class Plus500T4ProviderTests(unittest.TestCase):
 
     def test_controlled_roll_provenance_is_retained(self) -> None:
         payload = _payload()
-        payload["contract_id"] = "CME:MBT:202612"
         payload["contract_selection"] = "rolled"
-        payload["rolled_from_contract_id"] = "CME:MBT:202609"
+        payload["rolled_from_market_id"] = "MBT Jun26 (XCME)"
         evidence = payload["futures_evidence"]
         assert isinstance(evidence, dict)
-        evidence["contract_id"] = "CME:MBT:202612"
         evidence["contract_transition"] = {
-            "from_contract_id": "CME:MBT:202609",
-            "to_contract_id": "CME:MBT:202612",
+            "from_market_id": "MBT Jun26 (XCME)",
+            "to_market_id": "MBT Sep26 (XCME)",
             "price_type": "mid",
             "from_price": 219.8,
             "to_price": 220.0,
@@ -301,13 +331,43 @@ class Plus500T4ProviderTests(unittest.TestCase):
             )
         self.assertEqual(batch.metadata["t4_contract_selection"], "rolled")
         self.assertEqual(
-            batch.metadata["t4_rolled_from_contract_id"], "CME:MBT:202609"
+            batch.metadata["t4_rolled_from_market_id"], "MBT Jun26 (XCME)"
         )
 
     def test_forged_roll_provenance_fails_closed(self) -> None:
         payload = _payload()
         payload["contract_selection"] = "rolled"
-        payload["rolled_from_contract_id"] = payload["contract_id"]
+        payload["rolled_from_market_id"] = payload["market_id"]
+        with patch(
+            "crypto_agent.providers.t4.build_opener",
+            return_value=_Opener(payload),
+        ), self.assertRaises(ProviderError) as raised:
+            Plus500T4Provider(bridge_token=_BRIDGE_TOKEN).fetch_batch(
+                symbol="BTC/USD",
+                interval_minutes=1440,
+                as_of=datetime(2026, 8, 11, tzinfo=UTC),
+                limit=120,
+            )
+        self.assertEqual(raised.exception.code, "T4_PAYLOAD_INVALID")
+
+    def test_blank_market_id_fails_closed(self) -> None:
+        payload = _payload()
+        payload["market_id"] = "  "
+        with patch(
+            "crypto_agent.providers.t4.build_opener",
+            return_value=_Opener(payload),
+        ), self.assertRaises(ProviderError) as raised:
+            Plus500T4Provider(bridge_token=_BRIDGE_TOKEN).fetch_batch(
+                symbol="BTC/USD",
+                interval_minutes=1440,
+                as_of=datetime(2026, 8, 11, tzinfo=UTC),
+                limit=120,
+            )
+        self.assertEqual(raised.exception.code, "T4_PAYLOAD_INVALID")
+
+    def test_market_id_control_characters_fail_closed(self) -> None:
+        payload = _payload()
+        payload["market_id"] = "MBT\nSep26"
         with patch(
             "crypto_agent.providers.t4.build_opener",
             return_value=_Opener(payload),

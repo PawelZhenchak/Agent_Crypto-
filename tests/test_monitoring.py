@@ -106,7 +106,7 @@ def _report(
             "v1_gate_passed": False,
             "plus500_t4_source_attested": True,
             "external_delivery_eligible": True,
-            "t4_bridge_schema_version": 4,
+            "t4_bridge_schema_version": 5,
             "t4_environment": "live_t4",
             "futures_gate_passed": True,
             "futures_policy_id": "futures-analysis-v1-2026-08-12",
@@ -269,7 +269,7 @@ class MonitoringTests(unittest.TestCase):
             ),
             "legacy_schema_v3": replace(
                 live,
-                metadata={**live.metadata, "t4_bridge_schema_version": 3},
+                metadata={**live.metadata, "t4_bridge_schema_version": 4},
             ),
             "fixture_environment": replace(
                 live,

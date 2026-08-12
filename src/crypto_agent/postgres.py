@@ -357,6 +357,11 @@ _MIGRATED_TABLES = (
     "t4_contract_transition_evidence",
     "alert_delivery_outbox",
     "alert_delivery_attempts",
+    "t4_observation_campaigns",
+    "t4_observation_research_inputs",
+    "t4_observation_cycles",
+    "t4_observation_session_events",
+    "t4_observation_quality_reports",
 )
 _BASE_TRIGGER_FUNCTIONS = (
     "forbid_append_only_change",
@@ -376,6 +381,12 @@ _MIGRATED_TRIGGER_FUNCTIONS = (
     "enforce_v1_reference_price_provenance",
     "enforce_v1_reference_price_exact_provenance",
     "enforce_alert_delivery_attempt",
+    "enforce_t4_schema_v5_evidence",
+    "enforce_t4_observation_campaign_start",
+    "enforce_t4_observation_final_report",
+    "enforce_t4_observation_research_input",
+    "enforce_t4_observation_cycle_chain",
+    "enforce_t4_observation_event_chain",
 )
 
 
@@ -552,6 +563,48 @@ _MIGRATED_COLUMN_REQUIREMENTS = (
             type_name="text",
             not_null=False,
         ),
+        _ColumnRequirement(
+            table="t4_ingestion_batches",
+            name="environment",
+            type_name="text",
+            not_null=False,
+        ),
+        _ColumnRequirement(
+            table="t4_ingestion_batches",
+            name="exchange_id",
+            type_name="text",
+            not_null=False,
+        ),
+        _ColumnRequirement(
+            table="t4_ingestion_batches",
+            name="active_market_id",
+            type_name="text",
+            not_null=False,
+        ),
+        _ColumnRequirement(
+            table="t4_ingestion_batches",
+            name="rolled_from_market_id",
+            type_name="text",
+            not_null=False,
+        ),
+        _ColumnRequirement(
+            table="t4_ingestion_batches",
+            name="basis_exchange_id",
+            type_name="text",
+            not_null=False,
+        ),
+        _ColumnRequirement(
+            table="t4_ingestion_batches",
+            name="basis_contract_id",
+            type_name="text",
+            not_null=False,
+        ),
+        _ColumnRequirement(
+            table="t4_ingestion_batches",
+            name="basis_market_id",
+            type_name="text",
+            not_null=False,
+        ),
     )
     + _column_requirements(
         "t4_canonical_candles",
@@ -559,7 +612,7 @@ _MIGRATED_COLUMN_REQUIREMENTS = (
             ("t4_candle_id", "int8"),
             ("t4_batch_id", "int8"),
             ("source_id", "int8"),
-            ("market_id", "int8"),
+            ("registry_market_id", "int8"),
             ("logical_symbol", "text"),
             ("contract_id", "text"),
             ("interval_seconds", "int4"),
@@ -573,6 +626,14 @@ _MIGRATED_COLUMN_REQUIREMENTS = (
             ("available_at", "timestamptz"),
             ("provider_ingested_at", "timestamptz"),
             ("content_hash", "sha256_hex"),
+        ),
+    )
+    + (
+        _ColumnRequirement(
+            table="t4_canonical_candles",
+            name="market_id",
+            type_name="text",
+            not_null=False,
         ),
     )
     + _column_requirements(
@@ -598,6 +659,22 @@ _MIGRATED_COLUMN_REQUIREMENTS = (
             ("basis_ingested_at", "timestamptz"),
             ("content_hash", "sha256_hex"),
         ),
+    )
+    + tuple(
+        _ColumnRequirement(
+            table="t4_futures_snapshots",
+            name=name,
+            type_name="text",
+            not_null=False,
+        )
+        for name in (
+            "exchange_id",
+            "product_contract_id",
+            "active_market_id",
+            "basis_exchange_id",
+            "basis_product_contract_id",
+            "basis_market_id",
+        )
     )
     + _column_requirements(
         "t4_orderbook_levels",
@@ -629,6 +706,20 @@ _MIGRATED_COLUMN_REQUIREMENTS = (
             ("provider_ingested_at", "timestamptz"),
             ("content_hash", "sha256_hex"),
         ),
+    )
+    + tuple(
+        _ColumnRequirement(
+            table="t4_contract_transition_evidence",
+            name=name,
+            type_name="text",
+            not_null=False,
+        )
+        for name in (
+            "exchange_id",
+            "product_contract_id",
+            "from_market_id",
+            "to_market_id",
+        )
     )
     + _column_requirements(
         "alert_delivery_outbox",
@@ -682,6 +773,128 @@ _MIGRATED_COLUMN_REQUIREMENTS = (
             name="previous_attempt_hash",
             type_name="sha256_hex",
             not_null=False,
+        ),
+    )
+    + _column_requirements(
+        "t4_observation_campaigns",
+        (
+            ("campaign_id", "uuid"),
+            ("environment", "text"),
+            ("started_at", "timestamptz"),
+            ("planned_ends_at", "timestamptz"),
+            ("cycle_interval_seconds", "int4"),
+            ("observation_policy_id", "text"),
+            ("observation_policy_hash", "sha256_hex"),
+            ("code_commit_hash", "sha256_hex"),
+            ("t4_protocol_commit_hash", "sha256_hex"),
+            ("runtime_config_hash", "sha256_hex"),
+            ("scope_manifest", "jsonb"),
+            ("scope_manifest_hash", "sha256_hex"),
+            ("frozen_baseline_hash", "sha256_hex"),
+            ("read_only", "bool"),
+            ("execution_enabled", "bool"),
+            ("content_hash", "sha256_hex"),
+            ("created_at", "timestamptz"),
+        ),
+    )
+    + _column_requirements(
+        "t4_observation_research_inputs",
+        (
+            ("observation_research_input_id", "int8"),
+            ("campaign_id", "uuid"),
+            ("scope_key", "text"),
+            ("sequence_no", "int4"),
+            ("expected_at", "timestamptz"),
+            ("t4_batch_id", "int8"),
+            ("research_run_id", "int8"),
+            ("raw_payload_hash", "sha256_hex"),
+            ("analysis_input_hash", "sha256_hex"),
+            ("trace_id", "uuid"),
+            ("content_hash", "sha256_hex"),
+            ("created_at", "timestamptz"),
+        ),
+    )
+    + _column_requirements(
+        "t4_observation_cycles",
+        (
+            ("observation_cycle_id", "int8"),
+            ("campaign_id", "uuid"),
+            ("scope_key", "text"),
+            ("sequence_no", "int4"),
+            ("expected_at", "timestamptz"),
+            ("outcome", "text"),
+            ("read_only", "bool"),
+            ("execution_enabled", "bool"),
+            ("content_hash", "sha256_hex"),
+            ("created_at", "timestamptz"),
+        ),
+    )
+    + tuple(
+        _ColumnRequirement(
+            table="t4_observation_cycles",
+            name=name,
+            type_name=type_name,
+            not_null=False,
+        )
+        for name, type_name in (
+            ("started_at", "timestamptz"),
+            ("finished_at", "timestamptz"),
+            ("error_code", "text"),
+            ("gap_explanation_code", "text"),
+            ("t4_batch_id", "int8"),
+            ("research_run_id", "int8"),
+            ("analysis_input_hash", "sha256_hex"),
+            ("bridge_schema_version", "int2"),
+            ("raw_payload_hash", "sha256_hex"),
+            ("bridge_rtt_milliseconds", "int4"),
+            ("trace_id", "uuid"),
+            ("previous_cycle_hash", "sha256_hex"),
+        )
+    )
+    + _column_requirements(
+        "t4_observation_session_events",
+        (
+            ("observation_session_event_id", "int8"),
+            ("campaign_id", "uuid"),
+            ("sequence_no", "int4"),
+            ("event_at", "timestamptz"),
+            ("event_type", "text"),
+            ("outcome", "text"),
+            ("read_only", "bool"),
+            ("execution_enabled", "bool"),
+            ("content_hash", "sha256_hex"),
+            ("created_at", "timestamptz"),
+        ),
+    )
+    + tuple(
+        _ColumnRequirement(
+            table="t4_observation_session_events",
+            name=name,
+            type_name=type_name,
+            not_null=False,
+        )
+        for name, type_name in (
+            ("scenario_code", "text"),
+            ("detail_code", "text"),
+            ("previous_event_hash", "sha256_hex"),
+        )
+    )
+    + _column_requirements(
+        "t4_observation_quality_reports",
+        (
+            ("observation_quality_report_id", "int8"),
+            ("campaign_id", "uuid"),
+            ("generated_at", "timestamptz"),
+            ("observed_until", "timestamptz"),
+            ("overall_status", "text"),
+            ("v1_gate_passed", "bool"),
+            ("observation_policy_id", "text"),
+            ("observation_policy_hash", "sha256_hex"),
+            ("frozen_baseline_hash", "sha256_hex"),
+            ("report", "jsonb"),
+            ("report_hash", "sha256_hex"),
+            ("content_hash", "sha256_hex"),
+            ("created_at", "timestamptz"),
         ),
     )
 )
@@ -820,13 +1033,68 @@ _MIGRATED_TRIGGER_REQUIREMENTS = _append_only_trigger_requirements(_MIGRATED_TAB
         "enforce_alert_delivery_attempt",
         1 | 2 | 4,
     ),
+    _TriggerRequirement(
+        "t4_canonical_candles_schema_v5_guard",
+        "t4_canonical_candles",
+        "enforce_t4_schema_v5_evidence",
+        1 | 2 | 4,
+    ),
+    _TriggerRequirement(
+        "t4_futures_snapshots_schema_v5_guard",
+        "t4_futures_snapshots",
+        "enforce_t4_schema_v5_evidence",
+        1 | 2 | 4,
+    ),
+    _TriggerRequirement(
+        "t4_contract_transitions_schema_v5_guard",
+        "t4_contract_transition_evidence",
+        "enforce_t4_schema_v5_evidence",
+        1 | 2 | 4,
+    ),
+    _TriggerRequirement(
+        "t4_observation_campaign_start_guard",
+        "t4_observation_campaigns",
+        "enforce_t4_observation_campaign_start",
+        1 | 2 | 4,
+    ),
+    _TriggerRequirement(
+        "t4_observation_research_input_guard",
+        "t4_observation_research_inputs",
+        "enforce_t4_observation_research_input",
+        1 | 2 | 4,
+    ),
+    _TriggerRequirement(
+        "t4_observation_cycle_chain_guard",
+        "t4_observation_cycles",
+        "enforce_t4_observation_cycle_chain",
+        1 | 2 | 4,
+    ),
+    _TriggerRequirement(
+        "t4_observation_event_chain_guard",
+        "t4_observation_session_events",
+        "enforce_t4_observation_event_chain",
+        1 | 2 | 4,
+    ),
+    _TriggerRequirement(
+        "t4_observation_final_report_guard",
+        "t4_observation_quality_reports",
+        "enforce_t4_observation_final_report",
+        1 | 2 | 4,
+    ),
 )
 _OPERATIONAL_CONSTRAINT_REQUIREMENTS = (
     _CatalogDefinitionRequirement(
         "t4_ingestion_batches",
         "t4_ingestion_batches_bridge_schema_version_check",
         "c",
-        "CHECK ((bridge_schema_version = ANY (ARRAY[2, 3, 4])))",
+        "CHECK ((bridge_schema_version = ANY (ARRAY[2, 3, 4, 5])))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_contract_transition_evidence",
+        "t4_contract_transition_batch_fk",
+        "f",
+        "FOREIGN KEY (t4_batch_id) REFERENCES "
+        "crypto_agent.t4_ingestion_batches(t4_batch_id)",
     ),
     _CatalogDefinitionRequirement(
         "alert_delivery_outbox",
@@ -1080,8 +1348,224 @@ _OPERATIONAL_CONSTRAINT_REQUIREMENTS = (
         "CHECK ((((attempt_no = 1) AND (previous_attempt_hash IS NULL)) "
         "OR ((attempt_no > 1) AND (previous_attempt_hash IS NOT NULL))))",
     ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_campaigns",
+        "t4_observation_campaigns_pkey",
+        "p",
+        "PRIMARY KEY (campaign_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_campaigns",
+        "t4_observation_campaigns_frozen_baseline_hash_key",
+        "u",
+        "UNIQUE (frozen_baseline_hash)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_campaigns",
+        "t4_observation_campaigns_content_hash_key",
+        "u",
+        "UNIQUE (content_hash)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_research_inputs",
+        "t4_observation_research_inputs_pkey",
+        "p",
+        "PRIMARY KEY (observation_research_input_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_research_inputs",
+        "t4_observation_research_inputs_campaign_id_fkey",
+        "f",
+        "FOREIGN KEY (campaign_id) REFERENCES "
+        "crypto_agent.t4_observation_campaigns(campaign_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_research_inputs",
+        "t4_observation_research_inputs_t4_batch_id_fkey",
+        "f",
+        "FOREIGN KEY (t4_batch_id) REFERENCES "
+        "crypto_agent.t4_ingestion_batches(t4_batch_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_research_inputs",
+        "t4_observation_research_inputs_research_run_id_fkey",
+        "f",
+        "FOREIGN KEY (research_run_id) REFERENCES "
+        "crypto_agent.research_runs(research_run_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_research_inputs",
+        "t4_observation_research_input_campaign_id_scope_key_sequenc_key",
+        "u",
+        "UNIQUE (campaign_id, scope_key, sequence_no)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_research_inputs",
+        "t4_observation_research_input_campaign_id_scope_key_sequen_key1",
+        "u",
+        "UNIQUE (campaign_id, scope_key, sequence_no, expected_at, t4_batch_id, "
+        "research_run_id, raw_payload_hash, analysis_input_hash, trace_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_research_inputs",
+        "t4_observation_research_inputs_t4_batch_id_key",
+        "u",
+        "UNIQUE (t4_batch_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_research_inputs",
+        "t4_observation_research_inputs_research_run_id_key",
+        "u",
+        "UNIQUE (research_run_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_research_inputs",
+        "t4_observation_research_inputs_trace_id_key",
+        "u",
+        "UNIQUE (trace_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_research_inputs",
+        "t4_observation_research_inputs_content_hash_key",
+        "u",
+        "UNIQUE (content_hash)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_research_inputs",
+        "t4_observation_research_inputs_sequence_no_check",
+        "c",
+        "CHECK ((sequence_no > 0))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_research_inputs",
+        "t4_observation_research_inputs_scope_key_check",
+        "c",
+        "CHECK (((btrim(scope_key) <> ''::text) AND (length(scope_key) <= 256)))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_cycles",
+        "t4_observation_cycles_pkey",
+        "p",
+        "PRIMARY KEY (observation_cycle_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_cycles",
+        "t4_observation_cycles_campaign_id_fkey",
+        "f",
+        "FOREIGN KEY (campaign_id) REFERENCES "
+        "crypto_agent.t4_observation_campaigns(campaign_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_cycles",
+        "t4_observation_cycles_t4_batch_id_fkey",
+        "f",
+        "FOREIGN KEY (t4_batch_id) REFERENCES "
+        "crypto_agent.t4_ingestion_batches(t4_batch_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_cycles",
+        "t4_observation_cycles_research_run_id_fkey",
+        "f",
+        "FOREIGN KEY (research_run_id) REFERENCES "
+        "crypto_agent.research_runs(research_run_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_cycles",
+        "t4_observation_cycles_campaign_id_scope_key_sequence_no_ex_fkey",
+        "f",
+        "FOREIGN KEY (campaign_id, scope_key, sequence_no, expected_at, "
+        "t4_batch_id, research_run_id, raw_payload_hash, analysis_input_hash, "
+        "trace_id) REFERENCES crypto_agent.t4_observation_research_inputs"
+        "(campaign_id, scope_key, sequence_no, expected_at, t4_batch_id, "
+        "research_run_id, raw_payload_hash, analysis_input_hash, trace_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_cycles",
+        "t4_observation_cycles_campaign_id_scope_key_sequence_no_key",
+        "u",
+        "UNIQUE (campaign_id, scope_key, sequence_no)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_cycles",
+        "t4_observation_cycles_content_hash_key",
+        "u",
+        "UNIQUE (content_hash)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_session_events",
+        "t4_observation_session_events_pkey",
+        "p",
+        "PRIMARY KEY (observation_session_event_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_session_events",
+        "t4_observation_session_events_campaign_id_fkey",
+        "f",
+        "FOREIGN KEY (campaign_id) REFERENCES "
+        "crypto_agent.t4_observation_campaigns(campaign_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_session_events",
+        "t4_observation_session_events_campaign_id_sequence_no_key",
+        "u",
+        "UNIQUE (campaign_id, sequence_no)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_session_events",
+        "t4_observation_session_events_content_hash_key",
+        "u",
+        "UNIQUE (content_hash)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_quality_reports",
+        "t4_observation_quality_reports_pkey",
+        "p",
+        "PRIMARY KEY (observation_quality_report_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_quality_reports",
+        "t4_observation_quality_reports_campaign_id_key",
+        "u",
+        "UNIQUE (campaign_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_quality_reports",
+        "t4_observation_quality_reports_campaign_id_fkey",
+        "f",
+        "FOREIGN KEY (campaign_id) REFERENCES "
+        "crypto_agent.t4_observation_campaigns(campaign_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_quality_reports",
+        "t4_observation_quality_reports_report_hash_key",
+        "u",
+        "UNIQUE (report_hash)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_quality_reports",
+        "t4_observation_quality_reports_content_hash_key",
+        "u",
+        "UNIQUE (content_hash)",
+    ),
 )
 _OPERATIONAL_INDEX_REQUIREMENTS = (
+    _IndexRequirement(
+        "t4_ingestion_batches",
+        "t4_ingestion_batches_t4_identity_idx",
+        False,
+        "CREATE INDEX t4_ingestion_batches_t4_identity_idx ON "
+        "crypto_agent.t4_ingestion_batches USING btree "
+        "(environment, exchange_id, contract_id, active_market_id, available_at DESC) "
+        "WHERE (bridge_schema_version = 5)",
+    ),
+    _IndexRequirement(
+        "t4_canonical_candles",
+        "t4_canonical_candles_market_id_idx",
+        False,
+        "CREATE INDEX t4_canonical_candles_market_id_idx ON "
+        "crypto_agent.t4_canonical_candles USING btree (market_id, open_time DESC) "
+        "WHERE (market_id IS NOT NULL)",
+    ),
     _IndexRequirement(
         "alert_delivery_outbox",
         "alert_delivery_outbox_due_idx",
@@ -1107,6 +1591,38 @@ _OPERATIONAL_INDEX_REQUIREMENTS = (
         "(outcome, finished_at DESC) WHERE (outcome = ANY "
         "(ARRAY['delivered'::text, 'permanent_failure'::text, 'expired'::text]))",
     ),
+    _IndexRequirement(
+        "t4_observation_cycles",
+        "t4_observation_cycles_campaign_time_idx",
+        False,
+        "CREATE INDEX t4_observation_cycles_campaign_time_idx ON "
+        "crypto_agent.t4_observation_cycles USING btree "
+        "(campaign_id, expected_at, scope_key)",
+    ),
+    _IndexRequirement(
+        "t4_observation_research_inputs",
+        "t4_observation_research_inputs_campaign_time_idx",
+        False,
+        "CREATE INDEX t4_observation_research_inputs_campaign_time_idx ON "
+        "crypto_agent.t4_observation_research_inputs USING btree "
+        "(campaign_id, expected_at, scope_key)",
+    ),
+    _IndexRequirement(
+        "t4_observation_session_events",
+        "t4_observation_session_events_campaign_time_idx",
+        False,
+        "CREATE INDEX t4_observation_session_events_campaign_time_idx ON "
+        "crypto_agent.t4_observation_session_events USING btree "
+        "(campaign_id, event_at)",
+    ),
+    _IndexRequirement(
+        "t4_observation_session_events",
+        "t4_observation_session_events_scenario_idx",
+        False,
+        "CREATE INDEX t4_observation_session_events_scenario_idx ON "
+        "crypto_agent.t4_observation_session_events USING btree "
+        "(campaign_id, scenario_code, outcome) WHERE (scenario_code IS NOT NULL)",
+    ),
 )
 _OPERATIONAL_FUNCTION_REQUIREMENTS = (
     _FunctionDefinitionRequirement(
@@ -1115,6 +1631,48 @@ _OPERATIONAL_FUNCTION_REQUIREMENTS = (
         "v",
         False,
         "fa988543f76637d631a84a1548437802bb728c672364bb088aac37d8a65c1f29",
+    ),
+    _FunctionDefinitionRequirement(
+        "enforce_t4_schema_v5_evidence",
+        "plpgsql",
+        "v",
+        False,
+        "00d9d278d82c2284c003ccd8520d68427d27026ac726617206fbb239cd310027",
+    ),
+    _FunctionDefinitionRequirement(
+        "enforce_t4_observation_campaign_start",
+        "plpgsql",
+        "v",
+        False,
+        "2a8055eac4af2d433b146a397ad197f60e765f8c603e9599680e92ad8d06694d",
+    ),
+    _FunctionDefinitionRequirement(
+        "enforce_t4_observation_final_report",
+        "plpgsql",
+        "v",
+        False,
+        "4f0ef6c8f11caa6a7c9bda559eda5d81a9c83391ee368d918310e4ce9938ef23",
+    ),
+    _FunctionDefinitionRequirement(
+        "enforce_t4_observation_research_input",
+        "plpgsql",
+        "v",
+        False,
+        "c3388c439f8fb42d66285b448e71e3997240a5ae63494c5bf092d504e91a8c44",
+    ),
+    _FunctionDefinitionRequirement(
+        "enforce_t4_observation_cycle_chain",
+        "plpgsql",
+        "v",
+        False,
+        "20a6bca7d7ab616fda6000b16e32489fe52f022cf069871a1f0affccdd5523b9",
+    ),
+    _FunctionDefinitionRequirement(
+        "enforce_t4_observation_event_chain",
+        "plpgsql",
+        "v",
+        False,
+        "f4a241187fed453d8a791fb857c907e5b7a90a9acfeeb6a96dd65f921cf2966c",
     ),
 )
 _EXPECTED_BINDINGS = (

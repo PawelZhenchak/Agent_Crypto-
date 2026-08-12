@@ -22,8 +22,9 @@
 1. Trace ID tworzony przed analizą i bezpieczny zapis runu, eventów oraz artifactu.
 2. Fail-closed provider error i timeout z lokalnym, deduplikowanym incident logiem;
    brak surowych wyjątków, credentials, URL i nagłówków w projekcjach.
-3. Jednoznaczna kwalifikacja delivery: tylko aktualny live T4 `ALERT` po risk gate,
-   z bridge schema v4 i `environment=live_t4`.
+3. Jednoznaczna kwalifikacja delivery: tylko aktualny live T4 `ALERT` po risk
+   gate; historyczne kryterium schema v4 zostało zaostrzone do schema v5 w
+   `0.8.0`, nadal wyłącznie z `environment=live_t4`.
 4. Negatywne przypadki `NO_SIGNAL`, veto, stale, synthetic, fixture, replay,
    provider error i expiry nigdy nie tworzą dostawy.
 5. Migracja `0016`, atomowy PostgreSQL run/artifact + alert + event + outbox,
@@ -44,12 +45,43 @@ Simulator ani realnego dostarczenia live.
 
 ## Pozostałe przed Gate V1 — punkt 8
 
-1. Rejestracja aplikacji i podłączenie oficjalnego klienta T4; obecny reader
-   pending zwraca `503`.
-2. Live contract test schema v4 z `environment=live_t4` na T4 Simulator.
-3. Test sesji, reconnectu, limitów, opóźnień i braków danych live.
-4. Weryfikacja spread/depth/basis/roll na rzeczywistych danych T4.
-5. Walidacja trace, incydentów i lokalnego stdout delivery w realnym cyklu live.
-6. Minimum cztery tygodnie obserwacji read-only oraz raport jakości przed Gate V1.
+### Przygotowane w 0.8.0
 
-Do ukończenia powyższych kroków `v1_gate_passed=false`.
+1. Oficjalny reader `Plus500US.T4Proto` 1.0.73 i
+   `Plus500US.T4ChartDecoder` 1.0.97, publiczny protocol commit
+   `1a68b674482194f1cf3b9d7f129ce5fbed8bcb51`, WebSocket/Protobuf i Chart REST.
+2. Rozdzielone, stałe endpointy Simulator/live, reconnect, resubscribe, heartbeat,
+   timeout oraz prewarm cache fail-closed.
+3. Schema v5 z `ExchangeID`, produktowym `ContractID`, nieprzezroczystym
+   `MarketID` per świeca i niezależną tożsamością indeksu basis.
+4. Outbound allowlist bez order routes i bezwarunkowe wykluczenie Simulatora z
+   external delivery.
+5. Migracja `0017`, zamrożony baseline, append-only cykle/zdarzenia, blokada
+   backfillu i niezmienny raport końcowy.
+6. Polityka 672 godzin z progami pokrycia, sukcesu, luk i RTT, naruszeniami
+   read-only oraz obowiązkowymi scenariuszami.
+7. Komendy `observe-start`, `observe-run`, `observe-status`, `observe-report`;
+   live preflight przed startem, pojedynczy fetch powiązany z ingestem i analizą
+   w należnym slocie oraz brak finalizacji raportu przed
+   `planned_ends_at + cycle_interval_seconds`.
+
+### Nadal wymagane na rzeczywistym T4
+
+1. Provisioning `T4_API_KEY`, prawidłowych identyfikatorów rynków oraz uprawnień
+   depth i niezależnego indeksu.
+2. Contract test schema v5 najpierw na `t4_simulator`, potem osobno na
+   `live_t4`. Simulator nie zalicza live delivery.
+3. Test sesji, reconnectu, limitów, opóźnień, braków danych i rollu na
+   przydzielonym koncie.
+4. Weryfikacja spread/depth/basis na rzeczywistych danych i kontrolowane wykonanie
+   wszystkich obowiązkowych scenariuszy.
+5. Operacyjne uruchomienie i nadzór `observe-run` dla obu scope’ów przez całe
+   zamrożone okno.
+6. Minimum 672 godziny obserwacji czasu rzeczywistego dla zamrożonego scope’u
+   BTC/ETH 4h. Publiczny dwutygodniowy Simulator jest niewystarczający.
+7. Zapis końcowego raportu i komplet obowiązkowych kryteriów `PASS`.
+
+Provisioning, rzeczywiste testy Simulator/live i kampania nie zostały wykonane.
+Ponadto schema `0.8.0` blokuje scenariusz `PASS` i `v1_gate_passed=true`, dopóki
+późniejsza migracja nie doda obiektywnych referencji dowodów scenariuszy oraz ich
+walidacji w PostgreSQL.

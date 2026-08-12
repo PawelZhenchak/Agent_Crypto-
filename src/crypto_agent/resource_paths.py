@@ -36,6 +36,16 @@ def default_monitoring_policy_path() -> Path:
     )
 
 
+def default_observation_policy_path() -> Path:
+    """Locate the frozen 28-day live-T4 observation policy."""
+
+    return _first_existing(
+        _PACKAGE_DIRECTORY / "resources" / "configs" / "observation_policy.v1.json",
+        _SOURCE_PROJECT_DIRECTORY / "configs" / "observation_policy.v1.json",
+        description="packaged T4 observation policy",
+    )
+
+
 def default_migration_directory() -> Path:
     """Locate checksummed migrations without depending on the process cwd."""
 

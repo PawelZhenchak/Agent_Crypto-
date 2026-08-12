@@ -2,7 +2,7 @@ namespace CryptoAgent.T4Bridge;
 
 public static class RequestValidator
 {
-    private static readonly HashSet<int> AllowedIntervals = [240, 1440, 10080];
+    private static readonly HashSet<int> LegacyIntervals = [240, 1440, 10080];
 
     public static MarketDataRequest Validate(
         BridgeOptions options,
@@ -11,7 +11,10 @@ public static class RequestValidator
         DateTimeOffset asOf,
         int limit)
     {
-        if (!AllowedIntervals.Contains(intervalMinutes) || limit is < 60 or > 720 ||
+        var intervalAllowed = options.Api.IsConfigured
+            ? intervalMinutes == 240
+            : LegacyIntervals.Contains(intervalMinutes);
+        if (!intervalAllowed || limit is < 60 or > 720 ||
             asOf.Offset != TimeSpan.Zero || asOf > DateTimeOffset.UtcNow.AddSeconds(30))
         {
             throw new ArgumentException("The market-data request is outside the approved policy.");
@@ -22,10 +25,15 @@ public static class RequestValidator
 
         return new MarketDataRequest(
             symbol,
+            contract.ExchangeId,
             contract.ContractId,
+            contract.MarketId,
             contract.ExpiresAt,
             contract.RollAt,
-            selection.RolledFromContractId,
+            selection.RolledFromMarketId,
+            contract.BasisExchangeId,
+            contract.BasisContractId,
+            contract.BasisMarketId,
             intervalMinutes,
             asOf,
             limit);

@@ -1,45 +1,69 @@
-using System.Text.RegularExpressions;
-
 namespace CryptoAgent.T4Bridge;
 
 public sealed record FuturesContract(
     string LogicalSymbol,
+    string ExchangeId,
     string ContractId,
+    string MarketId,
     DateTimeOffset ExpiresAt,
-    DateTimeOffset RollAt);
+    DateTimeOffset RollAt,
+    string BasisExchangeId,
+    string BasisContractId,
+    string BasisMarketId)
+{
+    public FuturesContract(
+        string logicalSymbol,
+        string contractId,
+        DateTimeOffset expiresAt,
+        DateTimeOffset rollAt)
+        : this(logicalSymbol, string.Empty, contractId, string.Empty, expiresAt, rollAt,
+            string.Empty, string.Empty, string.Empty)
+    {
+    }
+
+    public bool IsOfficiallyAddressable =>
+        ExchangeId.Length > 0 && MarketId.Length > 0 &&
+        BasisExchangeId.Length > 0 && BasisContractId.Length > 0 && BasisMarketId.Length > 0;
+}
 
 public sealed record ContractSelection(
     FuturesContract Contract,
-    string? RolledFromContractId)
+    string? RolledFromMarketId)
 {
-    public bool IsRolled => RolledFromContractId is not null;
+    public bool IsRolled => RolledFromMarketId is not null;
 }
 
 public sealed class FuturesContractCatalog
 {
     private static readonly TimeSpan MinimumRollLead = TimeSpan.FromHours(1);
     private static readonly TimeSpan MaximumRollLead = TimeSpan.FromDays(30);
-    private static readonly Regex ContractIdPattern = new(
-        "^[A-Za-z0-9][A-Za-z0-9._:/-]{2,127}$",
-        RegexOptions.CultureInvariant | RegexOptions.NonBacktracking);
+    private static readonly TimeSpan TransitionEvidenceWindow = TimeSpan.FromHours(24);
 
     private readonly IReadOnlyDictionary<string, IReadOnlyList<FuturesContract>> _contracts;
+
+    public IReadOnlyList<FuturesContract> Contracts { get; }
+
+    public bool IsOfficiallyAddressable =>
+        Contracts.Count > 0 && Contracts.All(item => item.IsOfficiallyAddressable);
 
     public FuturesContractCatalog(IEnumerable<FuturesContract> contracts)
     {
         ArgumentNullException.ThrowIfNull(contracts);
         var materialized = contracts.ToArray();
+        Contracts = materialized;
         foreach (var contract in materialized)
         {
             Validate(contract);
         }
 
         var duplicateId = materialized
-            .GroupBy(item => item.ContractId, StringComparer.Ordinal)
+            .GroupBy(item => item.IsOfficiallyAddressable
+                ? $"{item.ExchangeId}\n{item.MarketId}"
+                : $"legacy\n{item.ContractId}", StringComparer.Ordinal)
             .FirstOrDefault(group => group.Count() > 1);
         if (duplicateId is not null)
         {
-            throw new InvalidOperationException($"Duplicate T4 contract ID: {duplicateId.Key}.");
+            throw new InvalidOperationException("Duplicate T4 exchange/market identity.");
         }
 
         var duplicateExpiry = materialized
@@ -62,6 +86,16 @@ public sealed class FuturesContractCatalog
 
         foreach (var series in _contracts.Values)
         {
+            if (series.All(item => item.IsOfficiallyAddressable) &&
+                series.Select(item => (item.ExchangeId, item.ContractId,
+                    item.BasisExchangeId, item.BasisContractId))
+                .Distinct()
+                .Skip(1)
+                .Any())
+            {
+                throw new InvalidOperationException(
+                    "T4 product and basis identities must remain stable across expiries.");
+            }
             for (var index = 1; index < series.Count; index++)
             {
                 if (series[index].RollAt <= series[index - 1].RollAt)
@@ -103,7 +137,18 @@ public sealed class FuturesContractCatalog
                 "No safe front-month T4 contract is available for the requested time.");
         }
 
-        var previous = selectedIndex > 0 ? contracts[selectedIndex - 1].ContractId : null;
+        string? previous = null;
+        if (selectedIndex > 0)
+        {
+            var transitionAt = contracts[selectedIndex - 1].RollAt;
+            if (asOf >= transitionAt && asOf - transitionAt <= TransitionEvidenceWindow)
+            {
+                var previousContract = contracts[selectedIndex - 1];
+                previous = previousContract.MarketId.Length > 0
+                    ? previousContract.MarketId
+                    : previousContract.ContractId;
+            }
+        }
         return new ContractSelection(contracts[selectedIndex], previous);
     }
 
@@ -114,9 +159,28 @@ public sealed class FuturesContractCatalog
             throw new InvalidOperationException("The T4 logical symbol is not approved.");
         }
 
-        if (!ContractIdPattern.IsMatch(contract.ContractId))
+        if (!ValidOpaqueId(contract.ContractId, 128) ||
+            !ValidOptionalOpaqueId(contract.ExchangeId, 64) ||
+            !ValidOptionalOpaqueId(contract.MarketId, 256) ||
+            !ValidOptionalOpaqueId(contract.BasisExchangeId, 64) ||
+            !ValidOptionalOpaqueId(contract.BasisContractId, 128) ||
+            !ValidOptionalOpaqueId(contract.BasisMarketId, 256))
         {
-            throw new InvalidOperationException("The T4 contract ID has an invalid format.");
+            throw new InvalidOperationException("A T4 catalog identifier has an invalid format.");
+        }
+        if ((contract.ExchangeId.Length == 0) != (contract.MarketId.Length == 0) ||
+            (contract.BasisExchangeId.Length == 0) != (contract.BasisContractId.Length == 0) ||
+            (contract.BasisContractId.Length == 0) != (contract.BasisMarketId.Length == 0))
+        {
+            throw new InvalidOperationException("The T4 official market identity is incomplete.");
+        }
+        if (contract.IsOfficiallyAddressable &&
+            contract.ExchangeId == contract.BasisExchangeId &&
+            contract.ContractId == contract.BasisContractId &&
+            contract.MarketId == contract.BasisMarketId)
+        {
+            throw new InvalidOperationException(
+                "The T4 basis market must be independent from the futures market.");
         }
 
         var rollLead = contract.ExpiresAt - contract.RollAt;
@@ -128,4 +192,11 @@ public sealed class FuturesContractCatalog
                 "T4 expiry and roll timestamps must be ordered UTC values.");
         }
     }
+
+    private static bool ValidOptionalOpaqueId(string value, int maximumLength) =>
+        value.Length == 0 || ValidOpaqueId(value, maximumLength);
+
+    private static bool ValidOpaqueId(string value, int maximumLength) =>
+        value.Length is > 0 && value.Length <= maximumLength &&
+        value == value.Trim() && !value.Any(char.IsControl);
 }
