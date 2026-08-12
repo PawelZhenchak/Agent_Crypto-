@@ -683,7 +683,8 @@ def _assert_observation_ledger() -> None:
     )
     _expect_sqlstate("TRUNCATE crypto_agent.t4_observation_cycles", "55000")
     _expect_sqlstate(
-        "TRUNCATE crypto_agent.t4_observation_research_inputs",
+        "TRUNCATE crypto_agent.t4_observation_research_inputs, "
+        "crypto_agent.t4_observation_cycles",
         "55000",
     )
 
