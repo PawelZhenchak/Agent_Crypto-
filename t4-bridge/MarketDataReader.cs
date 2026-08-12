@@ -2,7 +2,9 @@ namespace CryptoAgent.T4Bridge;
 
 public interface IT4MarketDataReader
 {
-    Task<MarketDataEnvelope> ReadAsync(MarketDataRequest request, CancellationToken cancellationToken);
+    Task<MarketDataEnvelope> ReadAsync(
+        MarketDataRequest request,
+        CancellationToken cancellationToken);
 }
 
 public sealed class T4ApplicationRegistrationPendingReader : IT4MarketDataReader

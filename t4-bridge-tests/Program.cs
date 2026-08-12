@@ -22,6 +22,81 @@ var request = RequestValidator.Validate(
     DateTimeOffset.UtcNow.AddSeconds(-1),
     120);
 Assert(request.ContractId == "SIM:MBT:TEST", "actual contract ID was not retained");
+Assert(!(request.RolledFromContractId?.Any() ?? false), "legacy contract unexpectedly rolled");
+
+var march = new FuturesContract(
+    "BTC/USD",
+    "SIM:MBT:202703",
+    new DateTimeOffset(2027, 3, 26, 0, 0, 0, TimeSpan.Zero),
+    new DateTimeOffset(2027, 3, 19, 0, 0, 0, TimeSpan.Zero));
+var june = new FuturesContract(
+    "BTC/USD",
+    "SIM:MBT:202706",
+    new DateTimeOffset(2027, 6, 25, 0, 0, 0, TimeSpan.Zero),
+    new DateTimeOffset(2027, 6, 18, 0, 0, 0, TimeSpan.Zero));
+var catalog = new FuturesContractCatalog([march, june]);
+
+var beforeRoll = catalog.Resolve(
+    "BTC/USD",
+    new DateTimeOffset(2027, 3, 18, 23, 59, 59, TimeSpan.Zero));
+Assert(beforeRoll.Contract.ContractId == march.ContractId, "front month was not selected");
+Assert(!beforeRoll.IsRolled, "front month was incorrectly marked as rolled");
+
+var atRoll = catalog.Resolve(
+    "BTC/USD",
+    new DateTimeOffset(2027, 3, 19, 0, 0, 0, TimeSpan.Zero));
+Assert(atRoll.Contract.ContractId == june.ContractId, "next contract was not selected at roll");
+Assert(atRoll.RolledFromContractId == march.ContractId, "roll provenance was not retained");
+
+Expect<T4SessionUnavailableException>(() => catalog.Resolve(
+    "BTC/USD",
+    new DateTimeOffset(2027, 6, 18, 0, 0, 0, TimeSpan.Zero)));
+Expect<InvalidOperationException>(() => new FuturesContractCatalog([march, march]));
+Expect<InvalidOperationException>(() => new FuturesContractCatalog([
+    march with { ContractId = "invalid contract id" },
+]));
+Expect<InvalidOperationException>(() => new FuturesContractCatalog([
+    march with { RollAt = march.ExpiresAt.AddMinutes(-30) },
+]));
+Expect<InvalidOperationException>(() => new FuturesContractCatalog([
+    march,
+    june with { RollAt = march.RollAt },
+]));
+
+var catalogPath = Path.GetTempFileName();
+try
+{
+    File.WriteAllText(catalogPath, """
+        {
+          "schema_version": 1,
+          "default_roll_days": 7,
+          "contracts": [
+            {
+              "logical_symbol": "BTC/USD",
+              "contract_id": "SIM:MBT:202703",
+              "expires_at": "2027-03-26T00:00:00Z"
+            },
+            {
+              "logical_symbol": "BTC/USD",
+              "contract_id": "SIM:MBT:202706",
+              "expires_at": "2027-06-25T00:00:00Z"
+            }
+          ]
+        }
+        """);
+    Environment.SetEnvironmentVariable("T4_CONTRACT_CATALOG_PATH", catalogPath);
+    var catalogOptions = BridgeOptions.FromEnvironment();
+    var fromFile = catalogOptions.ContractCatalog.Resolve(
+        "BTC/USD",
+        new DateTimeOffset(2027, 3, 19, 0, 0, 0, TimeSpan.Zero));
+    Assert(fromFile.Contract.ContractId == "SIM:MBT:202706", "catalog roll failed");
+    Assert(fromFile.RolledFromContractId == "SIM:MBT:202703", "catalog roll lost provenance");
+}
+finally
+{
+    Environment.SetEnvironmentVariable("T4_CONTRACT_CATALOG_PATH", null);
+    File.Delete(catalogPath);
+}
 
 Expect<ArgumentException>(() => RequestValidator.Validate(
     options,

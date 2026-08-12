@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta
 from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -28,7 +29,8 @@ class Plus500T4Provider:
     _allowed_intervals = frozenset({240, 1440, 10080})
     _allowed_symbols = frozenset({"BTC/USD", "ETH/USD"})
     _max_response_bytes = 4_000_000
-    _bridge_schema_version = 1
+    _bridge_schema_version = 2
+    _contract_id_pattern = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{2,127}$")
 
     def __init__(
         self,
@@ -136,6 +138,10 @@ class Plus500T4Provider:
             if not isinstance(payload, dict):
                 raise ValueError("payload is not an object")
             contract_expires_at = _utc(payload["contract_expires_at"])
+            contract_roll_at = _utc(payload["contract_roll_at"])
+            contract_id = payload.get("contract_id")
+            contract_selection = payload.get("contract_selection")
+            rolled_from_contract_id = payload.get("rolled_from_contract_id")
             if (
                 type(payload.get("schema_version")) is not int
                 or payload.get("schema_version") != self._bridge_schema_version
@@ -146,9 +152,23 @@ class Plus500T4Provider:
                 or payload.get("logical_symbol") != symbol
                 or type(payload.get("interval_minutes")) is not int
                 or payload.get("interval_minutes") != interval_minutes
-                or not isinstance(payload.get("contract_id"), str)
-                or not payload["contract_id"].strip()
-                or contract_expires_at <= as_of
+                or not isinstance(contract_id, str)
+                or self._contract_id_pattern.fullmatch(contract_id) is None
+                or contract_selection not in {"front_month", "rolled"}
+                or (
+                    contract_selection == "front_month"
+                    and rolled_from_contract_id is not None
+                )
+                or (
+                    contract_selection == "rolled"
+                    and (
+                        not isinstance(rolled_from_contract_id, str)
+                        or self._contract_id_pattern.fullmatch(rolled_from_contract_id)
+                        is None
+                        or rolled_from_contract_id == contract_id
+                    )
+                )
+                or not as_of < contract_roll_at < contract_expires_at
             ):
                 raise ValueError("bridge attestation mismatch")
             candles = tuple(
@@ -181,6 +201,9 @@ class Plus500T4Provider:
                 "t4_bridge_schema_version": payload.get("schema_version"),
                 "t4_contract_id": payload.get("contract_id"),
                 "t4_contract_expires_at": contract_expires_at.isoformat(),
+                "t4_contract_roll_at": contract_roll_at.isoformat(),
+                "t4_contract_selection": contract_selection,
+                "t4_rolled_from_contract_id": rolled_from_contract_id,
             },
             reference_price=ReferencePriceSnapshot(
                 symbol=symbol, observations=(reference,)

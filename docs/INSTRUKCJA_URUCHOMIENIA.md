@@ -49,6 +49,12 @@ Wygeneruj losowy token minimum 32 znaki i ustaw tę samą wartość prywatnie ja
 - `T4_BRIDGE_TOKEN` w procesie .NET;
 - `CRYPTO_AGENT_T4_BRIDGE_TOKEN` w procesie Python.
 
+Skopiuj `configs/t4-contract-catalog.example.json` poza repozytorium, zastąp
+wartości `SIM:*` rzeczywistymi identyfikatorami serii otrzymanymi z T4 i ustaw
+`T4_CONTRACT_CATALOG_PATH` na ścieżkę tej prywatnej kopii. Katalog musi zawierać
+co najmniej bieżącą i następną serię dla każdego aktywnego symbolu, aby roll nie
+zatrzymał odczytu.
+
 Następnie uruchom granicę bezpieczeństwa:
 
 ```bash
@@ -62,5 +68,6 @@ crypto-agent analyze --provider t4 --symbol BTC/USD --interval 1440
 ```
 
 Most musi potwierdzić `read_only=true`, `order_routes_exposed=false`, właściwe
-source/venue ID, rzeczywisty i niewygasły contract ID, 120 świec oraz świeżą cenę.
-Każda niezgodność kończy się `NO_SIGNAL`.
+source/venue ID, rzeczywisty i niewygasły contract ID, `roll_at`, proweniencję
+ewentualnego przełączenia, 120 świec oraz świeżą cenę. Każda niezgodność kończy
+się `NO_SIGNAL`.
