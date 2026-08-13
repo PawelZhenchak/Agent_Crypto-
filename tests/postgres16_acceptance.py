@@ -731,6 +731,13 @@ def _assert_operational_ingest_and_replay() -> None:
         "42501",
         _role_factory(_RUNTIME_ROLE),
     )
+    _expect_sqlstate_after(
+        (),
+        "UPDATE crypto_agent.data_sources SET source_id = DEFAULT "
+        "WHERE source_key = 'plus500_t4_futures_v1'",
+        "55000",
+        _role_factory(_RUNTIME_ROLE),
+    )
     replay_as_of = datetime.now(UTC)
     replay_a = repository.replay(
         symbol="BTC/USD", interval_minutes=240, as_of=replay_as_of, limit=120
@@ -788,7 +795,7 @@ def _assert_operational_alert_outbox() -> None:
     _expect_sqlstate_after(
         (),
         "UPDATE crypto_agent.alert_delivery_outbox "
-        "SET alert_delivery_outbox_id = alert_delivery_outbox_id",
+        "SET alert_delivery_outbox_id = DEFAULT",
         "55000",
         _role_factory(_RUNTIME_ROLE),
     )
