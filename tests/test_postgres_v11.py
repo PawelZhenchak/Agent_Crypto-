@@ -223,7 +223,16 @@ def _health_steps(
         ),
         SQLStep(
             "FROM pg_catalog.pg_trigger AS trg",
-            _trigger_rows(postgres_module._BASE_TRIGGER_REQUIREMENTS)
+            _trigger_rows(
+                (
+                    *postgres_module._BASE_TRIGGER_REQUIREMENTS,
+                    *(
+                        requirement
+                        for requirement in postgres_module._MIGRATED_TRIGGER_REQUIREMENTS
+                        if requirement.table in postgres_module._BASE_TABLES
+                    ),
+                )
+            )
             if base_triggers is None
             else base_triggers,
         ),
@@ -280,7 +289,17 @@ def _health_steps(
         ),
         SQLStep(
             "FROM pg_catalog.pg_trigger AS trg",
-            _trigger_rows(postgres_module._MIGRATED_TRIGGER_REQUIREMENTS)
+            _trigger_rows(
+                (
+                    *postgres_module._MIGRATED_TRIGGER_REQUIREMENTS,
+                    *(
+                        requirement
+                        for requirement in postgres_module._BASE_TRIGGER_REQUIREMENTS
+                        if requirement.table
+                        in postgres_module._MIGRATED_TRIGGER_CATALOG_TABLES
+                    ),
+                )
+            )
             if migrated_triggers is None
             else migrated_triggers,
         ),

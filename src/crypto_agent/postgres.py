@@ -1377,6 +1377,14 @@ _MIGRATED_TRIGGER_REQUIREMENTS = _append_only_trigger_requirements(_MIGRATED_TAB
         1 | 2 | 4,
     ),
 )
+_MIGRATED_TRIGGER_CATALOG_TABLES = tuple(
+    dict.fromkeys(
+        (
+            *_MIGRATED_TABLES,
+            *(requirement.table for requirement in _MIGRATED_TRIGGER_REQUIREMENTS),
+        )
+    )
+)
 _OPERATIONAL_CONSTRAINT_REQUIREMENTS = (
     _CatalogDefinitionRequirement(
         "t4_ingestion_batches",
@@ -2847,6 +2855,7 @@ def check_postgres_health(
             base_trigger_differences = _trigger_differences(
                 _BASE_TRIGGER_REQUIREMENTS,
                 _catalog_triggers(db_cursor, _BASE_TABLES),
+                ignored=_MIGRATED_TRIGGER_REQUIREMENTS,
             )
             if base_trigger_differences:
                 return _health_result(
@@ -2981,7 +2990,8 @@ def check_postgres_health(
 
             migrated_trigger_differences = _trigger_differences(
                 _MIGRATED_TRIGGER_REQUIREMENTS,
-                _catalog_triggers(db_cursor, _MIGRATED_TABLES),
+                _catalog_triggers(db_cursor, _MIGRATED_TRIGGER_CATALOG_TABLES),
+                ignored=_BASE_TRIGGER_REQUIREMENTS,
             )
             if migrated_trigger_differences:
                 return _health_result(
@@ -3912,11 +3922,16 @@ def _catalog_triggers(
 def _trigger_differences(
     required: Sequence[_TriggerRequirement],
     actual: Sequence[_TriggerRequirement],
+    *,
+    ignored: Sequence[_TriggerRequirement] = (),
 ) -> tuple[str, ...]:
     required_set = set(required)
     actual_set = set(actual)
     missing = {item.name for item in required_set - actual_set}
-    unexpected = {f"unexpected:{item.name}" for item in actual_set - required_set}
+    unexpected = {
+        f"unexpected:{item.name}"
+        for item in actual_set - required_set - set(ignored)
+    }
     return tuple(sorted(missing | unexpected))
 
 
