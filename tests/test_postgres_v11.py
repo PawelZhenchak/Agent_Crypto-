@@ -347,10 +347,20 @@ class PostgresV11Tests(unittest.TestCase):
             + len(postgres_module._MIGRATED_TRIGGER_REQUIREMENTS),
             165,
         )
-        for requirement in (
+        trigger_requirements = (
             *postgres_module._BASE_TRIGGER_REQUIREMENTS,
             *postgres_module._MIGRATED_TRIGGER_REQUIREMENTS,
-        ):
+        )
+        self.assertEqual(
+            len({requirement.name for requirement in trigger_requirements}),
+            len(trigger_requirements),
+        )
+        self.assertIn(
+            "t4_observation_scenario_trial_requests_append_only_truncate_gua",
+            {requirement.name for requirement in trigger_requirements},
+        )
+        for requirement in trigger_requirements:
+            self.assertLessEqual(len(requirement.name.encode("ascii")), 63)
             self.assertIs(type(requirement.type_mask), int)
             self.assertIs(type(requirement.deferrable), bool)
             self.assertIs(type(requirement.initially_deferred), bool)

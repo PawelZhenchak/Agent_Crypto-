@@ -1173,14 +1173,14 @@ def _append_only_trigger_requirements(
         requirements.extend(
             (
                 _TriggerRequirement(
-                    name=f"{table}_append_only_row_guard",
+                    name=_postgres_identifier(f"{table}_append_only_row_guard"),
                     table=table,
                     function="forbid_append_only_change",
                     # ROW | BEFORE | DELETE | UPDATE
                     type_mask=1 | 2 | 8 | 16,
                 ),
                 _TriggerRequirement(
-                    name=f"{table}_append_only_truncate_guard",
+                    name=_postgres_identifier(f"{table}_append_only_truncate_guard"),
                     table=table,
                     function="forbid_append_only_change",
                     # STATEMENT | BEFORE | TRUNCATE
@@ -1189,6 +1189,12 @@ def _append_only_trigger_requirements(
             )
         )
     return tuple(requirements)
+
+
+def _postgres_identifier(value: str) -> str:
+    """Return the catalog spelling of a generated unquoted ASCII identifier."""
+
+    return value.encode("ascii")[:63].decode("ascii")
 
 
 _BASE_TRIGGER_REQUIREMENTS = _append_only_trigger_requirements(_BASE_TABLES) + (
