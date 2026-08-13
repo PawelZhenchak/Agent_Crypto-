@@ -169,7 +169,6 @@ class T4IngestRepository:
                     SELECT source_id
                     FROM crypto_agent.data_sources
                     WHERE source_key = %s
-                    FOR SHARE
                     """,
                     (T4_SOURCE_ID,),
                 )

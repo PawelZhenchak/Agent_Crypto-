@@ -186,8 +186,6 @@ def _provision_acceptance_roles() -> None:
                     crypto_agent.alert_delivery_outbox,
                     crypto_agent.alert_delivery_attempts
                     TO {_RUNTIME_ROLE};
-                GRANT UPDATE (source_id) ON crypto_agent.data_sources
-                    TO {_RUNTIME_ROLE};
                 GRANT UPDATE (alert_delivery_outbox_id)
                     ON crypto_agent.alert_delivery_outbox
                     TO {_RUNTIME_ROLE};
@@ -294,7 +292,7 @@ def _assert_runtime_row_lock_grants() -> None:
         connection.commit()
     finally:
         connection.close()
-    if row != (True, True, False, False):
+    if row != (False, True, False, False):
         raise AssertionError(f"runtime row-lock grants are unsafe: {row!r}")
 
 
@@ -730,7 +728,7 @@ def _assert_operational_ingest_and_replay() -> None:
         (),
         "UPDATE crypto_agent.data_sources SET source_id = source_id "
         "WHERE source_key = 'plus500_t4_futures_v1'",
-        "55000",
+        "42501",
         _role_factory(_RUNTIME_ROLE),
     )
     replay_as_of = datetime.now(UTC)

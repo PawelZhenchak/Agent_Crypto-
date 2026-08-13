@@ -321,7 +321,7 @@ class PostgresV11Tests(unittest.TestCase):
             .read_text(encoding="utf-8")
             .split()
         )
-        self.assertIn(
+        self.assertNotIn(
             'GRANT UPDATE (source_id) ON crypto_agent.data_sources TO :"runtime_role";',
             provisioning_sql,
         )
@@ -330,6 +330,13 @@ class PostgresV11Tests(unittest.TestCase):
             'crypto_agent.alert_delivery_outbox TO :"runtime_role";',
             provisioning_sql,
         )
+        ingest_sql = (PROJECT_ROOT / "src/crypto_agent/t4_ingest.py").read_text(
+            encoding="utf-8"
+        )
+        source_lookup = ingest_sql.split("SELECT source_id", 1)[1].split(
+            "source_row =", 1
+        )[0]
+        self.assertNotIn("FOR SHARE", source_lookup)
 
     def test_health_manifest_covers_all_versioned_tables_and_triggers(self) -> None:
         base_sql = (PROJECT_ROOT / "db/schema.sql").read_text(encoding="utf-8")
