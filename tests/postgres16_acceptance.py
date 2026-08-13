@@ -1162,10 +1162,12 @@ def _assert_observation_ledger() -> tuple[bytes, ec.EllipticCurvePrivateKey, dat
         "UPDATE crypto_agent.t4_observation_session_events SET outcome = 'fail'",
         "55000",
     )
-    _expect_sqlstate("TRUNCATE crypto_agent.t4_observation_cycles", "55000")
+    _expect_sqlstate(
+        "TRUNCATE crypto_agent.t4_observation_cycles CASCADE", "55000"
+    )
     _expect_sqlstate(
         "TRUNCATE crypto_agent.t4_observation_research_inputs, "
-        "crypto_agent.t4_observation_cycles",
+        "crypto_agent.t4_observation_cycles CASCADE",
         "55000",
     )
     return public_key_der, private_key, started_at
