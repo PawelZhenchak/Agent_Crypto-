@@ -11,7 +11,9 @@ using T4Proto.V1.Service;
 
 namespace CryptoAgent.T4Bridge;
 
-public sealed class OfficialT4MarketDataReader : BackgroundService, IT4MarketDataReader
+public sealed class OfficialT4MarketDataReader : BackgroundService,
+    IT4MarketDataReader,
+    IT4ObservationController
 {
     private const string SourceId = "plus500_t4_futures_v1";
     private const string BasisSourceId = "plus500_t4_index_v1";
@@ -23,6 +25,7 @@ public sealed class OfficialT4MarketDataReader : BackgroundService, IT4MarketDat
     private static readonly TimeSpan MaximumSnapshotAge = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan HeartbeatInterval = TimeSpan.FromSeconds(20);
     private static readonly TimeSpan HistoryRefreshInterval = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan ControlledRateLimitDuration = TimeSpan.FromSeconds(5);
     // V1 live acceptance is intentionally limited to native 4-hour Chart bars.
     // Longer stitched histories remain replay-compatible but are not attested live.
     private static readonly int[] SupportedIntervals = [240];
@@ -30,27 +33,43 @@ public sealed class OfficialT4MarketDataReader : BackgroundService, IT4MarketDat
     private readonly BridgeOptions _options;
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly ILogger<OfficialT4MarketDataReader> _logger;
+    private readonly ObservationEventJournal _journal;
+    private readonly TimeProvider _timeProvider;
     private readonly HashSet<string> _basisMarketIds;
     private readonly ConcurrentDictionary<string, SnapshotBuffer> _snapshots = new();
     private readonly ConcurrentDictionary<string, HistoryBuffer> _history = new();
+    private readonly ConcurrentDictionary<string, byte> _recordedRolls = new();
+    private readonly ConcurrentDictionary<string, byte> _recordedDataFailures = new();
     private readonly SemaphoreSlim _sendLock = new(1, 1);
+    private readonly SemaphoreSlim _historyRefreshSignal = new(0, 1);
     private readonly object _chartTokenGate = new();
+    private readonly object _controlGate = new();
     private ClientWebSocket? _socket;
     private T4ReaderHealth _health;
     private ChartBearerToken? _chartBearerToken;
     private TaskCompletionSource<ChartBearerToken>? _pendingChartToken;
     private string? _pendingChartTokenRequestId;
     private int _reconnectCount;
+    private long _sessionGeneration;
+    private long _rateLimitedUntilUtcTicks;
     private bool _connected;
+    private ScenarioFault? _pendingScenarioFault;
+    private ControlReference? _pendingReconnect;
+    private ControlReference? _pendingRestart;
+    private bool _stoppingEventRecorded;
 
     public OfficialT4MarketDataReader(
         BridgeOptions options,
         IHttpClientFactory httpClientFactory,
-        ILogger<OfficialT4MarketDataReader> logger)
+        ILogger<OfficialT4MarketDataReader> logger,
+        ObservationEventJournal journal,
+        TimeProvider timeProvider)
     {
         _options = options;
         _httpClientFactory = httpClientFactory;
         _logger = logger;
+        _journal = journal;
+        _timeProvider = timeProvider;
         _basisMarketIds = options.ContractCatalog.Contracts
             .Select(item => item.BasisMarketId)
             .Where(item => item.Length > 0)
@@ -60,7 +79,10 @@ public sealed class OfficialT4MarketDataReader : BackgroundService, IT4MarketDat
             options.Api.AttestedEnvironment,
             "T4_SESSION_STARTING",
             null,
-            0);
+            0,
+            journal.BootId,
+            0,
+            journal.EvidenceKeyFingerprintSha256);
     }
 
     public T4ReaderHealth Health => Volatile.Read(ref _health);
@@ -70,33 +92,64 @@ public sealed class OfficialT4MarketDataReader : BackgroundService, IT4MarketDat
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        var injectedFault = ConsumeScenarioFault(request);
+        if (injectedFault is not null)
+        {
+            throw new T4SessionUnavailableException(
+                "A controlled read-only T4 scenario failed closed.",
+                injectedFault.ReasonCode);
+        }
         if (!_connected || !Health.Ready)
         {
-            throw new T4SessionUnavailableException("The official T4 session is not ready.");
+            throw new T4SessionUnavailableException(
+                "The official T4 session is not ready.",
+                Health.ReasonCode);
         }
 
         var current = SnapshotBefore(request.MarketId, request.AsOf);
         var basis = SnapshotBefore(request.BasisMarketId, request.AsOf);
-        if (current is null || basis is null ||
-            !T4ChartSafetyPolicy.IsFresh(
+        if (current is null || basis is null)
+        {
+            RecordDataFailure(request, stale: false);
+            throw new T4SessionUnavailableException(
+                "A synchronized T4 futures/index snapshot is unavailable.",
+                "T4_MISSING_DATA");
+        }
+        if (!T4ChartSafetyPolicy.IsFresh(
                 current.IngestedAt, request.AsOf, MaximumSnapshotAge) ||
             !T4ChartSafetyPolicy.IsFresh(
-                basis.IngestedAt, request.AsOf, MaximumSnapshotAge) ||
-            Math.Abs((current.ObservedAt - basis.ObservedAt).TotalSeconds) > 5)
+                basis.IngestedAt, request.AsOf, MaximumSnapshotAge))
         {
+            RecordDataFailure(request, stale: true);
             throw new T4SessionUnavailableException(
-                "A synchronized T4 futures/index snapshot is unavailable.");
+                "A fresh T4 futures/index snapshot is unavailable.",
+                "T4_STALE_DATA");
+        }
+        if (Math.Abs((current.ObservedAt - basis.ObservedAt).TotalSeconds) > 5)
+        {
+            RecordDataFailure(request, stale: false);
+            throw new T4SessionUnavailableException(
+                "A synchronized T4 futures/index snapshot is unavailable.",
+                "T4_MISSING_DATA");
         }
         var history = HistoryBefore(
             HistoryKey(request.LogicalSymbol, request.IntervalMinutes), request.AsOf);
-        if (history is null ||
-            !T4ChartSafetyPolicy.IsFresh(
+        if (history is null)
+        {
+            RecordDataFailure(request, stale: false);
+            throw new T4SessionUnavailableException(
+                "T4 chart history was not cached before the requested cutoff.",
+                "T4_MISSING_DATA");
+        }
+        if (!T4ChartSafetyPolicy.IsFresh(
                 history.IngestedAt,
                 request.AsOf,
                 T4ChartSafetyPolicy.MaximumHistoryCacheAge))
         {
+            RecordDataFailure(request, stale: true);
             throw new T4SessionUnavailableException(
-                "Fresh T4 chart history was not cached before the requested cutoff.");
+                "Fresh T4 chart history was not cached before the requested cutoff.",
+                "T4_STALE_DATA");
         }
         var bars = history.Bars
             .Where(item => item.CloseTime <= request.AsOf)
@@ -105,7 +158,10 @@ public sealed class OfficialT4MarketDataReader : BackgroundService, IT4MarketDat
             .ToArray();
         if (bars.Length < request.Limit)
         {
-            throw new T4SessionUnavailableException("T4 chart history is incomplete.");
+            RecordDataFailure(request, stale: false);
+            throw new T4SessionUnavailableException(
+                "T4 chart history is incomplete.",
+                "T4_MISSING_DATA");
         }
 
         var currentMid = Mid(current);
@@ -118,8 +174,10 @@ public sealed class OfficialT4MarketDataReader : BackgroundService, IT4MarketDat
                     previous.IngestedAt, request.AsOf, MaximumSnapshotAge) ||
                 Math.Abs((previous.ObservedAt - current.ObservedAt).TotalSeconds) > 5)
             {
+                RecordDataFailure(request, stale: false);
                 throw new T4SessionUnavailableException(
-                    "Synchronized T4 roll evidence is unavailable.");
+                    "Synchronized T4 roll evidence is unavailable.",
+                    "T4_MISSING_DATA");
             }
             var observedAt = Later(previous.ObservedAt, current.ObservedAt);
             var availableAt = Later(previous.AvailableAt, current.AvailableAt);
@@ -134,6 +192,7 @@ public sealed class OfficialT4MarketDataReader : BackgroundService, IT4MarketDat
                 observedAt,
                 availableAt,
                 ingestedAt);
+            RecordRollEvidence(request, transition);
         }
 
         var candles = bars.Select(item => new CandleEnvelope(
@@ -205,6 +264,121 @@ public sealed class OfficialT4MarketDataReader : BackgroundService, IT4MarketDat
         return Task.FromResult(result);
     }
 
+    public SignedObservationEvent ApplyControl(
+        ObservationControlAction action,
+        Guid campaignId,
+        Guid actionRequestId,
+        string scopeKey)
+    {
+        if (!Enum.IsDefined(action))
+        {
+            throw new ArgumentOutOfRangeException(nameof(action));
+        }
+        if (!_options.Observation.ControlEnabled ||
+            _options.Observation.CampaignId != campaignId ||
+            campaignId == Guid.Empty || actionRequestId == Guid.Empty ||
+            !ObservationEvidenceContract.IsScopeKey(scopeKey))
+        {
+            throw new InvalidOperationException(
+                "T4 observation control is disabled or outside the configured campaign.");
+        }
+        var actionCode = ObservationControlActions.Code(action);
+        var scenarioCode = ScenarioCode(action);
+        lock (_controlGate)
+        {
+            if (_pendingScenarioFault is not null || _pendingReconnect is not null ||
+                _pendingRestart is not null)
+            {
+                throw new InvalidOperationException(
+                    "Another T4 observation control is still pending.");
+            }
+            _journal.Append(
+                "control_requested",
+                "OBSERVATION_CONTROL_REQUESTED",
+                Volatile.Read(ref _sessionGeneration),
+                Volatile.Read(ref _reconnectCount),
+                scenarioCode: scenarioCode,
+                actionRequestId: actionRequestId,
+                campaignId: campaignId,
+                scopeKey: scopeKey,
+                payload: new ObservationEventPayload(actionCode, "requested"));
+            switch (action)
+            {
+                case ObservationControlAction.Reconnect:
+                    _pendingReconnect = new ControlReference(
+                        campaignId, actionRequestId, scopeKey);
+                    _connected = false;
+                    ClearCaches(
+                        "T4_CACHE_CLEARED", scenarioCode, actionRequestId, campaignId,
+                        scopeKey);
+                    SetUnavailable("T4_SESSION_DISCONNECTED");
+                    _socket?.Abort();
+                    break;
+                case ObservationControlAction.MissingData:
+                    ClearCaches(
+                        "T4_CACHE_CLEARED", scenarioCode, actionRequestId, campaignId,
+                        scopeKey);
+                    _pendingScenarioFault = new ScenarioFault(
+                        actionCode,
+                        scenarioCode,
+                        "T4_MISSING_DATA",
+                        campaignId,
+                        actionRequestId,
+                        scopeKey);
+                    SetUnavailable("T4_MISSING_DATA");
+                    RequestHistoryRefresh();
+                    break;
+                case ObservationControlAction.StaleData:
+                    _pendingScenarioFault = new ScenarioFault(
+                        actionCode,
+                        scenarioCode,
+                        "T4_STALE_DATA",
+                        campaignId,
+                        actionRequestId,
+                        scopeKey);
+                    SetUnavailable("T4_STALE_DATA");
+                    RequestHistoryRefresh();
+                    break;
+                case ObservationControlAction.RateLimit:
+                    ClearCaches("T4_CACHE_CLEARED");
+                    SetRateLimitedUntil(
+                        _timeProvider.GetUtcNow() + ControlledRateLimitDuration);
+                    _pendingScenarioFault = new ScenarioFault(
+                        actionCode,
+                        scenarioCode,
+                        "T4_RATE_LIMITED",
+                        campaignId,
+                        actionRequestId,
+                        scopeKey);
+                    SetUnavailable("T4_RATE_LIMITED");
+                    RequestHistoryRefresh();
+                    break;
+                case ObservationControlAction.Restart:
+                    _pendingRestart = new ControlReference(
+                        campaignId, actionRequestId, scopeKey);
+                    break;
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(action));
+            }
+            return _journal.Append(
+                "control_applied",
+                "OBSERVATION_CONTROL_APPLIED",
+                Volatile.Read(ref _sessionGeneration),
+                Volatile.Read(ref _reconnectCount),
+                scenarioCode: scenarioCode,
+                actionRequestId: actionRequestId,
+                campaignId: campaignId,
+                scopeKey: scopeKey,
+                payload: new ObservationEventPayload(actionCode, "applied"));
+        }
+    }
+
+    public override async Task StopAsync(CancellationToken cancellationToken)
+    {
+        RecordStoppingEvent();
+        await base.StopAsync(cancellationToken);
+    }
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var attempt = 0;
@@ -222,18 +396,19 @@ public sealed class OfficialT4MarketDataReader : BackgroundService, IT4MarketDat
             catch (AuthenticationException)
             {
                 SetUnavailable("T4_AUTHENTICATION_FAILED");
+                RecordSessionDisconnected("T4_SESSION_DISCONNECTED");
                 attempt = Math.Min(attempt + 1, 8);
             }
             catch (Exception)
             {
                 SetUnavailable("T4_SESSION_DISCONNECTED");
+                RecordSessionDisconnected("T4_SESSION_DISCONNECTED");
                 attempt = Math.Min(attempt + 1, 8);
             }
             finally
             {
                 _connected = false;
-                _snapshots.Clear();
-                _history.Clear();
+                ClearCaches("T4_CACHE_CLEARED");
                 ClearChartToken();
                 var socket = Interlocked.Exchange(ref _socket, null);
                 if (socket is not null)
@@ -246,13 +421,24 @@ public sealed class OfficialT4MarketDataReader : BackgroundService, IT4MarketDat
             {
                 Interlocked.Increment(ref _reconnectCount);
                 var delay = TimeSpan.FromSeconds(Math.Min(30, Math.Pow(2, attempt)));
-                await Task.Delay(delay, stoppingToken);
+                await Task.Delay(delay, _timeProvider, stoppingToken);
             }
         }
     }
 
     private async Task RunSessionAsync(CancellationToken stoppingToken)
     {
+        var sessionGeneration = Interlocked.Increment(ref _sessionGeneration);
+        Volatile.Write(ref _health, Health with
+        {
+            SessionGeneration = sessionGeneration,
+            ReconnectCount = Volatile.Read(ref _reconnectCount),
+        });
+        _journal.Append(
+            "session_connecting",
+            "T4_SESSION_CONNECTING",
+            sessionGeneration,
+            Volatile.Read(ref _reconnectCount));
         var socket = new ClientWebSocket();
         _socket = socket;
         using var connectTimeout = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
@@ -262,6 +448,11 @@ public sealed class OfficialT4MarketDataReader : BackgroundService, IT4MarketDat
                 "The T4 WebSocket endpoint is not configured."),
             connectTimeout.Token);
         await AuthenticateAsync(socket, stoppingToken);
+        _journal.Append(
+            "session_authenticated",
+            "T4_SESSION_AUTHENTICATED",
+            sessionGeneration,
+            Volatile.Read(ref _reconnectCount));
         await SubscribeAsync(socket, stoppingToken);
         _connected = true;
         SetUnavailable("T4_PREWARM_IN_PROGRESS");
@@ -398,7 +589,7 @@ public sealed class OfficialT4MarketDataReader : BackgroundService, IT4MarketDat
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             timeout.CancelAfter(MessageTimeout);
             var message = await ReceiveAsync(socket, timeout.Token);
-            var receivedAt = DateTimeOffset.UtcNow;
+            var receivedAt = _timeProvider.GetUtcNow();
             Volatile.Write(ref _health, Health with { LastMessageAt = receivedAt });
             switch (message.PayloadCase)
             {
@@ -450,7 +641,7 @@ public sealed class OfficialT4MarketDataReader : BackgroundService, IT4MarketDat
         ClientWebSocket socket,
         CancellationToken cancellationToken)
     {
-        using var timer = new PeriodicTimer(HeartbeatInterval);
+        using var timer = new PeriodicTimer(HeartbeatInterval, _timeProvider);
         while (await timer.WaitForNextTickAsync(cancellationToken))
         {
             await SendAsync(
@@ -459,7 +650,7 @@ public sealed class OfficialT4MarketDataReader : BackgroundService, IT4MarketDat
                 {
                     Heartbeat = new Heartbeat
                     {
-                        Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                        Timestamp = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds(),
                     },
                 },
                 cancellationToken);
@@ -470,6 +661,7 @@ public sealed class OfficialT4MarketDataReader : BackgroundService, IT4MarketDat
     {
         while (!cancellationToken.IsCancellationRequested)
         {
+            TimeSpan? rateLimitDelay = null;
             foreach (var logicalSymbol in _options.ContractCatalog.Contracts
                          .Select(item => item.LogicalSymbol)
                          .Distinct(StringComparer.Ordinal))
@@ -478,7 +670,7 @@ public sealed class OfficialT4MarketDataReader : BackgroundService, IT4MarketDat
                 try
                 {
                     contract = _options.ContractCatalog.Resolve(
-                        logicalSymbol, DateTimeOffset.UtcNow).Contract;
+                        logicalSymbol, _timeProvider.GetUtcNow()).Contract;
                 }
                 catch (T4SessionUnavailableException)
                 {
@@ -501,11 +693,20 @@ public sealed class OfficialT4MarketDataReader : BackgroundService, IT4MarketDat
                     {
                         throw;
                     }
-                    catch (HttpRequestException exception)
-                        when (exception.StatusCode == HttpStatusCode.TooManyRequests)
+                    catch (T4RateLimitException exception)
                     {
                         _history.Clear();
+                        var now = _timeProvider.GetUtcNow();
+                        rateLimitDelay = T4RateLimitPolicy.Clamp(exception.RetryAfter);
+                        SetRateLimitedUntil(now + rateLimitDelay.Value);
                         SetUnavailable("T4_RATE_LIMITED");
+                        _journal.Append(
+                            "rate_limited",
+                            "T4_RATE_LIMITED",
+                            Volatile.Read(ref _sessionGeneration),
+                            Volatile.Read(ref _reconnectCount),
+                            scopeKey: $"{contract.LogicalSymbol}:{intervalMinutes}m");
+                        break;
                     }
                     catch (Exception)
                     {
@@ -513,9 +714,54 @@ public sealed class OfficialT4MarketDataReader : BackgroundService, IT4MarketDat
                         SetUnavailable("T4_HISTORY_UNAVAILABLE");
                     }
                 }
+                if (rateLimitDelay is not null)
+                {
+                    break;
+                }
+            }
+            if (rateLimitDelay is not null)
+            {
+                await Task.Delay(rateLimitDelay.Value, _timeProvider, cancellationToken);
+                continue;
             }
             RefreshHealth();
-            await Task.Delay(HistoryRefreshInterval, cancellationToken);
+            var refreshDelay = HistoryRefreshInterval;
+            var limitedUntil = new DateTimeOffset(
+                Interlocked.Read(ref _rateLimitedUntilUtcTicks), TimeSpan.Zero);
+            var rateLimitRemaining = limitedUntil - _timeProvider.GetUtcNow();
+            if (rateLimitRemaining > TimeSpan.Zero && rateLimitRemaining < refreshDelay)
+            {
+                refreshDelay = rateLimitRemaining;
+            }
+            await WaitForHistoryRefreshAsync(refreshDelay, cancellationToken);
+        }
+    }
+
+    private async Task WaitForHistoryRefreshAsync(
+        TimeSpan delay,
+        CancellationToken cancellationToken)
+    {
+        using var pending = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken);
+        var delayTask = Task.Delay(delay, _timeProvider, pending.Token);
+        var signalTask = _historyRefreshSignal.WaitAsync(pending.Token);
+        var completed = await Task.WhenAny(delayTask, signalTask);
+        pending.Cancel();
+        try
+        {
+            await completed;
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            // The losing wait is cancelled after the other path wins.
+        }
+    }
+
+    private void RequestHistoryRefresh()
+    {
+        if (_historyRefreshSignal.CurrentCount == 0)
+        {
+            _historyRefreshSignal.Release();
         }
     }
 
@@ -532,7 +778,7 @@ public sealed class OfficialT4MarketDataReader : BackgroundService, IT4MarketDat
             10080 => ("Week", 1),
             _ => throw new InvalidOperationException("Unsupported T4 chart interval."),
         };
-        var end = DateTimeOffset.UtcNow;
+        var end = _timeProvider.GetUtcNow();
         var start = end.AddMinutes(-intervalMinutes * requestedLimit * 1.5);
         var query = string.Join("&", new Dictionary<string, string>
         {
@@ -563,10 +809,10 @@ public sealed class OfficialT4MarketDataReader : BackgroundService, IT4MarketDat
             timeout.Token);
         if (response.StatusCode == HttpStatusCode.TooManyRequests)
         {
-            throw new HttpRequestException(
-                "The T4 Chart API rate limit was reached.",
-                null,
-                response.StatusCode);
+            throw new T4RateLimitException(
+                T4RateLimitPolicy.ResolveRetryAfter(
+                    response.Headers.RetryAfter,
+                    _timeProvider.GetUtcNow()));
         }
         response.EnsureSuccessStatusCode();
         var mediaType = response.Content.Headers.ContentType?.MediaType;
@@ -590,7 +836,7 @@ public sealed class OfficialT4MarketDataReader : BackgroundService, IT4MarketDat
         var decoder = new T4ChartDecoder.T4BinaryDecoder();
         var collection = await decoder.DecodeAll(chartStream, timeout.Token);
         var bars = DecodeBars(collection.Bars);
-        var ingestedAt = DateTimeOffset.UtcNow;
+        var ingestedAt = _timeProvider.GetUtcNow();
         if (bars.Count < 60 || bars.Any(item => item.CloseTime > ingestedAt))
         {
             throw new InvalidDataException("The decoded T4 chart history is incomplete.");
@@ -749,6 +995,11 @@ public sealed class OfficialT4MarketDataReader : BackgroundService, IT4MarketDat
     {
         if (!T4OutboundPolicy.IsAllowed(message.PayloadCase))
         {
+            _journal.Append(
+                "outbound_rejected",
+                "T4_OUTBOUND_REJECTED",
+                Volatile.Read(ref _sessionGeneration),
+                Volatile.Read(ref _reconnectCount));
             throw new InvalidOperationException(
                 "The read-only T4 bridge rejected a non-market-data outbound message.");
         }
@@ -777,7 +1028,7 @@ public sealed class OfficialT4MarketDataReader : BackgroundService, IT4MarketDat
         {
             if (_chartBearerToken is not null &&
                 _chartBearerToken.ExpiresAt >
-                    DateTimeOffset.UtcNow + T4ChartSafetyPolicy.TokenRefreshLead)
+                    _timeProvider.GetUtcNow() + T4ChartSafetyPolicy.TokenRefreshLead)
             {
                 return _chartBearerToken.Value;
             }
@@ -835,7 +1086,7 @@ public sealed class OfficialT4MarketDataReader : BackgroundService, IT4MarketDat
             FailChartTokenRequest(exception);
             throw exception;
         }
-        if (token.ExpiresAt <= DateTimeOffset.UtcNow + T4ChartSafetyPolicy.TokenRefreshLead)
+        if (token.ExpiresAt <= _timeProvider.GetUtcNow() + T4ChartSafetyPolicy.TokenRefreshLead)
         {
             throw new T4SessionUnavailableException("The T4 Chart bearer token is expired.");
         }
@@ -846,7 +1097,7 @@ public sealed class OfficialT4MarketDataReader : BackgroundService, IT4MarketDat
     {
         if (!T4ChartSafetyPolicy.TryReadBearerToken(
                 token,
-                DateTimeOffset.UtcNow,
+                _timeProvider.GetUtcNow(),
                 out var value,
                 out var expiresAt))
         {
@@ -869,7 +1120,7 @@ public sealed class OfficialT4MarketDataReader : BackgroundService, IT4MarketDat
                 token.RequestId != _pendingChartTokenRequestId ||
                 !T4ChartSafetyPolicy.TryReadBearerToken(
                     token,
-                    DateTimeOffset.UtcNow,
+                    _timeProvider.GetUtcNow(),
                     out var value,
                     out var expiresAt))
             {
@@ -921,7 +1172,17 @@ public sealed class OfficialT4MarketDataReader : BackgroundService, IT4MarketDat
         {
             return;
         }
-        var now = DateTimeOffset.UtcNow;
+        var now = _timeProvider.GetUtcNow();
+        var rateLimitedUntil = Volatile.Read(ref _rateLimitedUntilUtcTicks);
+        if (rateLimitedUntil > now.UtcDateTime.Ticks)
+        {
+            SetUnavailable("T4_RATE_LIMITED");
+            return;
+        }
+        if (rateLimitedUntil > 0)
+        {
+            Interlocked.Exchange(ref _rateLimitedUntilUtcTicks, 0);
+        }
         foreach (var symbol in _options.ContractCatalog.Contracts
                      .Select(item => item.LogicalSymbol)
                      .Distinct(StringComparer.Ordinal))
@@ -961,12 +1222,58 @@ public sealed class OfficialT4MarketDataReader : BackgroundService, IT4MarketDat
                 return;
             }
         }
+        RecordReadyTransition();
+    }
+
+    internal void RecordReadyTransition()
+    {
+        var wasReady = Health.Ready;
         Volatile.Write(ref _health, Health with
         {
             Ready = true,
             ReasonCode = "READY",
             ReconnectCount = Volatile.Read(ref _reconnectCount),
+            SessionGeneration = Volatile.Read(ref _sessionGeneration),
         });
+        if (!wasReady)
+        {
+            ControlReference? recovery;
+            lock (_controlGate)
+            {
+                recovery = _pendingReconnect;
+                _pendingReconnect = null;
+            }
+            _journal.Append(
+                "session_ready",
+                "READY",
+                Volatile.Read(ref _sessionGeneration),
+                Volatile.Read(ref _reconnectCount),
+                scenarioCode: recovery is null ? null : "reconnect",
+                actionRequestId: recovery?.ActionRequestId,
+                campaignId: recovery?.CampaignId,
+                scopeKey: recovery?.ScopeKey,
+                payload: recovery is null
+                    ? null
+                    : new ObservationEventPayload("reconnect", "consumed"));
+        }
+    }
+
+    internal (int SnapshotKeys, int HistoryKeys) CacheEntryCountsForContractTest =>
+        (_snapshots.Count, _history.Count);
+
+    internal void SeedCacheEntriesForContractTest(MarketDataRequest request)
+    {
+        _snapshots.TryAdd(request.MarketId, new SnapshotBuffer());
+        _snapshots.TryAdd(request.BasisMarketId, new SnapshotBuffer());
+        _history.TryAdd(
+            HistoryKey(request.LogicalSymbol, request.IntervalMinutes),
+            new HistoryBuffer());
+    }
+
+    internal void RefreshRateLimitForContractTest()
+    {
+        _connected = true;
+        RefreshHealth();
     }
 
     private void SetUnavailable(string reasonCode)
@@ -981,8 +1288,159 @@ public sealed class OfficialT4MarketDataReader : BackgroundService, IT4MarketDat
             Ready = false,
             ReasonCode = reasonCode,
             ReconnectCount = Volatile.Read(ref _reconnectCount),
+            SessionGeneration = Volatile.Read(ref _sessionGeneration),
         });
     }
+
+    private ScenarioFault? ConsumeScenarioFault(MarketDataRequest request)
+    {
+        ScenarioFault? fault;
+        var scopeKey = ScopeKey(request);
+        lock (_controlGate)
+        {
+            fault = _pendingScenarioFault;
+            if (fault is not null && fault.ScopeKey == scopeKey)
+            {
+                _pendingScenarioFault = null;
+            }
+        }
+        if (fault is null || fault.ScopeKey != scopeKey)
+        {
+            return null;
+        }
+        var eventType = fault.ReasonCode switch
+        {
+            "T4_MISSING_DATA" => "missing_data_detected",
+            "T4_STALE_DATA" => "stale_data_detected",
+            "T4_RATE_LIMITED" => "rate_limited",
+            _ => throw new InvalidOperationException("Unsupported controlled T4 fault."),
+        };
+        _journal.Append(
+            eventType,
+            fault.ReasonCode,
+            Volatile.Read(ref _sessionGeneration),
+            Volatile.Read(ref _reconnectCount),
+            scenarioCode: fault.ScenarioCode,
+            actionRequestId: fault.ActionRequestId,
+            campaignId: fault.CampaignId,
+            scopeKey: fault.ScopeKey,
+            payload: new ObservationEventPayload(fault.Action, "consumed"));
+        return fault;
+    }
+
+    private void RecordDataFailure(MarketDataRequest request, bool stale)
+    {
+        var reasonCode = stale ? "T4_STALE_DATA" : "T4_MISSING_DATA";
+        SetUnavailable(reasonCode);
+        var scopeKey = ScopeKey(request);
+        var deduplicationKey = string.Join(
+            '\n',
+            Volatile.Read(ref _sessionGeneration).ToString(CultureInfo.InvariantCulture),
+            reasonCode,
+            scopeKey);
+        if (!_recordedDataFailures.TryAdd(deduplicationKey, 0))
+        {
+            return;
+        }
+        _journal.Append(
+            stale ? "stale_data_detected" : "missing_data_detected",
+            reasonCode,
+            Volatile.Read(ref _sessionGeneration),
+            Volatile.Read(ref _reconnectCount),
+            scopeKey: scopeKey);
+    }
+
+    internal void RecordRollEvidence(
+        MarketDataRequest request,
+        ContractTransitionEnvelope transition)
+    {
+        var key = $"{request.LogicalSymbol}\n{transition.FromMarketId}\n{transition.ToMarketId}";
+        if (!_recordedRolls.TryAdd(key, 0))
+        {
+            return;
+        }
+        _journal.Append(
+            "contract_roll_observed",
+            "T4_CONTRACT_ROLL_OBSERVED",
+            Volatile.Read(ref _sessionGeneration),
+            Volatile.Read(ref _reconnectCount),
+            scopeKey: ScopeKey(request),
+            scenarioCode: "roll_transition",
+            payload: new ObservationEventPayload(
+                FromMarketId: transition.FromMarketId,
+                ToMarketId: transition.ToMarketId));
+    }
+
+    private void RecordSessionDisconnected(string reasonCode)
+    {
+        _journal.Append(
+            "session_disconnected",
+            reasonCode,
+            Volatile.Read(ref _sessionGeneration),
+            Volatile.Read(ref _reconnectCount));
+    }
+
+    private void RecordStoppingEvent()
+    {
+        ControlReference? restart;
+        lock (_controlGate)
+        {
+            if (_stoppingEventRecorded)
+            {
+                return;
+            }
+            _stoppingEventRecorded = true;
+            restart = _pendingRestart;
+        }
+        _journal.Append(
+            "bridge_stopping",
+            "BRIDGE_STOPPING",
+            Volatile.Read(ref _sessionGeneration),
+            Volatile.Read(ref _reconnectCount),
+            scenarioCode: restart is null ? null : "bridge_restart",
+            actionRequestId: restart?.ActionRequestId,
+            campaignId: restart?.CampaignId,
+            scopeKey: restart?.ScopeKey,
+            payload: restart is null
+                ? null
+                : new ObservationEventPayload("restart", "consumed"));
+    }
+
+    private void ClearCaches(
+        string reasonCode,
+        string? scenarioCode = null,
+        Guid? actionRequestId = null,
+        Guid? campaignId = null,
+        string? scopeKey = null)
+    {
+        _snapshots.Clear();
+        _history.Clear();
+        _journal.Append(
+            "cache_cleared",
+            reasonCode,
+            Volatile.Read(ref _sessionGeneration),
+            Volatile.Read(ref _reconnectCount),
+            scenarioCode: scenarioCode,
+            actionRequestId: actionRequestId,
+            campaignId: campaignId,
+            scopeKey: scopeKey);
+    }
+
+    private void SetRateLimitedUntil(DateTimeOffset value) =>
+        Interlocked.Exchange(ref _rateLimitedUntilUtcTicks, value.UtcDateTime.Ticks);
+
+    private static string ScopeKey(MarketDataRequest request) =>
+        $"{request.LogicalSymbol}:{request.IntervalMinutes}m";
+
+    private static string ScenarioCode(ObservationControlAction action) => action switch
+    {
+        ObservationControlAction.Reconnect => "reconnect",
+        ObservationControlAction.MissingData => "missing_data",
+        ObservationControlAction.StaleData => "stale_data",
+        ObservationControlAction.RateLimit => "rate_limit",
+        ObservationControlAction.Restart => "bridge_restart",
+        _ => throw new ArgumentOutOfRangeException(nameof(action)),
+    };
 
     private static IReadOnlyList<OrderBookLevelEnvelope> Levels(
         IReadOnlyList<DepthLevel> levels) => levels
@@ -1041,7 +1499,8 @@ public sealed class OfficialT4MarketDataReader : BackgroundService, IT4MarketDat
 
     private static bool ValidOpaqueId(string value, int maximumLength) =>
         value.Length is > 0 && value.Length <= maximumLength &&
-        value == value.Trim() && !value.Any(char.IsControl);
+        value == value.Trim() && value.All(character =>
+            character is >= ' ' and <= '~');
 
     private static bool FinitePositive(double value) => double.IsFinite(value) && value > 0;
 
@@ -1163,6 +1622,65 @@ public sealed class OfficialT4MarketDataReader : BackgroundService, IT4MarketDat
     private sealed record ChartBearerToken(
         string Value,
         DateTimeOffset ExpiresAt);
+
+    private sealed record ScenarioFault(
+        string Action,
+        string ScenarioCode,
+        string ReasonCode,
+        Guid CampaignId,
+        Guid ActionRequestId,
+        string ScopeKey);
+
+    private sealed record ControlReference(
+        Guid CampaignId,
+        Guid ActionRequestId,
+        string ScopeKey);
+}
+
+public sealed class T4RateLimitException : Exception
+{
+    public T4RateLimitException(TimeSpan retryAfter)
+        : base("The T4 Chart API rate limit was reached.")
+    {
+        RetryAfter = T4RateLimitPolicy.Clamp(retryAfter);
+    }
+
+    public TimeSpan RetryAfter { get; }
+}
+
+public static class T4RateLimitPolicy
+{
+    public static readonly TimeSpan DefaultRetryAfter = TimeSpan.FromSeconds(30);
+    public static readonly TimeSpan MinimumRetryAfter = TimeSpan.FromSeconds(1);
+    public static readonly TimeSpan MaximumRetryAfter = TimeSpan.FromMinutes(5);
+
+    public static TimeSpan ResolveRetryAfter(
+        RetryConditionHeaderValue? retryAfter,
+        DateTimeOffset now)
+    {
+        if (retryAfter?.Delta is { } delta)
+        {
+            return Clamp(delta);
+        }
+        if (retryAfter?.Date is { } date)
+        {
+            return Clamp(date - now);
+        }
+        return DefaultRetryAfter;
+    }
+
+    public static TimeSpan Clamp(TimeSpan value)
+    {
+        if (value < MinimumRetryAfter)
+        {
+            return MinimumRetryAfter;
+        }
+        if (value > MaximumRetryAfter)
+        {
+            return MaximumRetryAfter;
+        }
+        return value;
+    }
 }
 
 public static class T4OutboundPolicy

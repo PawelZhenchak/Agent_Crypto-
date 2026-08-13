@@ -293,6 +293,19 @@ class _FunctionDefinitionRequirement:
     source_sha256: str
 
 
+@dataclass(frozen=True, slots=True)
+class _RoutineRequirement:
+    name: str
+    argument_count: int
+    identity_arguments: str
+    language: str
+    volatility: str
+    security_definer: bool
+    owner: str
+    fixed_search_path: bool
+    source_sha256: str
+
+
 _MIGRATION_FILE = re.compile(r"^(?P<version>[0-9]{4})_(?P<name>[a-z0-9_]+)\.sql$")
 
 _REQUIRED_POSTGRES_MAJOR = 16
@@ -362,6 +375,11 @@ _MIGRATED_TABLES = (
     "t4_observation_cycles",
     "t4_observation_session_events",
     "t4_observation_quality_reports",
+    "t4_bridge_evidence_keys",
+    "t4_bridge_observation_events",
+    "t4_replay_verifier_attestations",
+    "t4_observation_scenario_trial_requests",
+    "t4_observation_scenario_trials",
 )
 _BASE_TRIGGER_FUNCTIONS = (
     "forbid_append_only_change",
@@ -387,6 +405,96 @@ _MIGRATED_TRIGGER_FUNCTIONS = (
     "enforce_t4_observation_research_input",
     "enforce_t4_observation_cycle_chain",
     "enforce_t4_observation_event_chain",
+    "enforce_t4_bridge_observation_event",
+    "enforce_t4_observation_scenario_trial",
+    "enforce_t4_scenario_alert_finalization",
+    "serialize_t4_observation_campaign_write",
+)
+_MIGRATED_ROUTINE_REQUIREMENTS = (
+    _RoutineRequirement(
+        "t4_evidence_verifier_session_is_safe", 0, "", "sql", "s", False,
+        "crypto_agent_evidence_owner", True,
+        "aa4f8a329e29f5252573bf1de0b32bb02a75973932ad65eaccb425ff6b4f4aa1",
+    ),
+    _RoutineRequirement(
+        "t4_replay_attestations_are_verified", 2,
+        "p_campaign_id uuid, p_attestation_ids bigint[]", "plpgsql", "s", True,
+        "crypto_agent_evidence_owner", True,
+        "53924f4fd74aead92ac3b07e98f40cd3860c594a4e68097adcb7292cac3e05b1",
+    ),
+    _RoutineRequirement(
+        "forbid_append_only_change", 0, "", "plpgsql", "v", False,
+        "crypto_agent_evidence_owner", True,
+        "365608cac855e60c4fa0138ffaf654ee4cb66ef261e83086e47d9b71f60bc252",
+    ),
+    _RoutineRequirement(
+        "canonical_jsonb_text", 1, "p_value jsonb", "plpgsql", "i", False,
+        "crypto_agent_evidence_owner", True,
+        "04429a83abe2acdc537329532cf7e3ec9206a3673d2757d9fe6a7714f4f4d9c1",
+    ),
+    _RoutineRequirement(
+        "register_t4_bridge_evidence_key", 1,
+        "p_public_key_spki_base64 text", "plpgsql", "v", True,
+        "crypto_agent_evidence_owner", True,
+        "10d90542e5a8cdd58c743a07ba5498b1eedcb7c228c70ad82ea557b3996dfa99",
+    ),
+    _RoutineRequirement(
+        "record_verified_t4_bridge_observation_event", 17,
+        "p_event_id uuid, p_campaign_id uuid, p_sequence_no bigint, "
+        "p_event_at timestamp with time zone, p_event_type text, "
+        "p_reason_code text, p_boot_id uuid, p_session_generation bigint, "
+        "p_reconnect_count integer, p_scenario_code text, "
+        "p_action_request_id uuid, p_previous_event_hash "
+        "crypto_agent.sha256_hex, p_payload_hash_sha256 "
+        "crypto_agent.sha256_hex, p_event_hash_sha256 "
+        "crypto_agent.sha256_hex, p_canonical_payload_base64 text, "
+        "p_evidence_key_fingerprint_sha256 crypto_agent.sha256_hex, "
+        "p_signature_base64 text",
+        "plpgsql", "v", True, "crypto_agent_evidence_owner", True,
+        "79f4c4d7fe8058942003b374c9504db4a55e7bb56fd3d83beebba969056b08d9",
+    ),
+    _RoutineRequirement(
+        "record_verified_t4_replay_attestation", 8,
+        "p_attestation_id uuid, p_campaign_id uuid, p_scope_key text, "
+        "p_replay_as_of timestamp with time zone, "
+        "p_replay_fingerprint_sha256 crypto_agent.sha256_hex, "
+        "p_source_batch_ids bigint[], p_source_batch_hashes "
+        "crypto_agent.sha256_hex[], p_provenance_sha256 "
+        "crypto_agent.sha256_hex",
+        "plpgsql", "v", True, "crypto_agent_evidence_owner", True,
+        "77d4d0e1dbf55a127ed22706fb6b5f96532275f8ff6b2a87b3100c0aec5a1370",
+    ),
+    _RoutineRequirement(
+        "begin_t4_observation_scenario_trial", 4,
+        "p_campaign_id uuid, p_scenario_code text, p_action_request_id uuid, "
+        "p_scope_key text", "plpgsql", "v", True,
+        "crypto_agent_evidence_owner", True,
+        "b8544458b532eb9e1a9365569a91a6fcb722a6bf89b23f5f9c42c2b6b27953ea",
+    ),
+    _RoutineRequirement(
+        "complete_t4_observation_scenario_trial", 3,
+        "p_trial_id uuid, p_event_hashes crypto_agent.sha256_hex[], "
+        "p_control_receipt_event_hash crypto_agent.sha256_hex",
+        "plpgsql", "v", True, "crypto_agent_evidence_owner", True,
+        "590a1f9ae99236e325d02f642f48ff457d4ebc5192333ca6bd4e44567434c334",
+    ),
+    _RoutineRequirement(
+        "verify_passive_t4_observation_scenario", 2,
+        "p_campaign_id uuid, p_scenario_code text", "plpgsql", "v", True,
+        "crypto_agent_evidence_owner", True,
+        "fcd08ad41f87a28a6034f9837180e67630def7f18b4c72846db468dc71557acd",
+    ),
+    _RoutineRequirement(
+        "t4_observation_gate_is_verified", 1, "p_campaign_id uuid",
+        "plpgsql", "v", True, "crypto_agent_evidence_owner", True,
+        "dbe5d89b09c440440f60466aa22d04904e67065c13421e3add84abcb1d2b9023",
+    ),
+    _RoutineRequirement(
+        "t4_observation_gate_is_verified", 2,
+        "p_campaign_id uuid, p_checkpoint_event_id uuid", "plpgsql", "v",
+        True, "crypto_agent_evidence_owner", True,
+        "bf94252b1e006c8d84cf5b13528b579be476f91f51082c5175997a29b7e8a114",
+    ),
 )
 
 
@@ -897,6 +1005,163 @@ _MIGRATED_COLUMN_REQUIREMENTS = (
             ("created_at", "timestamptz"),
         ),
     )
+    + tuple(
+        _ColumnRequirement(
+            table="t4_observation_quality_reports",
+            name=name,
+            type_name=type_name,
+            not_null=False,
+        )
+        for name, type_name in (
+            ("bridge_checkpoint_event_id", "uuid"),
+            ("bridge_checkpoint_sequence_no", "int8"),
+            ("bridge_checkpoint_event_hash", "sha256_hex"),
+            ("bridge_checkpoint_action_request_id", "uuid"),
+        )
+    )
+    + (
+        _ColumnRequirement(
+            table="t4_observation_campaigns",
+            name="bridge_evidence_key_fingerprint",
+            type_name="sha256_hex",
+            not_null=False,
+        ),
+    )
+    + _column_requirements(
+        "t4_bridge_evidence_keys",
+        (
+            ("evidence_key_fingerprint", "sha256_hex"),
+            ("public_key_spki_base64", "text"),
+            ("signature_algorithm", "text"),
+            ("registered_at", "timestamptz"),
+        ),
+    )
+    + (
+        _ColumnRequirement(
+            table="t4_bridge_evidence_keys",
+            name="retired_at",
+            type_name="timestamptz",
+            not_null=False,
+        ),
+    )
+    + _column_requirements(
+        "t4_bridge_observation_events",
+        (
+            ("bridge_observation_event_id", "int8"),
+            ("event_id", "uuid"),
+            ("sequence_no", "int8"),
+            ("event_at", "timestamptz"),
+            ("event_type", "text"),
+            ("reason_code", "text"),
+            ("boot_id", "uuid"),
+            ("session_generation", "int8"),
+            ("reconnect_count", "int4"),
+            ("environment", "text"),
+            ("bridge_schema_version", "int2"),
+            ("read_only", "bool"),
+            ("order_routes_exposed", "bool"),
+            ("payload", "jsonb"),
+            ("payload_hash_sha256", "sha256_hex"),
+            ("event_hash_sha256", "sha256_hex"),
+            ("canonical_payload_base64", "text"),
+            ("signature_algorithm", "text"),
+            ("evidence_key_fingerprint_sha256", "sha256_hex"),
+            ("signature_base64", "text"),
+            ("signature_verified", "bool"),
+            ("signature_verified_at", "timestamptz"),
+            ("signature_verified_by", "name"),
+            ("received_at", "timestamptz"),
+        ),
+    )
+    + tuple(
+        _ColumnRequirement(
+            table="t4_bridge_observation_events",
+            name=name,
+            type_name=type_name,
+            not_null=False,
+        )
+        for name, type_name in (
+            ("campaign_id", "uuid"),
+            ("scenario_code", "text"),
+            ("action_request_id", "uuid"),
+            ("scope_key", "text"),
+            ("control_action", "text"),
+            ("control_step", "text"),
+            ("roll_from_market_id", "text"),
+            ("roll_to_market_id", "text"),
+            ("previous_event_hash", "sha256_hex"),
+        )
+    )
+    + _column_requirements(
+        "t4_replay_verifier_attestations",
+        (
+            ("replay_attestation_id", "int8"),
+            ("attestation_id", "uuid"),
+            ("campaign_id", "uuid"),
+            ("scope_key", "text"),
+            ("replay_as_of", "timestamptz"),
+            ("replay_limit", "int4"),
+            ("replay_fingerprint_sha256", "sha256_hex"),
+            ("source_batch_ids", "_int8"),
+            ("source_batch_hashes", "_sha256_hex"),
+            ("provenance_sha256", "sha256_hex"),
+            ("read_only", "bool"),
+            ("execution_enabled", "bool"),
+            ("external_delivery_eligible", "bool"),
+            ("attested_at", "timestamptz"),
+            ("attested_by", "name"),
+            ("content_hash", "sha256_hex"),
+        ),
+    )
+    + _column_requirements(
+        "t4_observation_scenario_trial_requests",
+        (
+            ("trial_id", "uuid"),
+            ("campaign_id", "uuid"),
+            ("scenario_code", "text"),
+            ("scope_key", "text"),
+            ("action_request_id", "uuid"),
+            ("started_at", "timestamptz"),
+            ("content_hash", "sha256_hex"),
+        ),
+    )
+    + _column_requirements(
+        "t4_observation_scenario_trials",
+        (
+            ("scenario_trial_id", "int8"),
+            ("trial_id", "uuid"),
+            ("campaign_id", "uuid"),
+            ("scenario_code", "text"),
+            ("outcome", "text"),
+            ("started_at", "timestamptz"),
+            ("completed_at", "timestamptz"),
+            ("evidence_event_ids", "_uuid"),
+            ("evidence_event_hashes", "_sha256_hex"),
+            ("replay_attestation_ids", "_int8"),
+            ("detail_code", "text"),
+            ("content_hash", "sha256_hex"),
+            ("created_at", "timestamptz"),
+        ),
+    )
+    + tuple(
+        _ColumnRequirement(
+            table="t4_observation_scenario_trials",
+            name=name,
+            type_name=type_name,
+            not_null=False,
+        )
+        for name, type_name in (
+            ("action_request_id", "uuid"),
+            ("bridge_boot_id", "uuid"),
+            ("first_event_id", "uuid"),
+            ("last_event_id", "uuid"),
+            ("pre_t4_batch_id", "int8"),
+            ("post_t4_batch_id", "int8"),
+            ("observation_cycle_id", "int8"),
+            ("research_run_id", "int8"),
+            ("replay_fingerprint_sha256", "sha256_hex"),
+        )
+    )
 )
 
 
@@ -908,14 +1173,14 @@ def _append_only_trigger_requirements(
         requirements.extend(
             (
                 _TriggerRequirement(
-                    name=f"{table}_append_only_row_guard",
+                    name=_postgres_identifier(f"{table}_append_only_row_guard"),
                     table=table,
                     function="forbid_append_only_change",
                     # ROW | BEFORE | DELETE | UPDATE
                     type_mask=1 | 2 | 8 | 16,
                 ),
                 _TriggerRequirement(
-                    name=f"{table}_append_only_truncate_guard",
+                    name=_postgres_identifier(f"{table}_append_only_truncate_guard"),
                     table=table,
                     function="forbid_append_only_change",
                     # STATEMENT | BEFORE | TRUNCATE
@@ -924,6 +1189,12 @@ def _append_only_trigger_requirements(
             )
         )
     return tuple(requirements)
+
+
+def _postgres_identifier(value: str) -> str:
+    """Return the catalog spelling of a generated unquoted ASCII identifier."""
+
+    return value.encode("ascii")[:63].decode("ascii")
 
 
 _BASE_TRIGGER_REQUIREMENTS = _append_only_trigger_requirements(_BASE_TABLES) + (
@@ -1081,6 +1352,44 @@ _MIGRATED_TRIGGER_REQUIREMENTS = _append_only_trigger_requirements(_MIGRATED_TAB
         "enforce_t4_observation_final_report",
         1 | 2 | 4,
     ),
+    _TriggerRequirement(
+        "t4_bridge_observation_event_integrity_guard",
+        "t4_bridge_observation_events",
+        "enforce_t4_bridge_observation_event",
+        1 | 2 | 4,
+    ),
+    _TriggerRequirement(
+        "t4_observation_scenario_trial_integrity_guard",
+        "t4_observation_scenario_trials",
+        "enforce_t4_observation_scenario_trial",
+        1 | 2 | 4,
+    ),
+    _TriggerRequirement(
+        "t4_observation_campaign_serialization_input_guard",
+        "t4_observation_research_inputs",
+        "serialize_t4_observation_campaign_write",
+        1 | 2 | 4,
+    ),
+    _TriggerRequirement(
+        "t4_observation_campaign_serialization_cycle_guard",
+        "t4_observation_cycles",
+        "serialize_t4_observation_campaign_write",
+        1 | 2 | 4,
+    ),
+    _TriggerRequirement(
+        "t4_scenario_alert_finalization_guard",
+        "alerts",
+        "enforce_t4_scenario_alert_finalization",
+        1 | 2 | 4,
+    ),
+)
+_MIGRATED_TRIGGER_CATALOG_TABLES = tuple(
+    dict.fromkeys(
+        (
+            *_MIGRATED_TABLES,
+            *(requirement.table for requirement in _MIGRATED_TRIGGER_REQUIREMENTS),
+        )
+    )
 )
 _OPERATIONAL_CONSTRAINT_REQUIREMENTS = (
     _CatalogDefinitionRequirement(
@@ -1547,6 +1856,490 @@ _OPERATIONAL_CONSTRAINT_REQUIREMENTS = (
         "u",
         "UNIQUE (content_hash)",
     ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_quality_reports",
+        "t4_observation_quality_reports_checkpoint_event_fk",
+        "f",
+        "FOREIGN KEY (bridge_checkpoint_event_id) REFERENCES "
+        "crypto_agent.t4_bridge_observation_events(event_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_quality_reports",
+        "t4_observation_quality_reports_checkpoint_event_key",
+        "u",
+        "UNIQUE (bridge_checkpoint_event_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_quality_reports",
+        "t4_observation_quality_reports_checkpoint_shape_check",
+        "c",
+        "CHECK ((((bridge_checkpoint_event_id IS NULL) AND "
+        "(bridge_checkpoint_sequence_no IS NULL) AND "
+        "(bridge_checkpoint_event_hash IS NULL) AND "
+        "(bridge_checkpoint_action_request_id IS NULL)) OR "
+        "((bridge_checkpoint_event_id IS NOT NULL) AND "
+        "(bridge_checkpoint_sequence_no > 0) AND "
+        "(bridge_checkpoint_event_hash IS NOT NULL) AND "
+        "(bridge_checkpoint_action_request_id IS NOT NULL))))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_bridge_evidence_keys",
+        "t4_bridge_evidence_keys_pkey",
+        "p",
+        "PRIMARY KEY (evidence_key_fingerprint)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_bridge_evidence_keys",
+        "t4_bridge_evidence_keys_signature_algorithm_check",
+        "c",
+        "CHECK ((signature_algorithm = 'ecdsa-p256-sha256-der'::text))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_bridge_evidence_keys",
+        "t4_bridge_evidence_keys_retirement_check",
+        "c",
+        "CHECK (((retired_at IS NULL) OR (retired_at > registered_at)))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_bridge_evidence_keys",
+        "t4_bridge_evidence_keys_spki_size_check",
+        "c",
+        "CHECK (((octet_length(decode(public_key_spki_base64, 'base64'::text)) "
+        ">= 80) AND (octet_length(decode(public_key_spki_base64, "
+        "'base64'::text)) <= 256)))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_bridge_evidence_keys",
+        "t4_bridge_evidence_keys_fingerprint_check",
+        "c",
+        "CHECK (((evidence_key_fingerprint)::text = encode(public.digest("
+        "decode(public_key_spki_base64, 'base64'::text), 'sha256'::text), "
+        "'hex'::text)))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_campaigns",
+        "t4_observation_campaigns_bridge_evidence_key_fk",
+        "f",
+        "FOREIGN KEY (bridge_evidence_key_fingerprint) REFERENCES "
+        "crypto_agent.t4_bridge_evidence_keys(evidence_key_fingerprint)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_bridge_observation_events",
+        "t4_bridge_observation_events_pkey",
+        "p",
+        "PRIMARY KEY (bridge_observation_event_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_bridge_observation_events",
+        "t4_bridge_observation_events_event_id_key",
+        "u",
+        "UNIQUE (event_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_bridge_observation_events",
+        "t4_bridge_observation_events_event_hash_sha256_key",
+        "u",
+        "UNIQUE (event_hash_sha256)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_bridge_observation_events",
+        "t4_bridge_observation_events_evidence_key_fingerprint_sha25_key",
+        "u",
+        "UNIQUE (evidence_key_fingerprint_sha256, sequence_no)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_bridge_observation_events",
+        "t4_bridge_observation_events_evidence_key_fingerprint_sha2_fkey",
+        "f",
+        "FOREIGN KEY (evidence_key_fingerprint_sha256) REFERENCES "
+        "crypto_agent.t4_bridge_evidence_keys(evidence_key_fingerprint)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_bridge_observation_events",
+        "t4_bridge_observation_events_sequence_positive_check",
+        "c",
+        "CHECK ((sequence_no > 0))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_bridge_observation_events",
+        "t4_bridge_observation_events_event_type_check",
+        "c",
+        "CHECK ((event_type = ANY (ARRAY['bridge_started'::text, "
+        "'session_connecting'::text, 'session_authenticated'::text, "
+        "'session_ready'::text, 'session_disconnected'::text, "
+        "'cache_cleared'::text, 'missing_data_detected'::text, "
+        "'stale_data_detected'::text, 'rate_limited'::text, "
+        "'contract_roll_observed'::text, 'control_requested'::text, "
+        "'control_applied'::text, 'bridge_stopping'::text, "
+        "'outbound_rejected'::text, 'campaign_checkpoint'::text])))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_bridge_observation_events",
+        "t4_bridge_observation_events_live_environment_check",
+        "c",
+        "CHECK ((environment = 'live_t4'::text))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_bridge_observation_events",
+        "t4_bridge_observation_events_schema_v5_check",
+        "c",
+        "CHECK ((bridge_schema_version = 5))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_bridge_observation_events",
+        "t4_bridge_observation_events_read_only_check",
+        "c",
+        "CHECK (read_only)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_bridge_observation_events",
+        "t4_bridge_observation_events_no_order_routes_check",
+        "c",
+        "CHECK ((NOT order_routes_exposed))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_bridge_observation_events",
+        "t4_bridge_observation_events_signature_verified_check",
+        "c",
+        "CHECK (signature_verified)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_bridge_observation_events",
+        "t4_bridge_observation_events_signature_algorithm_check",
+        "c",
+        "CHECK ((signature_algorithm = 'ecdsa-p256-sha256-der'::text))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_bridge_observation_events",
+        "t4_bridge_observation_events_chain_shape_check",
+        "c",
+        "CHECK ((((sequence_no = 1) AND (previous_event_hash IS NULL)) OR "
+        "((sequence_no > 1) AND (previous_event_hash IS NOT NULL))))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_bridge_observation_events",
+        "t4_bridge_observation_events_roll_projection_check",
+        "c",
+        "CHECK ((((event_type = 'contract_roll_observed'::text) AND "
+        "(roll_from_market_id IS NOT NULL) AND (roll_to_market_id IS NOT NULL) "
+        "AND (roll_from_market_id <> roll_to_market_id)) OR "
+        "((event_type <> 'contract_roll_observed'::text) AND "
+        "(roll_from_market_id IS NULL) AND (roll_to_market_id IS NULL))))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_bridge_observation_events",
+        "t4_bridge_observation_events_hash_check",
+        "c",
+        "CHECK (((event_hash_sha256)::text = encode(public.digest("
+        "decode(canonical_payload_base64, 'base64'::text), 'sha256'::text), "
+        "'hex'::text)))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_scenario_trial_requests",
+        "t4_observation_scenario_trial_requests_pkey",
+        "p",
+        "PRIMARY KEY (trial_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_scenario_trial_requests",
+        "t4_observation_scenario_trial_requests_campaign_id_fkey",
+        "f",
+        "FOREIGN KEY (campaign_id) REFERENCES "
+        "crypto_agent.t4_observation_campaigns(campaign_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_scenario_trial_requests",
+        "t4_observation_scenario_trial_campaign_id_scenario_code_act_key",
+        "u",
+        "UNIQUE (campaign_id, scenario_code, action_request_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_scenario_trial_requests",
+        "t4_observation_scenario_trial_requests_campaign_action_key",
+        "u",
+        "UNIQUE (campaign_id, action_request_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_replay_verifier_attestations",
+        "t4_replay_verifier_attestations_pk",
+        "p",
+        "PRIMARY KEY (replay_attestation_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_replay_verifier_attestations",
+        "t4_replay_verifier_attestations_attestation_key",
+        "u",
+        "UNIQUE (attestation_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_replay_verifier_attestations",
+        "t4_replay_verifier_attestations_campaign_scope_key",
+        "u",
+        "UNIQUE (campaign_id, scope_key)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_replay_verifier_attestations",
+        "t4_replay_verifier_attestations_content_hash_key",
+        "u",
+        "UNIQUE (content_hash)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_replay_verifier_attestations",
+        "t4_replay_verifier_attestations_campaign_fk",
+        "f",
+        "FOREIGN KEY (campaign_id) REFERENCES "
+        "crypto_agent.t4_observation_campaigns(campaign_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_replay_verifier_attestations",
+        "t4_replay_verifier_attestations_scope_key_check",
+        "c",
+        "CHECK ((scope_key ~ '^(BTC|ETH)/USD:(240|1440|10080)m$'::text))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_replay_verifier_attestations",
+        "t4_replay_verifier_attestations_limit_check",
+        "c",
+        "CHECK ((replay_limit = 120))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_replay_verifier_attestations",
+        "t4_replay_verifier_attestations_source_cardinality_check",
+        "c",
+        "CHECK (((cardinality(source_batch_ids) = 1) AND "
+        "(cardinality(source_batch_hashes) = 1) AND "
+        "(source_batch_ids[1] > 0)))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_replay_verifier_attestations",
+        "t4_replay_verifier_attestations_safety_check",
+        "c",
+        "CHECK ((read_only AND (NOT execution_enabled) AND "
+        "(NOT external_delivery_eligible)))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_replay_verifier_attestations",
+        "t4_replay_verifier_attestations_time_check",
+        "c",
+        "CHECK ((replay_as_of <= attested_at))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_scenario_trials",
+        "t4_observation_scenario_trials_pkey",
+        "p",
+        "PRIMARY KEY (scenario_trial_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_scenario_trials",
+        "t4_observation_scenario_trials_trial_id_key",
+        "u",
+        "UNIQUE (trial_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_scenario_trials",
+        "t4_observation_scenario_trials_campaign_id_fkey",
+        "f",
+        "FOREIGN KEY (campaign_id) REFERENCES "
+        "crypto_agent.t4_observation_campaigns(campaign_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_scenario_trials",
+        "t4_observation_scenario_trials_outcome_check",
+        "c",
+        "CHECK ((outcome = ANY (ARRAY['pass'::text, 'fail'::text])))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_scenario_trials",
+        "t4_observation_scenario_trials_first_event_id_fkey",
+        "f",
+        "FOREIGN KEY (first_event_id) REFERENCES "
+        "crypto_agent.t4_bridge_observation_events(event_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_scenario_trials",
+        "t4_observation_scenario_trials_last_event_id_fkey",
+        "f",
+        "FOREIGN KEY (last_event_id) REFERENCES "
+        "crypto_agent.t4_bridge_observation_events(event_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_scenario_trials",
+        "t4_observation_scenario_trials_pre_t4_batch_id_fkey",
+        "f",
+        "FOREIGN KEY (pre_t4_batch_id) REFERENCES "
+        "crypto_agent.t4_ingestion_batches(t4_batch_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_scenario_trials",
+        "t4_observation_scenario_trials_post_t4_batch_id_fkey",
+        "f",
+        "FOREIGN KEY (post_t4_batch_id) REFERENCES "
+        "crypto_agent.t4_ingestion_batches(t4_batch_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_scenario_trials",
+        "t4_observation_scenario_trials_observation_cycle_id_fkey",
+        "f",
+        "FOREIGN KEY (observation_cycle_id) REFERENCES "
+        "crypto_agent.t4_observation_cycles(observation_cycle_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_scenario_trials",
+        "t4_observation_scenario_trials_research_run_id_fkey",
+        "f",
+        "FOREIGN KEY (research_run_id) REFERENCES "
+        "crypto_agent.research_runs(research_run_id)",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_scenario_trials",
+        "t4_observation_scenario_trials_time_check",
+        "c",
+        "CHECK (((started_at <= completed_at) AND (completed_at <= created_at)))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_scenario_trials",
+        "t4_observation_scenario_trials_event_cardinality_check",
+        "c",
+        "CHECK (((cardinality(evidence_event_ids) = "
+        "cardinality(evidence_event_hashes)) AND "
+        "(cardinality(evidence_event_ids) <= 64)))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_scenario_trials",
+        "t4_observation_scenario_trials_replay_attestation_shape_check",
+        "c",
+        "CHECK ((((scenario_code = 'replay_blocked'::text) AND "
+        "(research_run_id IS NULL) AND "
+        "(replay_fingerprint_sha256 IS NULL) AND "
+        "(cardinality(replay_attestation_ids) > 0)) OR "
+        "((scenario_code <> 'replay_blocked'::text) AND "
+        "(cardinality(replay_attestation_ids) = 0))))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_scenario_trials",
+        "t4_observation_scenario_trials_shape_check",
+        "c",
+        "CHECK (((outcome = 'fail'::text) OR ((scenario_code = "
+        "'replay_blocked'::text) AND (first_event_id IS NULL) AND "
+        "(last_event_id IS NULL) AND (cardinality(evidence_event_ids) = 0)) OR "
+        "((scenario_code <> 'replay_blocked'::text) AND "
+        "(first_event_id IS NOT NULL) AND (last_event_id IS NOT NULL) AND "
+        "(cardinality(evidence_event_ids) > 0) AND "
+        "(evidence_event_ids[1] = first_event_id) AND "
+        "(evidence_event_ids[cardinality(evidence_event_ids)] = "
+        "last_event_id))))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_bridge_observation_events",
+        "t4_bridge_observation_events_attestation_time_check", "c",
+        "CHECK (((event_at <= signature_verified_at) AND "
+        "(signature_verified_at <= received_at)))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_bridge_observation_events",
+        "t4_bridge_observation_events_canonical_size_check", "c",
+        "CHECK (((octet_length(decode(canonical_payload_base64, "
+        "'base64'::text)) >= 32) AND (octet_length(decode("
+        "canonical_payload_base64, 'base64'::text)) <= 65536)))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_bridge_observation_events",
+        "t4_bridge_observation_events_control_action_check", "c",
+        "CHECK (((control_action IS NULL) OR (control_action = ANY "
+        "(ARRAY['restart'::text, 'reconnect'::text, 'missing_data'::text, "
+        "'stale_data'::text, 'rate_limit'::text, 'checkpoint'::text]))))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_bridge_observation_events",
+        "t4_bridge_observation_events_control_event_shape_check", "c",
+        "CHECK ((((event_type = ANY (ARRAY['control_requested'::text, "
+        "'control_applied'::text])) AND (action_request_id IS NOT NULL) AND "
+        "(control_step IS NOT NULL)) OR (event_type <> ALL "
+        "(ARRAY['control_requested'::text, 'control_applied'::text]))))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_bridge_observation_events",
+        "t4_bridge_observation_events_control_projection_check", "c",
+        "CHECK (((control_action IS NULL) = (control_step IS NULL)))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_bridge_observation_events",
+        "t4_bridge_observation_events_control_step_check", "c",
+        "CHECK (((control_step IS NULL) OR (control_step = ANY "
+        "(ARRAY['requested'::text, 'applied'::text, 'consumed'::text]))))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_bridge_observation_events",
+        "t4_bridge_observation_events_payload_check", "c",
+        "CHECK (((jsonb_typeof(payload) = 'object'::text) AND "
+        "(octet_length((payload)::text) <= 16384)))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_bridge_observation_events",
+        "t4_bridge_observation_events_reason_code_check", "c",
+        "CHECK ((reason_code ~ '^[A-Z][A-Z0-9_]{0,63}$'::text))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_bridge_observation_events",
+        "t4_bridge_observation_events_received_at_check", "c",
+        "CHECK ((received_at <= (clock_timestamp() + '00:05:00'::interval)))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_bridge_observation_events",
+        "t4_bridge_observation_events_reconnect_count_check", "c",
+        "CHECK ((reconnect_count >= 0))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_bridge_observation_events",
+        "t4_bridge_observation_events_scenario_code_check", "c",
+        "CHECK (((scenario_code IS NULL) OR (scenario_code = ANY "
+        "(ARRAY['bridge_restart'::text, 'missing_data'::text, "
+        "'rate_limit'::text, 'reconnect'::text, 'replay_blocked'::text, "
+        "'roll_transition'::text, 'stale_data'::text]))))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_bridge_observation_events",
+        "t4_bridge_observation_events_scope_key_check", "c",
+        "CHECK (((scope_key IS NULL) OR (scope_key ~ "
+        "'^(BTC|ETH)/USD:(240|1440|10080)m$'::text)))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_bridge_observation_events",
+        "t4_bridge_observation_events_session_generation_check", "c",
+        "CHECK ((session_generation >= 0))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_bridge_observation_events",
+        "t4_bridge_observation_events_signature_size_check", "c",
+        "CHECK (((octet_length(decode(signature_base64, 'base64'::text)) "
+        ">= 8) AND (octet_length(decode(signature_base64, "
+        "'base64'::text)) <= 256)))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_scenario_trial_requests",
+        "t4_observation_scenario_trial_requests_scenario_code_check", "c",
+        "CHECK ((scenario_code = ANY (ARRAY['bridge_restart'::text, "
+        "'missing_data'::text, 'rate_limit'::text, 'reconnect'::text, "
+        "'stale_data'::text])))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_scenario_trial_requests",
+        "t4_observation_scenario_trial_requests_scope_key_check", "c",
+        "CHECK ((scope_key ~ '^(BTC|ETH)/USD:(240|1440|10080)m$'::text))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_scenario_trials",
+        "t4_observation_scenario_trials_detail_code_check", "c",
+        "CHECK ((detail_code ~ '^[A-Z][A-Z0-9_]{0,63}$'::text))",
+    ),
+    _CatalogDefinitionRequirement(
+        "t4_observation_scenario_trials",
+        "t4_observation_scenario_trials_scenario_code_check", "c",
+        "CHECK ((scenario_code = ANY (ARRAY['bridge_restart'::text, "
+        "'missing_data'::text, 'rate_limit'::text, 'reconnect'::text, "
+        "'replay_blocked'::text, 'roll_transition'::text, "
+        "'stale_data'::text])))",
+    ),
 )
 _OPERATIONAL_INDEX_REQUIREMENTS = (
     _IndexRequirement(
@@ -1623,6 +2416,31 @@ _OPERATIONAL_INDEX_REQUIREMENTS = (
         "crypto_agent.t4_observation_session_events USING btree "
         "(campaign_id, scenario_code, outcome) WHERE (scenario_code IS NOT NULL)",
     ),
+    _IndexRequirement(
+        "t4_bridge_observation_events",
+        "t4_bridge_observation_events_campaign_time_idx",
+        False,
+        "CREATE INDEX t4_bridge_observation_events_campaign_time_idx ON "
+        "crypto_agent.t4_bridge_observation_events USING btree "
+        "(campaign_id, event_at, sequence_no)",
+    ),
+    _IndexRequirement(
+        "t4_bridge_observation_events",
+        "t4_bridge_observation_events_scenario_idx",
+        False,
+        "CREATE INDEX t4_bridge_observation_events_scenario_idx ON "
+        "crypto_agent.t4_bridge_observation_events USING btree "
+        "(campaign_id, scenario_code, action_request_id, sequence_no) "
+        "WHERE (scenario_code IS NOT NULL)",
+    ),
+    _IndexRequirement(
+        "t4_observation_scenario_trials",
+        "t4_observation_scenario_trials_campaign_idx",
+        False,
+        "CREATE INDEX t4_observation_scenario_trials_campaign_idx ON "
+        "crypto_agent.t4_observation_scenario_trials USING btree "
+        "(campaign_id, scenario_code, completed_at)",
+    ),
 )
 _OPERATIONAL_FUNCTION_REQUIREMENTS = (
     _FunctionDefinitionRequirement(
@@ -1643,36 +2461,64 @@ _OPERATIONAL_FUNCTION_REQUIREMENTS = (
         "enforce_t4_observation_campaign_start",
         "plpgsql",
         "v",
-        False,
-        "2a8055eac4af2d433b146a397ad197f60e765f8c603e9599680e92ad8d06694d",
+        True,
+        "d3c94b00a3e74822877f8ca8f149c8affe0180b5f0d1f41d15349f56254963c2",
     ),
     _FunctionDefinitionRequirement(
         "enforce_t4_observation_final_report",
         "plpgsql",
         "v",
-        False,
-        "4f0ef6c8f11caa6a7c9bda559eda5d81a9c83391ee368d918310e4ce9938ef23",
+        True,
+        "f08ab7f5df629aaf0f927e2ca5e43c6213e4504808c1e6d543469e3fa88859c3",
     ),
     _FunctionDefinitionRequirement(
         "enforce_t4_observation_research_input",
         "plpgsql",
         "v",
         False,
-        "c3388c439f8fb42d66285b448e71e3997240a5ae63494c5bf092d504e91a8c44",
+        "e28de614028e10db3af05a06f8ce926a845e60677eef9f6d30e293f3a00fb337",
     ),
     _FunctionDefinitionRequirement(
         "enforce_t4_observation_cycle_chain",
         "plpgsql",
         "v",
         False,
-        "20a6bca7d7ab616fda6000b16e32489fe52f022cf069871a1f0affccdd5523b9",
+        "9d67015e96ecb2269b9d0043cd3ae687ad0fd1dc10935f87e29dd98afc308e77",
     ),
     _FunctionDefinitionRequirement(
         "enforce_t4_observation_event_chain",
         "plpgsql",
         "v",
         False,
-        "f4a241187fed453d8a791fb857c907e5b7a90a9acfeeb6a96dd65f921cf2966c",
+        "3a17765b11a411760b7a6ddc0524c9a60dcf6f362bc893f607de558e0b75daec",
+    ),
+    _FunctionDefinitionRequirement(
+        "enforce_t4_bridge_observation_event",
+        "plpgsql",
+        "v",
+        False,
+        "ee19cb134c47d62747bc7cabb842d9ced81c9ac72ab61e11631e083f6670fb2a",
+    ),
+    _FunctionDefinitionRequirement(
+        "enforce_t4_observation_scenario_trial",
+        "plpgsql",
+        "v",
+        False,
+        "db3fa6193cdd198bf47263db352256ab7e3694adafd8f42ce413fa2d5a2e2909",
+    ),
+    _FunctionDefinitionRequirement(
+        "enforce_t4_scenario_alert_finalization",
+        "plpgsql",
+        "v",
+        True,
+        "360ade53de8e58c4439ac0d4cc91a99b067ca602acefbb8c7cee3d283c52d6a9",
+    ),
+    _FunctionDefinitionRequirement(
+        "serialize_t4_observation_campaign_write",
+        "plpgsql",
+        "v",
+        False,
+        "5b8dd4b568aa1394df083b03d5711e1e3810e0e4d366101a7d6da440da13898d",
     ),
 )
 _EXPECTED_BINDINGS = (
@@ -1852,7 +2698,57 @@ def check_postgres_health(
                 """
                 SELECT current_setting('server_version_num'),
                        current_setting('server_version'),
-                       current_setting('session_replication_role')
+                       current_setting('session_replication_role'),
+                       current_user,
+                       coalesce((SELECT role.rolsuper
+                           FROM pg_catalog.pg_roles role
+                           WHERE role.rolname = current_user), TRUE),
+                       pg_catalog.pg_has_role(
+                           current_user, 'crypto_agent_evidence_owner', 'MEMBER'
+                       ),
+                       pg_catalog.pg_has_role(
+                           current_user, 'crypto_agent_evidence_verifier', 'MEMBER'
+                       ),
+                       pg_catalog.pg_has_role(
+                           current_user, 'crypto_agent_evidence_reader', 'MEMBER'
+                       ),
+                       coalesce((SELECT database.datdba = role.oid
+                           FROM pg_catalog.pg_database database
+                           JOIN pg_catalog.pg_roles role
+                             ON role.rolname = current_user
+                           WHERE database.datname = current_database()), TRUE),
+                       coalesce((SELECT namespace.nspowner = role.oid
+                           FROM pg_catalog.pg_namespace namespace
+                           JOIN pg_catalog.pg_roles role
+                             ON role.rolname = current_user
+                           WHERE namespace.nspname = 'crypto_agent'), TRUE),
+                       EXISTS (
+                           SELECT 1
+                           FROM pg_catalog.pg_class relation
+                           JOIN pg_catalog.pg_namespace namespace
+                             ON namespace.oid = relation.relnamespace
+                           JOIN pg_catalog.pg_roles role
+                             ON role.oid = relation.relowner
+                           WHERE namespace.nspname = 'crypto_agent'
+                             AND role.rolname = current_user
+                       ),
+                       EXISTS (
+                           SELECT 1
+                           FROM pg_catalog.pg_proc routine
+                           JOIN pg_catalog.pg_namespace namespace
+                             ON namespace.oid = routine.pronamespace
+                           JOIN pg_catalog.pg_roles role
+                             ON role.oid = routine.proowner
+                           WHERE namespace.nspname = 'crypto_agent'
+                             AND role.rolname = current_user
+                       ),
+                       coalesce((SELECT
+                           role.rolcanlogin AND role.rolinherit
+                           AND NOT role.rolsuper AND NOT role.rolcreaterole
+                           AND NOT role.rolcreatedb AND NOT role.rolreplication
+                           AND NOT role.rolbypassrls
+                           FROM pg_catalog.pg_roles role
+                           WHERE role.rolname = current_user), FALSE)
                 """
             )
             version_row = db_cursor.fetchone()
@@ -1867,6 +2763,16 @@ def check_postgres_health(
             replication_role = str(
                 _row_value(version_row, "session_replication_role", 2)
             )
+            health_user = str(_row_value(version_row, "current_user", 3))
+            health_user_super = _row_value(version_row, "rolsuper", 4) is True
+            health_user_owner = _row_value(version_row, "pg_has_role", 5) is True
+            health_user_verifier = _row_value(version_row, "pg_has_role", 6) is True
+            health_user_reader = _row_value(version_row, "pg_has_role", 7) is True
+            health_user_database_owner = _row_value(version_row, "coalesce", 8) is True
+            health_user_schema_owner = _row_value(version_row, "coalesce", 9) is True
+            health_user_table_owner = _row_value(version_row, "exists", 10) is True
+            health_user_function_owner = _row_value(version_row, "exists", 11) is True
+            health_user_role_safe = _row_value(version_row, "coalesce", 12) is True
             try:
                 version_number = int(str(version_number_raw))
             except (TypeError, ValueError):
@@ -1878,7 +2784,23 @@ def check_postgres_health(
                     server_version=server_version,
                     missing_migrations=required_versions,
                 )
-            if replication_role != "origin":
+            if (
+                replication_role != "origin"
+                or health_user_super
+                or health_user_owner
+                or health_user_verifier
+                or not health_user_reader
+                or health_user_database_owner
+                or health_user_schema_owner
+                or health_user_table_owner
+                or health_user_function_owner
+                or not health_user_role_safe
+                or health_user in {
+                    "crypto_agent_evidence_owner",
+                    "crypto_agent_evidence_verifier",
+                    "crypto_agent_evidence_reader",
+                }
+            ):
                 return _health_result(
                     status_code="POSTGRES_SESSION_UNSAFE",
                     database_reachable=True,
@@ -1939,6 +2861,7 @@ def check_postgres_health(
             base_trigger_differences = _trigger_differences(
                 _BASE_TRIGGER_REQUIREMENTS,
                 _catalog_triggers(db_cursor, _BASE_TABLES),
+                ignored=_MIGRATED_TRIGGER_REQUIREMENTS,
             )
             if base_trigger_differences:
                 return _health_result(
@@ -2030,6 +2953,13 @@ def check_postgres_health(
                 if name not in migrated_functions
             )
             migrated_missing.extend(
+                _routine_differences(
+                    _MIGRATED_ROUTINE_REQUIREMENTS,
+                    _catalog_routines(db_cursor, _MIGRATED_ROUTINE_REQUIREMENTS),
+                )
+            )
+            migrated_missing.extend(_catalog_evidence_boundary_differences(db_cursor))
+            migrated_missing.extend(
                 _catalog_definition_differences(
                     "constraint",
                     _OPERATIONAL_CONSTRAINT_REQUIREMENTS,
@@ -2066,7 +2996,8 @@ def check_postgres_health(
 
             migrated_trigger_differences = _trigger_differences(
                 _MIGRATED_TRIGGER_REQUIREMENTS,
-                _catalog_triggers(db_cursor, _MIGRATED_TABLES),
+                _catalog_triggers(db_cursor, _MIGRATED_TRIGGER_CATALOG_TABLES),
+                ignored=_BASE_TRIGGER_REQUIREMENTS,
             )
             if migrated_trigger_differences:
                 return _health_result(
@@ -2177,6 +3108,561 @@ def _catalog_trigger_functions(
         (list(names),),
     )
     return {str(_row_value(row, "proname", 0)) for row in db_cursor.fetchall()}
+
+
+def _catalog_routines(
+    db_cursor: DBCursor,
+    required: Sequence[_RoutineRequirement],
+) -> dict[tuple[str, int], tuple[str, str, str, bool, str, bool, str]]:
+    db_cursor.execute(
+        """
+        SELECT proc.proname, proc.pronargs,
+               pg_catalog.pg_get_function_identity_arguments(proc.oid),
+               language.lanname, proc.provolatile, proc.prosecdef, owner.rolname,
+               coalesce(
+                   'search_path=pg_catalog, crypto_agent' = ANY(proc.proconfig),
+                   FALSE
+               ) AS fixed_search_path, proc.prosrc
+        FROM pg_catalog.pg_proc AS proc
+        JOIN pg_catalog.pg_namespace AS ns ON ns.oid = proc.pronamespace
+        JOIN pg_catalog.pg_roles AS owner ON owner.oid = proc.proowner
+        JOIN pg_catalog.pg_language AS language ON language.oid = proc.prolang
+        WHERE ns.nspname = 'crypto_agent'
+          AND proc.proname = ANY(%s)
+        """,
+        ([item.name for item in required],),
+    )
+    return {
+        (
+            str(_row_value(row, "proname", 0)),
+            _catalog_int(_row_value(row, "pronargs", 1)),
+        ): (
+            str(_row_value(row, "pg_get_function_identity_arguments", 2)),
+            str(_row_value(row, "lanname", 3)),
+            str(_row_value(row, "provolatile", 4)),
+            _row_value(row, "prosecdef", 5) is True,
+            str(_row_value(row, "rolname", 6)),
+            _row_value(row, "fixed_search_path", 7) is True,
+            _definition_sha256(_row_value(row, "prosrc", 8)),
+        )
+        for row in db_cursor.fetchall()
+    }
+
+
+def _routine_differences(
+    required: Sequence[_RoutineRequirement],
+    actual: Mapping[
+        tuple[str, int], tuple[str, str, str, bool, str, bool, str]
+    ],
+) -> tuple[str, ...]:
+    required_by_signature = {
+        (item.name, item.argument_count): item for item in required
+    }
+    differences = {
+        f"routine:{item.name}"
+        for item in required
+        if actual.get((item.name, item.argument_count))
+        != (
+            item.identity_arguments,
+            item.language,
+            item.volatility,
+            item.security_definer,
+            item.owner,
+            item.fixed_search_path,
+            item.source_sha256,
+        )
+    }
+    differences.update(
+        f"unexpected:routine:{name}/{argument_count}"
+        for name, argument_count in actual.keys() - required_by_signature.keys()
+    )
+    return tuple(sorted(differences))
+
+
+def _catalog_evidence_boundary_differences(
+    db_cursor: DBCursor,
+) -> tuple[str, ...]:
+    db_cursor.execute(
+        """
+        WITH protected_tables(table_name) AS (VALUES
+            ('t4_bridge_evidence_keys'),
+            ('t4_bridge_observation_events'),
+            ('t4_replay_verifier_attestations'),
+            ('t4_observation_scenario_trial_requests'),
+            ('t4_observation_scenario_trials')
+        ), verifier_functions(function_name, argument_count) AS (VALUES
+            ('register_t4_bridge_evidence_key', 1),
+            ('record_verified_t4_bridge_observation_event', 17),
+            ('record_verified_t4_replay_attestation', 8),
+            ('begin_t4_observation_scenario_trial', 4),
+            ('complete_t4_observation_scenario_trial', 3),
+            ('verify_passive_t4_observation_scenario', 2)
+        ), owner_only_functions(function_name, argument_count) AS (VALUES
+            ('canonical_jsonb_text', 1),
+            ('t4_evidence_verifier_session_is_safe', 0),
+            ('t4_replay_attestations_are_verified', 2)
+        ), owner_inputs(table_name) AS (VALUES
+            ('t4_observation_campaigns'),
+            ('t4_observation_quality_reports'),
+            ('t4_ingestion_batches'),
+            ('t4_observation_cycles'),
+            ('t4_observation_session_events'),
+            ('research_runs'), ('research_run_events'), ('research_run_inputs'),
+            ('research_artifacts'),
+            ('alerts'), ('alert_delivery_outbox'), ('alert_delivery_attempts'),
+            ('t4_contract_transition_evidence'), ('t4_canonical_candles')
+        ), reader_inputs(table_name) AS (VALUES
+            ('t4_observation_campaigns'),
+            ('t4_observation_quality_reports'),
+            ('t4_ingestion_batches'), ('t4_canonical_candles'),
+            ('t4_futures_snapshots'), ('t4_orderbook_levels'),
+            ('t4_contract_transition_evidence')
+        ), critical_definer_triggers(function_name) AS (VALUES
+            ('enforce_t4_observation_campaign_start'),
+            ('enforce_t4_observation_final_report'),
+            ('enforce_t4_scenario_alert_finalization')
+        )
+        SELECT
+            coalesce((
+                SELECT ns.nspname = 'public'
+                FROM pg_catalog.pg_extension extension
+                JOIN pg_catalog.pg_namespace ns
+                  ON ns.oid = extension.extnamespace
+                WHERE extension.extname = 'pgcrypto'
+            ), FALSE) AS pgcrypto_in_public,
+            coalesce((SELECT
+                NOT role.rolsuper AND NOT role.rolinherit
+                AND NOT role.rolcreaterole AND NOT role.rolcreatedb
+                AND NOT role.rolcanlogin AND NOT role.rolreplication
+                AND NOT role.rolbypassrls
+                FROM pg_catalog.pg_roles role
+                WHERE role.rolname = 'crypto_agent_evidence_owner'
+            ), FALSE) AS owner_role_safe,
+            coalesce((SELECT
+                NOT role.rolsuper AND NOT role.rolinherit
+                AND NOT role.rolcreaterole AND NOT role.rolcreatedb
+                AND NOT role.rolcanlogin AND NOT role.rolreplication
+                AND NOT role.rolbypassrls
+                FROM pg_catalog.pg_roles role
+                WHERE role.rolname = 'crypto_agent_evidence_verifier'
+            ), FALSE) AS verifier_role_safe,
+            coalesce((SELECT
+                NOT role.rolsuper AND NOT role.rolinherit
+                AND NOT role.rolcreaterole AND NOT role.rolcreatedb
+                AND NOT role.rolcanlogin AND NOT role.rolreplication
+                AND NOT role.rolbypassrls
+                FROM pg_catalog.pg_roles role
+                WHERE role.rolname = 'crypto_agent_evidence_reader'
+            ), FALSE) AS reader_role_safe,
+            NOT pg_catalog.pg_has_role(
+                'crypto_agent_evidence_verifier',
+                'crypto_agent_evidence_owner', 'MEMBER'
+            ) AND NOT pg_catalog.pg_has_role(
+                'crypto_agent_evidence_owner',
+                'crypto_agent_evidence_verifier', 'MEMBER'
+            ) AND NOT pg_catalog.pg_has_role(
+                'crypto_agent_evidence_reader',
+                'crypto_agent_evidence_owner', 'MEMBER'
+            ) AND NOT pg_catalog.pg_has_role(
+                'crypto_agent_evidence_reader',
+                'crypto_agent_evidence_verifier', 'MEMBER'
+            ) AND NOT pg_catalog.pg_has_role(
+                'crypto_agent_evidence_owner',
+                'crypto_agent_evidence_reader', 'MEMBER'
+            ) AND NOT pg_catalog.pg_has_role(
+                'crypto_agent_evidence_verifier',
+                'crypto_agent_evidence_reader', 'MEMBER'
+            ) AND NOT EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_auth_members owner_membership
+                JOIN pg_catalog.pg_roles target
+                  ON target.oid = owner_membership.roleid
+                WHERE target.rolname = 'crypto_agent_evidence_owner'
+            ) AND NOT EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_auth_members membership
+                JOIN pg_catalog.pg_roles evidence_role
+                  ON evidence_role.oid = membership.member
+                WHERE evidence_role.rolname IN (
+                    'crypto_agent_evidence_owner',
+                    'crypto_agent_evidence_verifier',
+                    'crypto_agent_evidence_reader'
+                )
+            ) AND (
+                SELECT count(*) = 1
+                FROM pg_catalog.pg_auth_members membership
+                JOIN pg_catalog.pg_roles target ON target.oid = membership.roleid
+                JOIN pg_catalog.pg_roles member ON member.oid = membership.member
+                WHERE target.rolname = 'crypto_agent_evidence_verifier'
+                  AND member.rolcanlogin
+            ) AND (
+                SELECT count(*) = 2
+                FROM pg_catalog.pg_auth_members membership
+                JOIN pg_catalog.pg_roles target ON target.oid = membership.roleid
+                JOIN pg_catalog.pg_roles member ON member.oid = membership.member
+                WHERE target.rolname = 'crypto_agent_evidence_reader'
+                  AND member.rolcanlogin
+            ) AND NOT EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_auth_members membership
+                JOIN pg_catalog.pg_roles target ON target.oid = membership.roleid
+                JOIN pg_catalog.pg_roles member ON member.oid = membership.member
+                WHERE target.rolname IN (
+                    'crypto_agent_evidence_verifier',
+                    'crypto_agent_evidence_reader'
+                )
+                  AND (
+                    NOT (
+                        member.rolcanlogin AND member.rolinherit
+                        AND NOT member.rolsuper
+                        AND NOT member.rolcreaterole
+                        AND NOT member.rolcreatedb
+                        AND NOT member.rolreplication
+                        AND NOT member.rolbypassrls
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM pg_catalog.pg_database database
+                        WHERE database.datname = current_database()
+                          AND database.datdba = member.oid
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM pg_catalog.pg_namespace namespace
+                        WHERE namespace.nspname = 'crypto_agent'
+                          AND namespace.nspowner = member.oid
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM pg_catalog.pg_class relation
+                        JOIN pg_catalog.pg_namespace namespace
+                          ON namespace.oid = relation.relnamespace
+                        WHERE namespace.nspname = 'crypto_agent'
+                          AND relation.relowner = member.oid
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM pg_catalog.pg_proc routine
+                        JOIN pg_catalog.pg_namespace namespace
+                          ON namespace.oid = routine.pronamespace
+                        WHERE namespace.nspname = 'crypto_agent'
+                          AND routine.proowner = member.oid
+                    )
+                  )
+            ) AND NOT EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_roles candidate
+                WHERE NOT candidate.rolsuper
+                  AND pg_catalog.pg_has_role(
+                          candidate.rolname,
+                          'crypto_agent_evidence_verifier', 'MEMBER'
+                      )
+                  AND pg_catalog.pg_has_role(
+                          candidate.rolname,
+                          'crypto_agent_evidence_reader', 'MEMBER'
+                      )
+            ) AND NOT EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_roles candidate
+                WHERE candidate.rolname NOT IN (
+                          'crypto_agent_evidence_verifier',
+                          'crypto_agent_evidence_reader'
+                      )
+                  AND NOT candidate.rolsuper
+                  AND (
+                      pg_catalog.pg_has_role(
+                          candidate.rolname,
+                          'crypto_agent_evidence_verifier', 'MEMBER'
+                      ) OR pg_catalog.pg_has_role(
+                          candidate.rolname,
+                          'crypto_agent_evidence_reader', 'MEMBER'
+                      )
+                  )
+                  AND NOT (
+                      candidate.rolcanlogin AND candidate.rolinherit
+                      AND NOT candidate.rolcreaterole
+                      AND NOT candidate.rolcreatedb
+                      AND NOT candidate.rolreplication
+                      AND NOT candidate.rolbypassrls
+                  )
+            ) AND NOT EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_roles candidate
+                WHERE candidate.rolname NOT IN (
+                    'crypto_agent_evidence_owner',
+                    'crypto_agent_evidence_verifier',
+                    'crypto_agent_evidence_reader'
+                )
+                  AND NOT candidate.rolsuper
+                  AND (
+                    pg_catalog.pg_has_role(
+                        candidate.rolname,
+                        'crypto_agent_evidence_verifier', 'MEMBER'
+                    ) OR pg_catalog.pg_has_role(
+                        candidate.rolname,
+                        'crypto_agent_evidence_reader', 'MEMBER'
+                    )
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM pg_catalog.pg_auth_members direct_membership
+                    JOIN pg_catalog.pg_roles target
+                      ON target.oid = direct_membership.roleid
+                    WHERE direct_membership.member = candidate.oid
+                      AND target.rolname IN (
+                        'crypto_agent_evidence_verifier',
+                        'crypto_agent_evidence_reader'
+                      )
+                  )
+            ) AS roles_separated,
+            (SELECT count(*) = 5 AND bool_and(
+                        owner.rolname = 'crypto_agent_evidence_owner'
+                    )
+             FROM protected_tables expected
+             JOIN pg_catalog.pg_class relation
+               ON relation.relname = expected.table_name
+             JOIN pg_catalog.pg_namespace ns
+               ON ns.oid = relation.relnamespace
+              AND ns.nspname = 'crypto_agent'
+             JOIN pg_catalog.pg_roles owner ON owner.oid = relation.relowner
+            ) AS protected_tables_owned,
+            NOT EXISTS (
+                SELECT 1
+                FROM protected_tables expected
+                JOIN pg_catalog.pg_class relation
+                  ON relation.relname = expected.table_name
+                JOIN pg_catalog.pg_namespace ns
+                  ON ns.oid = relation.relnamespace
+                 AND ns.nspname = 'crypto_agent'
+                CROSS JOIN LATERAL pg_catalog.aclexplode(coalesce(
+                    relation.relacl,
+                    pg_catalog.acldefault('r', relation.relowner)
+                )) acl
+                LEFT JOIN pg_catalog.pg_roles grantee ON grantee.oid = acl.grantee
+                WHERE NOT (
+                    acl.grantee = (
+                        SELECT role.oid FROM pg_catalog.pg_roles role
+                        WHERE role.rolname = 'crypto_agent_evidence_owner'
+                    )
+                    OR (acl.grantee = (
+                            SELECT role.oid FROM pg_catalog.pg_roles role
+                            WHERE role.rolname = 'crypto_agent_evidence_reader'
+                        )
+                        AND acl.privilege_type = 'SELECT'
+                        AND NOT acl.is_grantable)
+                )
+            ) AND (SELECT count(*) = 5
+                    FROM protected_tables expected
+                    JOIN pg_catalog.pg_class relation
+                      ON relation.relname = expected.table_name
+                    JOIN pg_catalog.pg_namespace ns
+                      ON ns.oid = relation.relnamespace
+                     AND ns.nspname = 'crypto_agent'
+                    CROSS JOIN LATERAL pg_catalog.aclexplode(coalesce(
+                        relation.relacl,
+                        pg_catalog.acldefault('r', relation.relowner)
+                    )) acl
+                    WHERE acl.grantee = (
+                            SELECT role.oid FROM pg_catalog.pg_roles role
+                            WHERE role.rolname = 'crypto_agent_evidence_reader'
+                        )
+                      AND acl.privilege_type = 'SELECT'
+                      AND NOT acl.is_grantable
+                   ) AS protected_table_acl_exact,
+            NOT EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_namespace namespace
+                CROSS JOIN LATERAL pg_catalog.aclexplode(coalesce(
+                    namespace.nspacl,
+                    pg_catalog.acldefault('n', namespace.nspowner)
+                )) acl
+                WHERE namespace.nspname = 'crypto_agent'
+                  AND NOT (
+                    acl.grantee = namespace.nspowner
+                    OR (acl.grantee IN (
+                            SELECT role.oid FROM pg_catalog.pg_roles role
+                            WHERE role.rolname IN (
+                                'crypto_agent_evidence_owner',
+                                'crypto_agent_evidence_verifier',
+                                'crypto_agent_evidence_reader'
+                            )
+                        )
+                        AND acl.privilege_type = 'USAGE'
+                        AND NOT acl.is_grantable)
+                  )
+            ) AND (SELECT count(*) = 3
+                    FROM pg_catalog.pg_namespace namespace
+                    CROSS JOIN LATERAL pg_catalog.aclexplode(coalesce(
+                        namespace.nspacl,
+                        pg_catalog.acldefault('n', namespace.nspowner)
+                    )) acl
+                    WHERE namespace.nspname = 'crypto_agent'
+                      AND acl.grantee IN (
+                          SELECT role.oid FROM pg_catalog.pg_roles role
+                          WHERE role.rolname IN (
+                              'crypto_agent_evidence_owner',
+                              'crypto_agent_evidence_verifier',
+                              'crypto_agent_evidence_reader'
+                          )
+                      )
+                      AND acl.privilege_type = 'USAGE'
+                      AND NOT acl.is_grantable
+                   ) AS schema_privileges_safe,
+            NOT EXISTS (
+                SELECT 1
+                FROM verifier_functions expected
+                LEFT JOIN pg_catalog.pg_proc proc
+                  ON proc.proname = expected.function_name
+                 AND proc.pronargs = expected.argument_count
+                LEFT JOIN pg_catalog.pg_namespace ns
+                  ON ns.oid = proc.pronamespace
+                 AND ns.nspname = 'crypto_agent'
+                WHERE proc.oid IS NULL OR ns.oid IS NULL
+                   OR NOT pg_catalog.has_function_privilege(
+                        'crypto_agent_evidence_verifier', proc.oid, 'EXECUTE'
+                   )
+                   OR EXISTS (
+                        SELECT 1
+                        FROM pg_catalog.aclexplode(coalesce(
+                            proc.proacl,
+                            pg_catalog.acldefault('f', proc.proowner)
+                        )) acl
+                        WHERE acl.privilege_type = 'EXECUTE'
+                          AND NOT (
+                            acl.grantee = proc.proowner
+                            OR (acl.grantee = (
+                                    SELECT role.oid
+                                    FROM pg_catalog.pg_roles role
+                                    WHERE role.rolname =
+                                        'crypto_agent_evidence_verifier'
+                                )
+                                AND NOT acl.is_grantable)
+                          )
+                   )
+            ) AND (SELECT count(*) = 6
+                    FROM verifier_functions expected
+                    JOIN pg_catalog.pg_proc proc
+                      ON proc.proname = expected.function_name
+                     AND proc.pronargs = expected.argument_count
+                    JOIN pg_catalog.pg_namespace ns
+                      ON ns.oid = proc.pronamespace
+                     AND ns.nspname = 'crypto_agent'
+                    CROSS JOIN LATERAL pg_catalog.aclexplode(coalesce(
+                        proc.proacl, pg_catalog.acldefault('f', proc.proowner)
+                    )) acl
+                    WHERE acl.grantee = (
+                        SELECT role.oid FROM pg_catalog.pg_roles role
+                        WHERE role.rolname = 'crypto_agent_evidence_verifier'
+                    )
+                      AND acl.privilege_type = 'EXECUTE'
+                      AND NOT acl.is_grantable
+                   ) AND NOT EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_proc proc
+                JOIN pg_catalog.pg_namespace ns ON ns.oid = proc.pronamespace
+                CROSS JOIN LATERAL pg_catalog.aclexplode(coalesce(
+                    proc.proacl, pg_catalog.acldefault('f', proc.proowner)
+                )) acl
+                WHERE ns.nspname = 'crypto_agent'
+                  AND proc.proname = 't4_observation_gate_is_verified'
+                  AND ((proc.pronargs = 1 AND NOT (
+                        acl.grantee = proc.proowner
+                        OR (acl.grantee = 0
+                            AND acl.privilege_type = 'EXECUTE'
+                            AND NOT acl.is_grantable)
+                  )) OR (proc.pronargs = 2 AND
+                        acl.grantee IS DISTINCT FROM proc.proowner))
+            ) AND (SELECT count(*) = 1
+                    FROM pg_catalog.pg_proc proc
+                    JOIN pg_catalog.pg_namespace ns ON ns.oid = proc.pronamespace
+                    CROSS JOIN LATERAL pg_catalog.aclexplode(coalesce(
+                        proc.proacl, pg_catalog.acldefault('f', proc.proowner)
+                    )) acl
+                    WHERE ns.nspname = 'crypto_agent'
+                      AND proc.proname = 't4_observation_gate_is_verified'
+                      AND proc.pronargs = 1
+                      AND acl.grantee = 0
+                      AND acl.privilege_type = 'EXECUTE'
+                      AND NOT acl.is_grantable
+            ) AND NOT EXISTS (
+                SELECT 1
+                FROM owner_only_functions expected
+                JOIN pg_catalog.pg_proc proc
+                  ON proc.proname = expected.function_name
+                 AND proc.pronargs = expected.argument_count
+                JOIN pg_catalog.pg_namespace ns
+                  ON ns.oid = proc.pronamespace
+                 AND ns.nspname = 'crypto_agent'
+                CROSS JOIN LATERAL pg_catalog.aclexplode(coalesce(
+                    proc.proacl, pg_catalog.acldefault('f', proc.proowner)
+                )) acl
+                WHERE acl.grantee IS DISTINCT FROM proc.proowner
+            ) AS verifier_functions_restricted,
+            NOT EXISTS (
+                SELECT 1 FROM owner_inputs expected
+                LEFT JOIN pg_catalog.pg_class relation
+                  ON relation.relname = expected.table_name
+                LEFT JOIN pg_catalog.pg_namespace ns
+                  ON ns.oid = relation.relnamespace
+                 AND ns.nspname = 'crypto_agent'
+                WHERE relation.oid IS NULL OR ns.oid IS NULL
+                   OR NOT pg_catalog.has_table_privilege(
+                        'crypto_agent_evidence_owner', relation.oid, 'SELECT'
+                   )
+            ) AND NOT EXISTS (
+                SELECT 1 FROM reader_inputs expected
+                LEFT JOIN pg_catalog.pg_class relation
+                  ON relation.relname = expected.table_name
+                LEFT JOIN pg_catalog.pg_namespace ns
+                  ON ns.oid = relation.relnamespace
+                 AND ns.nspname = 'crypto_agent'
+                WHERE relation.oid IS NULL OR ns.oid IS NULL
+                   OR NOT pg_catalog.has_table_privilege(
+                        'crypto_agent_evidence_reader', relation.oid, 'SELECT'
+                   )
+                   OR pg_catalog.has_table_privilege(
+                        'crypto_agent_evidence_reader', relation.oid,
+                        'INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER'
+                   )
+            ) AS owner_inputs_readable,
+            NOT EXISTS (
+                SELECT 1
+                FROM critical_definer_triggers expected
+                LEFT JOIN pg_catalog.pg_proc proc
+                  ON proc.proname = expected.function_name
+                LEFT JOIN pg_catalog.pg_namespace ns
+                  ON ns.oid = proc.pronamespace
+                 AND ns.nspname = 'crypto_agent'
+                LEFT JOIN pg_catalog.pg_roles owner ON owner.oid = proc.proowner
+                WHERE proc.oid IS NULL OR ns.oid IS NULL
+                   OR proc.prorettype <>
+                        'pg_catalog.trigger'::pg_catalog.regtype
+                   OR NOT proc.prosecdef
+                   OR owner.rolname <> 'crypto_agent_evidence_owner'
+                   OR NOT coalesce(
+                        'search_path=pg_catalog, crypto_agent' =
+                            ANY(proc.proconfig), FALSE
+                   )
+            ) AS critical_definer_triggers_safe
+        """
+    )
+    row = db_cursor.fetchone()
+    labels = (
+        "pgcrypto_schema",
+        "evidence_owner_role",
+        "evidence_verifier_role",
+        "evidence_reader_role",
+        "evidence_roles_separated",
+        "evidence_table_owners",
+        "evidence_table_acl",
+        "evidence_schema_acl",
+        "evidence_function_acl",
+        "evidence_owner_inputs",
+        "critical_definer_triggers",
+    )
+    if row is None:
+        return tuple(f"boundary:{label}" for label in labels)
+    return tuple(
+        f"boundary:{label}"
+        for index, label in enumerate(labels)
+        if _row_value(row, label, index) is not True
+    )
 
 
 def _catalog_columns(
@@ -2441,11 +3927,16 @@ def _catalog_triggers(
 def _trigger_differences(
     required: Sequence[_TriggerRequirement],
     actual: Sequence[_TriggerRequirement],
+    *,
+    ignored: Sequence[_TriggerRequirement] = (),
 ) -> tuple[str, ...]:
     required_set = set(required)
     actual_set = set(actual)
     missing = {item.name for item in required_set - actual_set}
-    unexpected = {f"unexpected:{item.name}" for item in actual_set - required_set}
+    unexpected = {
+        f"unexpected:{item.name}"
+        for item in actual_set - required_set - set(ignored)
+    }
     return tuple(sorted(missing | unexpected))
 
 

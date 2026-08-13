@@ -1,27 +1,50 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "default_roll_days": 5,
   "contracts": [
     {
       "logical_symbol": "BTC/USD",
-      "contract_id": "SIM:MBT:209903",
-      "expires_at": "2099-03-27T00:00:00Z"
+      "exchange_id": "REPLACE_WITH_BTC_EXCHANGE_ID",
+      "contract_id": "REPLACE_WITH_BTC_PRODUCT_CONTRACT_ID",
+      "market_id": "REPLACE_WITH_BTC_209903_MARKET_ID",
+      "expires_at": "2099-03-27T00:00:00Z",
+      "roll_at": "2099-03-22T00:00:00Z",
+      "basis_exchange_id": "REPLACE_WITH_BTC_INDEX_EXCHANGE_ID",
+      "basis_contract_id": "REPLACE_WITH_BTC_INDEX_CONTRACT_ID",
+      "basis_market_id": "REPLACE_WITH_BTC_INDEX_MARKET_ID"
     },
     {
       "logical_symbol": "BTC/USD",
-      "contract_id": "SIM:MBT:209906",
+      "exchange_id": "REPLACE_WITH_BTC_EXCHANGE_ID",
+      "contract_id": "REPLACE_WITH_BTC_PRODUCT_CONTRACT_ID",
+      "market_id": "REPLACE_WITH_BTC_209906_MARKET_ID",
       "expires_at": "2099-06-26T00:00:00Z",
-      "roll_at": "2099-06-19T00:00:00Z"
+      "roll_at": "2099-06-21T00:00:00Z",
+      "basis_exchange_id": "REPLACE_WITH_BTC_INDEX_EXCHANGE_ID",
+      "basis_contract_id": "REPLACE_WITH_BTC_INDEX_CONTRACT_ID",
+      "basis_market_id": "REPLACE_WITH_BTC_INDEX_MARKET_ID"
     },
     {
       "logical_symbol": "ETH/USD",
-      "contract_id": "SIM:MET:209903",
-      "expires_at": "2099-03-27T00:00:00Z"
+      "exchange_id": "REPLACE_WITH_ETH_EXCHANGE_ID",
+      "contract_id": "REPLACE_WITH_ETH_PRODUCT_CONTRACT_ID",
+      "market_id": "REPLACE_WITH_ETH_209903_MARKET_ID",
+      "expires_at": "2099-03-27T00:00:00Z",
+      "roll_at": "2099-03-22T00:00:00Z",
+      "basis_exchange_id": "REPLACE_WITH_ETH_INDEX_EXCHANGE_ID",
+      "basis_contract_id": "REPLACE_WITH_ETH_INDEX_CONTRACT_ID",
+      "basis_market_id": "REPLACE_WITH_ETH_INDEX_MARKET_ID"
     },
     {
       "logical_symbol": "ETH/USD",
-      "contract_id": "SIM:MET:209906",
-      "expires_at": "2099-06-26T00:00:00Z"
+      "exchange_id": "REPLACE_WITH_ETH_EXCHANGE_ID",
+      "contract_id": "REPLACE_WITH_ETH_PRODUCT_CONTRACT_ID",
+      "market_id": "REPLACE_WITH_ETH_209906_MARKET_ID",
+      "expires_at": "2099-06-26T00:00:00Z",
+      "roll_at": "2099-06-21T00:00:00Z",
+      "basis_exchange_id": "REPLACE_WITH_ETH_INDEX_EXCHANGE_ID",
+      "basis_contract_id": "REPLACE_WITH_ETH_INDEX_CONTRACT_ID",
+      "basis_market_id": "REPLACE_WITH_ETH_INDEX_MARKET_ID"
     }
   ]
 }

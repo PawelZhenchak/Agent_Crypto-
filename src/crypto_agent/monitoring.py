@@ -9,7 +9,7 @@ import signal
 import stat
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -547,6 +547,12 @@ class MonitoringRepository:
             if row is None or str(_value(row, 1)) != run_hash:
                 raise MonitoringError("Monitoring trace idempotency conflict")
         run_id = _as_int(_value(row, 0))
+        if operation == "analyze_replay":
+            self._insert_replay_inputs(
+                db_cursor,
+                run_id=run_id,
+                artifact=artifact,
+            )
         self._insert_run_event(
             db_cursor,
             run_id=run_id,
@@ -578,6 +584,62 @@ class MonitoringRepository:
             event_at=recorded_at,
         )
         return run_id
+
+    @staticmethod
+    def _insert_replay_inputs(
+        db_cursor: DBCursor,
+        *,
+        run_id: int,
+        artifact: Mapping[str, object],
+    ) -> None:
+        metadata = artifact.get("metadata")
+        if not isinstance(metadata, Mapping):
+            raise MonitoringError("Replay input provenance is unavailable")
+        batch_ids = metadata.get("t4_replay_source_batch_ids")
+        batch_hashes = metadata.get("t4_replay_source_batch_hashes")
+        if not isinstance(batch_ids, list) or not isinstance(batch_hashes, list):
+            raise MonitoringError("Replay input provenance is unavailable")
+        for batch_id, batch_hash in zip(batch_ids, batch_hashes, strict=True):
+            db_cursor.execute(
+                """
+                INSERT INTO crypto_agent.research_run_inputs (
+                    research_run_id, input_table, input_record_id, source_id,
+                    source_record_key, source_version, revision_no, observed_at,
+                    available_at, ingested_at, content_hash
+                )
+                SELECT %s, 't4_ingestion_batches', batch.t4_batch_id,
+                       batch.source_id, 't4-batch:' || batch.t4_batch_id::text,
+                       't4-schema-' || batch.bridge_schema_version::text, 1,
+                       batch.observed_at, batch.available_at, batch.ingested_at,
+                       batch.raw_payload_hash
+                FROM crypto_agent.t4_ingestion_batches batch
+                WHERE batch.t4_batch_id = %s
+                  AND batch.raw_payload_hash = %s
+                  AND batch.environment = 'live_t4'
+                  AND batch.bridge_schema_version = 5
+                ON CONFLICT (
+                    research_run_id, input_table, input_record_id, content_hash
+                ) DO NOTHING
+                RETURNING content_hash
+                """,
+                (run_id, batch_id, batch_hash),
+            )
+            inserted = db_cursor.fetchone()
+            if inserted is None:
+                db_cursor.execute(
+                    """
+                    SELECT content_hash
+                    FROM crypto_agent.research_run_inputs
+                    WHERE research_run_id = %s
+                      AND input_table = 't4_ingestion_batches'
+                      AND input_record_id = %s
+                      AND content_hash = %s
+                    """,
+                    (run_id, batch_id, batch_hash),
+                )
+                existing = db_cursor.fetchone()
+                if existing is None:
+                    raise MonitoringError("Replay input provenance is unavailable")
 
     def _insert_failed_run(
         self,
@@ -1562,6 +1624,8 @@ def _safe_report_artifact(report: ResearchReport) -> dict[str, object]:
         "v1_gate_passed",
         "plus500_t4_source_attested",
         "external_delivery_eligible",
+        "t4_replay",
+        "t4_replay_as_of",
         "t4_bridge_schema_version",
         "t4_environment",
         "futures_gate_passed",
@@ -1601,9 +1665,12 @@ def _safe_report_artifact(report: ResearchReport) -> dict[str, object]:
             "flags": list(report.risk.flags[:50]),
         },
         "metadata": {
+            **{
             key: _safe_scalar(report.metadata.get(key))
             for key in metadata_keys
             if key in report.metadata
+            },
+            **_safe_replay_evidence_metadata(report.metadata),
         },
         "read_only": True,
     }
@@ -1863,6 +1930,52 @@ def _safe_scalar(value: object) -> str | int | float | bool | None:
     if isinstance(value, float) and value == value and abs(value) != float("inf"):
         return value
     return None
+
+
+def _safe_replay_evidence_metadata(metadata: Mapping[str, object]) -> dict[str, object]:
+    fingerprint = metadata.get("t4_replay_fingerprint_sha256")
+    source_ids = metadata.get("t4_replay_source_batch_ids")
+    source_hashes = metadata.get("t4_replay_source_batch_hashes")
+    provenance = metadata.get("t4_replay_provenance_sha256")
+    if (
+        not isinstance(fingerprint, str)
+        or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
+        or not isinstance(source_ids, (list, tuple))
+        or not isinstance(source_hashes, (list, tuple))
+        or len(source_ids) != len(source_hashes)
+        or not 1 <= len(source_hashes) <= 720
+        or any(type(item) is not int or item <= 0 for item in source_ids)
+        or tuple(sorted(source_ids)) != tuple(source_ids)
+        or len(set(source_ids)) != len(source_ids)
+        or any(
+            not isinstance(item, str) or re.fullmatch(r"[0-9a-f]{64}", item) is None
+            for item in source_hashes
+        )
+        or not isinstance(provenance, str)
+        or provenance != _replay_provenance_hash(source_ids, source_hashes)
+    ):
+        return {}
+    return {
+        "t4_replay_fingerprint_sha256": fingerprint,
+        "t4_replay_source_batch_ids": list(source_ids),
+        "t4_replay_source_batch_hashes": list(source_hashes),
+        "t4_replay_provenance_sha256": provenance,
+    }
+
+
+def _replay_provenance_hash(
+    source_batch_ids: Sequence[object],
+    source_batch_hashes: Sequence[object],
+) -> str:
+    framed = "t4-replay-provenance-v1\n" + "".join(
+        f"{batch_id}:{batch_hash}\n"
+        for batch_id, batch_hash in zip(
+            source_batch_ids,
+            source_batch_hashes,
+            strict=True,
+        )
+    )
+    return hashlib.sha256(framed.encode("ascii")).hexdigest()
 
 
 def _hash(value: object) -> str:

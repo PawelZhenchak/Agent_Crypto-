@@ -65,14 +65,35 @@ Simulator ani realnego dostarczenia live.
    w należnym slocie oraz brak finalizacji raportu przed
    `planned_ends_at + cycle_interval_seconds`.
 
+### Przygotowane w 0.9.0 — etap 1
+
+1. Migracja `0018` z rejestrem kluczy bridge'a, podpisanymi zdarzeniami,
+   żądaniami prób i append-only wynikami scenariuszy.
+2. Weryfikacja fingerprintu SPKI, ECDSA P-256, kanonicznych claims i globalnego
+   hash chain przez restarty bridge'a.
+3. Rozłączne role `crypto_agent_evidence_verifier` i read-only
+   `crypto_agent_evidence_reader`; caller nie przekazuje eventów ani wyniku
+   `PASS`.
+4. Pięć prób kontrolowanych: `bridge_restart`, `missing_data`, `rate_limit`,
+   `reconnect`, `stale_data`.
+5. Dwie próby pasywne: `replay_blocked` samodzielnie odtwarzany i atestowany
+   przez isolated verifier oraz `roll_transition`, który nie ma injectora i
+   wymaga realnego live batcha schema v5.
+6. Niezależny predykat PostgreSQL dla bramki: pełne okno, progi jakości,
+   bezpieczeństwo i siedem scenariuszy `pass`.
+7. Komenda `observe-scenarios`, która nie przyjmuje wyniku scenariusza.
+
+Podpisane testy offline potwierdzają nasz bridge i walidator, nie podpis T4.
+Kontrolowany `rate_limit` testuje handler, nie rzeczywiste `429` dostawcy.
+
 ### Nadal wymagane na rzeczywistym T4
 
 1. Provisioning `T4_API_KEY`, prawidłowych identyfikatorów rynków oraz uprawnień
    depth i niezależnego indeksu.
 2. Contract test schema v5 najpierw na `t4_simulator`, potem osobno na
    `live_t4`. Simulator nie zalicza live delivery.
-3. Test sesji, reconnectu, limitów, opóźnień, braków danych i rollu na
-   przydzielonym koncie.
+3. Test sesji, reconnectu, naturalnych limitów, opóźnień, braków danych i rollu
+   na przydzielonym koncie. Nie wolno wywoływać `429` spamowaniem T4.
 4. Weryfikacja spread/depth/basis na rzeczywistych danych i kontrolowane wykonanie
    wszystkich obowiązkowych scenariuszy.
 5. Operacyjne uruchomienie i nadzór `observe-run` dla obu scope’ów przez całe
@@ -80,8 +101,18 @@ Simulator ani realnego dostarczenia live.
 6. Minimum 672 godziny obserwacji czasu rzeczywistego dla zamrożonego scope’u
    BTC/ETH 4h. Publiczny dwutygodniowy Simulator jest niewystarczający.
 7. Zapis końcowego raportu i komplet obowiązkowych kryteriów `PASS`.
+8. Zewnętrzny supervisor dla kontrolowanego restartu i działania 24/7. Etap 1
+   zatrzymuje bridge po receipt, ale nie uruchamia go ponownie; to etap 2.
 
 Provisioning, rzeczywiste testy Simulator/live i kampania nie zostały wykonane.
-Ponadto schema `0.8.0` blokuje scenariusz `PASS` i `v1_gate_passed=true`, dopóki
-późniejsza migracja nie doda obiektywnych referencji dowodów scenariuszy oraz ich
-walidacji w PostgreSQL.
+Nie ma jeszcze dostępu T4 ani rzeczywistych `ExchangeID`, `ContractID` i
+`MarketID`.
+
+W `0.9.0` `PASS` nie jest blokowany stałą. Wynik pozostaje jednak
+`v1_gate_passed=false`, ponieważ nie wykonano realnych 672 godzin ani siedmiu
+dowodów, w tym prawdziwego rollu.
+
+Przed kampanią trzeba wybrać nowy UUID, nowy klucz bridge'a i nowy pusty
+dziennik. Runtime, verifier-write i evidence-reader korzystają z trzech
+rozłącznych loginów PostgreSQL bez superusera; DSN administratora jest poza
+wszystkimi ścieżkami.

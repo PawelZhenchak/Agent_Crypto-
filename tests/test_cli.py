@@ -10,17 +10,30 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+from unittest.mock import call as mock_call
 
-from crypto_agent.cli import build_parser, main
+from crypto_agent.cli import (
+    _observation_scope_is_due,
+    _scenario_evidence_repository,
+    build_parser,
+    main,
+)
+from crypto_agent.evidence_verifier import EvidenceRegistration
 from crypto_agent.monitoring import DeliveryResult, MonitoringError
 from crypto_agent.observation import (
     CriterionResult,
     CriterionStatus,
+    ObservationBridgeCheckpoint,
     ObservationCyclePlan,
     ObservationCycleRunResult,
     ObservationQualityReport,
 )
 from crypto_agent.observation_policy import ObservationPolicy
+from crypto_agent.observation_scenarios import (
+    ScenarioCheckpointReceipt,
+    ScenarioEvidenceError,
+    ScenarioTrialResult,
+)
 from crypto_agent.postgres import PostgresUnavailableError
 from crypto_agent.providers.base import ProviderBatch
 
@@ -34,6 +47,26 @@ class _BrokenDriver:
 _OBSERVATION_POLICY = ObservationPolicy.load("configs/observation_policy.v1.json")
 _CAMPAIGN_ID = "6d18efb9-c1ee-47bd-a122-351482b1410e"
 _DATABASE_NOW = datetime(2026, 8, 12, 16, 0, tzinfo=UTC)
+_CHECKPOINT_ACTION_REQUEST_ID = "31f5ef33-d35e-4d97-a599-f861eaa9ed4f"
+_CHECKPOINT_EVENT_HASH = "f" * 64
+
+
+def _checkpoint_receipt() -> ScenarioCheckpointReceipt:
+    return ScenarioCheckpointReceipt(
+        campaign_id=_CAMPAIGN_ID,
+        action_request_id=_CHECKPOINT_ACTION_REQUEST_ID,
+        event_sequence_no=19,
+        event_hash_sha256=_CHECKPOINT_EVENT_HASH,
+    )
+
+
+def _bridge_checkpoint() -> ObservationBridgeCheckpoint:
+    return ObservationBridgeCheckpoint(
+        campaign_id=_CAMPAIGN_ID,
+        action_request_id=_CHECKPOINT_ACTION_REQUEST_ID,
+        sequence_no=19,
+        event_hash_sha256=_CHECKPOINT_EVENT_HASH,
+    )
 
 
 @dataclass(frozen=True)
@@ -107,6 +140,57 @@ def _live_preflight_batch() -> ProviderBatch:
 
 
 class CliTests(unittest.TestCase):
+    def test_due_preflight_allows_backlog_through_exact_final_grace(self) -> None:
+        class DueCursor:
+            def __init__(self) -> None:
+                self.query = ""
+                self.params: object = None
+
+            def execute(self, query: str, params: object = None) -> None:
+                if "WITH campaign" in query:
+                    self.query = query
+                    self.params = params
+
+            def fetchone(self) -> object:
+                return (True,)
+
+            def close(self) -> None:
+                return None
+
+        class DueConnection:
+            def __init__(self) -> None:
+                self.database_cursor = DueCursor()
+
+            def cursor(self) -> DueCursor:
+                return self.database_cursor
+
+            def commit(self) -> None:
+                return None
+
+            def rollback(self) -> None:
+                return None
+
+            def close(self) -> None:
+                return None
+
+        connection = DueConnection()
+        repository = SimpleNamespace(connection_factory=lambda: connection)
+
+        self.assertTrue(
+            _observation_scope_is_due(
+                repository,
+                campaign_id=_CAMPAIGN_ID,
+                scope_key="BTC/USD:240m",
+            )
+        )
+        self.assertIn("database_now <= planned_ends_at", connection.database_cursor.query)
+        self.assertIn("cycle_interval_seconds", connection.database_cursor.query)
+        self.assertNotIn("LEAST", connection.database_cursor.query)
+        self.assertEqual(
+            connection.database_cursor.params,
+            ("BTC/USD:240m", _CAMPAIGN_ID, "BTC/USD:240m"),
+        )
+
     def test_parser_exposes_only_synthetic_and_t4(self) -> None:
         parser = build_parser()
         for provider in ("synthetic", "t4"):
@@ -166,7 +250,9 @@ class CliTests(unittest.TestCase):
     def test_parser_exposes_observation_commands_without_caller_cutoff(self) -> None:
         parser = build_parser()
 
-        start = parser.parse_args(["observe-start"])
+        start = parser.parse_args(
+            ["observe-start", "--campaign-id", _CAMPAIGN_ID]
+        )
         self.assertEqual(start.command, "observe-start")
         self.assertEqual(start.cycle_interval_seconds, 300)
         status = parser.parse_args(
@@ -188,10 +274,41 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(run.command, "observe-run")
         self.assertEqual(run.limit, 120)
+        scenario = parser.parse_args(
+            [
+                "observe-scenarios",
+                "--campaign-id",
+                _CAMPAIGN_ID,
+                "--scenario",
+                "rate_limit",
+            ]
+        )
+        self.assertEqual(scenario.scenario, "rate_limit")
+        self.assertEqual(scenario.scope, "BTC/USD:240m")
 
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             parser.parse_args(
-                ["observe-start", "--started-at", "2020-01-01T00:00:00Z"]
+                [
+                    "observe-start",
+                    "--campaign-id",
+                    _CAMPAIGN_ID,
+                    "--started-at",
+                    "2020-01-01T00:00:00Z",
+                ]
+            )
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(["observe-start"])
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(
+                [
+                    "observe-scenarios",
+                    "--campaign-id",
+                    _CAMPAIGN_ID,
+                    "--scenario",
+                    "rate_limit",
+                    "--outcome",
+                    "pass",
+                ]
             )
 
     def test_observation_start_uses_database_time_and_freezes_baseline(self) -> None:
@@ -200,6 +317,17 @@ class CliTests(unittest.TestCase):
             create_campaign=Mock(return_value="e" * 64),
         )
         provider = SimpleNamespace(fetch_batch=Mock(return_value=_live_preflight_batch()))
+        evidence_repository = SimpleNamespace(
+            register_campaign=Mock(
+                return_value=EvidenceRegistration(
+                    campaign_id=_CAMPAIGN_ID,
+                    evidence_key_fingerprint_sha256="d" * 64,
+                    boot_id="cd6b270c-7a99-402c-8e24-c4e7cd59db84",
+                    verified_event_count=1,
+                )
+            ),
+            sync_bridge_events=Mock(return_value=1),
+        )
         output = io.StringIO()
         with (
             patch(
@@ -211,6 +339,10 @@ class CliTests(unittest.TestCase):
                 return_value=_DATABASE_NOW,
             ),
             patch("crypto_agent.cli._t4_provider", return_value=provider),
+            patch(
+                "crypto_agent.cli._scenario_evidence_repository",
+                return_value=evidence_repository,
+            ),
             redirect_stdout(output),
         ):
             exit_code = main(
@@ -245,6 +377,12 @@ class CliTests(unittest.TestCase):
         self.assertTrue(payload["read_only"])
         self.assertFalse(payload["execution_enabled"])
         self.assertEqual(provider.fetch_batch.call_count, 2)
+        evidence_repository.register_campaign.assert_called_once_with(
+            _CAMPAIGN_ID
+        )
+        evidence_repository.sync_bridge_events.assert_called_once_with(
+            campaign_id=_CAMPAIGN_ID
+        )
         for call in provider.fetch_batch.call_args_list:
             self.assertEqual(call.kwargs["as_of"], _DATABASE_NOW)
             self.assertEqual(call.kwargs["limit"], 60)
@@ -266,6 +404,16 @@ class CliTests(unittest.TestCase):
             external_delivery_eligible=False,
         )
         provider = SimpleNamespace(fetch_batch=Mock(return_value=simulator))
+        evidence_repository = SimpleNamespace(
+            register_campaign=Mock(
+                return_value=EvidenceRegistration(
+                    campaign_id=_CAMPAIGN_ID,
+                    evidence_key_fingerprint_sha256="d" * 64,
+                    boot_id="cd6b270c-7a99-402c-8e24-c4e7cd59db84",
+                    verified_event_count=1,
+                )
+            ),
+        )
         output = io.StringIO()
 
         with (
@@ -275,6 +423,10 @@ class CliTests(unittest.TestCase):
                 return_value=_DATABASE_NOW,
             ),
             patch("crypto_agent.cli._t4_provider", return_value=provider),
+            patch(
+                "crypto_agent.cli._scenario_evidence_repository",
+                return_value=evidence_repository,
+            ),
             redirect_stdout(output),
         ):
             exit_code = main(
@@ -293,10 +445,226 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 1)
         repository.create_campaign.assert_not_called()
+        provider.fetch_batch.assert_called_once()
         self.assertEqual(
             json.loads(output.getvalue())["error_code"],
             "OBSERVATION_START_FAILED",
         )
+
+    def test_observation_start_rejects_journal_not_bound_to_campaign(self) -> None:
+        repository = SimpleNamespace(
+            policy=_OBSERVATION_POLICY,
+            create_campaign=Mock(),
+        )
+        evidence_repository = SimpleNamespace(
+            register_campaign=Mock(
+                side_effect=ScenarioEvidenceError(
+                    "campaign mismatch",
+                    code="T4_EVIDENCE_CAMPAIGN_MISMATCH",
+                )
+            ),
+        )
+        output = io.StringIO()
+
+        with (
+            patch("crypto_agent.cli._observation_repository", return_value=repository),
+            patch(
+                "crypto_agent.cli._observation_database_now",
+                return_value=_DATABASE_NOW,
+            ),
+            patch(
+                "crypto_agent.cli._scenario_evidence_repository",
+                return_value=evidence_repository,
+            ),
+            redirect_stdout(output),
+        ):
+            exit_code = main(
+                [
+                    "observe-start",
+                    "--campaign-id",
+                    _CAMPAIGN_ID,
+                    "--code-commit-hash",
+                    "a" * 64,
+                    "--t4-protocol-commit-hash",
+                    "b" * 64,
+                    "--runtime-config-hash",
+                    "c" * 64,
+                ]
+            )
+
+        self.assertEqual(exit_code, 1)
+        repository.create_campaign.assert_not_called()
+        evidence_repository.register_campaign.assert_called_once_with(_CAMPAIGN_ID)
+        self.assertEqual(
+            json.loads(output.getvalue())["error_code"],
+            "OBSERVATION_START_FAILED",
+        )
+
+    def test_replay_scenario_uses_isolated_passive_verification(self) -> None:
+        result = ScenarioTrialResult(
+            trial_id="268d6bb9-c877-42c5-9a53-73b017607ee4",
+            campaign_id=_CAMPAIGN_ID,
+            scenario_code="replay_blocked",
+            outcome="pass",
+            completed_at=_DATABASE_NOW,
+            content_hash_sha256="a" * 64,
+        )
+        repository = SimpleNamespace(
+            verify_passive_trial=Mock(return_value=result)
+        )
+        output = io.StringIO()
+        with (
+            patch(
+                "crypto_agent.cli._scenario_evidence_repository",
+                return_value=repository,
+            ),
+            redirect_stdout(output),
+        ):
+            exit_code = main(
+                [
+                    "observe-scenarios",
+                    "--campaign-id",
+                    _CAMPAIGN_ID,
+                    "--scenario",
+                    "replay_blocked",
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        repository.verify_passive_trial.assert_called_once_with(
+            campaign_id=_CAMPAIGN_ID,
+            scenario_code="replay_blocked",
+        )
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["status"], "verified")
+        self.assertEqual(payload["outcome"], "pass")
+        self.assertFalse(payload["execution_enabled"])
+
+    def test_roll_scenario_syncs_signed_events_before_passive_verification(self) -> None:
+        result = ScenarioTrialResult(
+            trial_id="268d6bb9-c877-42c5-9a53-73b017607ee4",
+            campaign_id=_CAMPAIGN_ID,
+            scenario_code="roll_transition",
+            outcome="pass",
+            completed_at=_DATABASE_NOW,
+            content_hash_sha256="a" * 64,
+        )
+        repository = SimpleNamespace(
+            verify_passive_trial=Mock(return_value=result)
+        )
+        output = io.StringIO()
+        with (
+            patch(
+                "crypto_agent.cli._scenario_evidence_repository",
+                return_value=repository,
+            ),
+            redirect_stdout(output),
+        ):
+            exit_code = main(
+                [
+                    "observe-scenarios",
+                    "--campaign-id",
+                    _CAMPAIGN_ID,
+                    "--scenario",
+                    "roll_transition",
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        repository.verify_passive_trial.assert_called_once_with(
+            campaign_id=_CAMPAIGN_ID,
+            scenario_code="roll_transition",
+        )
+
+    def test_controlled_fault_records_typed_cycle_and_recovery_batch(self) -> None:
+        result = ScenarioTrialResult(
+            trial_id="268d6bb9-c877-42c5-9a53-73b017607ee4",
+            campaign_id=_CAMPAIGN_ID,
+            scenario_code="rate_limit",
+            outcome="pass",
+            completed_at=_DATABASE_NOW,
+            content_hash_sha256="b" * 64,
+        )
+        verifier = Mock()
+
+        def run_controlled(**kwargs: object) -> ScenarioTrialResult:
+            exercise = kwargs["exercise"]
+            recovery = kwargs["recovery"]
+            assert callable(exercise)
+            assert callable(recovery)
+            exercise(object())
+            recovery(object())
+            return result
+
+        verifier.run_controlled.side_effect = run_controlled
+        recovery_batch = _live_preflight_batch()
+        provider = SimpleNamespace(fetch_batch=Mock(return_value=recovery_batch))
+        ingestion = SimpleNamespace(
+            ingest=Mock(
+                return_value=SimpleNamespace(
+                    payload_sha256=recovery_batch.raw_payload_sha256
+                )
+            )
+        )
+
+        def controlled_cycle(_args: object) -> int:
+            print(
+                json.dumps(
+                    {
+                        "status": "recorded",
+                        "outcome": "failure",
+                        "error_code": "T4_RATE_LIMITED",
+                    }
+                )
+            )
+            return 1
+
+        output = io.StringIO()
+        with (
+            patch(
+                "crypto_agent.cli._scenario_evidence_repository",
+                return_value=verifier,
+            ),
+            patch(
+                "crypto_agent.cli._run_observation_cycle_command",
+                side_effect=controlled_cycle,
+            ) as cycle,
+            patch("crypto_agent.cli._observation_repository"),
+            patch(
+                "crypto_agent.cli._observation_scope_is_due",
+                return_value=True,
+            ),
+            patch(
+                "crypto_agent.cli._observation_database_now",
+                return_value=_DATABASE_NOW,
+            ),
+            patch("crypto_agent.cli._t4_provider", return_value=provider),
+            patch("crypto_agent.cli._t4_repository", return_value=ingestion),
+            redirect_stdout(output),
+        ):
+            exit_code = main(
+                [
+                    "observe-scenarios",
+                    "--campaign-id",
+                    _CAMPAIGN_ID,
+                    "--scenario",
+                    "rate_limit",
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(cycle.called)
+        provider.fetch_batch.assert_called_once_with(
+            symbol="BTC/USD",
+            interval_minutes=240,
+            as_of=_DATABASE_NOW,
+            limit=120,
+        )
+        ingestion.ingest.assert_called_once_with(
+            recovery_batch,
+            requested_as_of=_DATABASE_NOW,
+        )
+        self.assertEqual(json.loads(output.getvalue())["status"], "verified")
 
     def test_observe_run_ingests_and_analyzes_the_exact_single_fetched_batch(self) -> None:
         batch = _live_preflight_batch()
@@ -437,6 +805,7 @@ class CliTests(unittest.TestCase):
         repository = SimpleNamespace(
             policy=_OBSERVATION_POLICY,
             build_quality_report=Mock(return_value=report),
+            finalization_remaining_seconds=Mock(return_value=0),
         )
         output = io.StringIO()
         with (
@@ -472,6 +841,7 @@ class CliTests(unittest.TestCase):
         repository = SimpleNamespace(
             policy=_OBSERVATION_POLICY,
             build_quality_report=Mock(return_value=report),
+            finalization_remaining_seconds=Mock(return_value=0),
             store_final_report=Mock(),
         )
         output = io.StringIO()
@@ -484,6 +854,9 @@ class CliTests(unittest.TestCase):
                 "crypto_agent.cli._observation_database_now",
                 return_value=_DATABASE_NOW,
             ),
+            patch(
+                "crypto_agent.cli._checkpoint_and_sync_bridge_observation_events"
+            ) as sync,
             redirect_stdout(output),
         ):
             exit_code = main(
@@ -492,9 +865,49 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 1)
         repository.store_final_report.assert_not_called()
+        sync.assert_not_called()
         payload = json.loads(output.getvalue())
         self.assertEqual(payload["error_code"], "OBSERVATION_WINDOW_INCOMPLETE")
         self.assertGreater(payload["remaining_seconds"], 0)
+
+    def test_final_observation_report_waits_for_final_slot_grace(self) -> None:
+        report = _quality_report(
+            elapsed_seconds=_OBSERVATION_POLICY.minimum_elapsed_seconds,
+        )
+        repository = SimpleNamespace(
+            policy=_OBSERVATION_POLICY,
+            build_quality_report=Mock(return_value=report),
+            finalization_remaining_seconds=Mock(return_value=300),
+            store_final_report=Mock(),
+        )
+        output = io.StringIO()
+        with (
+            patch(
+                "crypto_agent.cli._observation_repository",
+                return_value=repository,
+            ),
+            patch(
+                "crypto_agent.cli._observation_database_now",
+                return_value=_DATABASE_NOW,
+            ),
+            patch(
+                "crypto_agent.cli._checkpoint_and_sync_bridge_observation_events"
+            ) as sync,
+            redirect_stdout(output),
+        ):
+            exit_code = main(["observe-report", "--campaign-id", _CAMPAIGN_ID])
+
+        self.assertEqual(exit_code, 1)
+        repository.store_final_report.assert_not_called()
+        sync.assert_not_called()
+        payload = json.loads(output.getvalue())
+        self.assertEqual(
+            payload["error_code"],
+            "OBSERVATION_FINALIZATION_GRACE_INCOMPLETE",
+        )
+        self.assertEqual(payload["remaining_seconds"], 300)
+        self.assertEqual(payload["observation_remaining_seconds"], 0)
+        self.assertEqual(payload["finalization_grace_remaining_seconds"], 300)
 
     def test_final_observation_report_stores_quality_failure_and_returns_nonzero(
         self,
@@ -506,6 +919,7 @@ class CliTests(unittest.TestCase):
         repository = SimpleNamespace(
             policy=_OBSERVATION_POLICY,
             build_quality_report=Mock(return_value=report),
+            finalization_remaining_seconds=Mock(return_value=0),
             store_final_report=Mock(return_value=report.report_hash_sha256),
         )
         output = io.StringIO()
@@ -518,6 +932,10 @@ class CliTests(unittest.TestCase):
                 "crypto_agent.cli._observation_database_now",
                 return_value=_DATABASE_NOW,
             ),
+            patch(
+                "crypto_agent.cli._checkpoint_and_sync_bridge_observation_events",
+                return_value=_checkpoint_receipt(),
+            ) as sync,
             redirect_stdout(output),
         ):
             exit_code = main(
@@ -525,15 +943,63 @@ class CliTests(unittest.TestCase):
             )
 
         self.assertEqual(exit_code, 3)
-        repository.store_final_report.assert_called_once_with(report)
+        repository.store_final_report.assert_called_once_with(
+            report,
+            bridge_checkpoint=_bridge_checkpoint(),
+        )
+        sync.assert_called_once_with(_CAMPAIGN_ID)
+        self.assertEqual(repository.build_quality_report.call_count, 2)
         payload = json.loads(output.getvalue())
         self.assertEqual(payload["status"], "stored")
         self.assertEqual(payload["overall_status"], "FAIL")
         self.assertFalse(payload["v1_gate_passed"])
 
+    def test_final_report_freezes_database_cutoff_before_bridge_sync(self) -> None:
+        calls: list[str] = []
+        report = _quality_report(
+            elapsed_seconds=_OBSERVATION_POLICY.minimum_elapsed_seconds,
+            overall_status=CriterionStatus.FAIL,
+        )
+        repository = SimpleNamespace(
+            policy=_OBSERVATION_POLICY,
+            build_quality_report=Mock(return_value=report),
+            finalization_remaining_seconds=Mock(return_value=0),
+            store_final_report=Mock(return_value=report.report_hash_sha256),
+        )
+        with (
+            patch(
+                "crypto_agent.cli._observation_repository",
+                return_value=repository,
+            ),
+            patch(
+                "crypto_agent.cli._observation_database_now",
+                side_effect=lambda _repository: (
+                    calls.append("cutoff") or _DATABASE_NOW
+                ),
+            ),
+            patch(
+                "crypto_agent.cli._checkpoint_and_sync_bridge_observation_events",
+                side_effect=lambda _campaign_id: (
+                    calls.append("sync") or _checkpoint_receipt()
+                ),
+            ),
+            redirect_stdout(io.StringIO()),
+        ):
+            exit_code = main(["observe-report", "--campaign-id", _CAMPAIGN_ID])
+
+        self.assertEqual(exit_code, 3)
+        self.assertEqual(calls, ["cutoff", "sync"])
+        self.assertEqual(
+            repository.build_quality_report.call_args_list,
+            [
+                mock_call(_CAMPAIGN_ID, observed_until=_DATABASE_NOW),
+                mock_call(_CAMPAIGN_ID, observed_until=_DATABASE_NOW),
+            ],
+        )
+
     def test_observation_runtime_failures_are_secret_safe_stable_json(self) -> None:
         for command in (
-            ["observe-start"],
+            ["observe-start", "--campaign-id", _CAMPAIGN_ID],
             ["observe-status", "--campaign-id", _CAMPAIGN_ID],
             ["observe-report", "--campaign-id", _CAMPAIGN_ID],
         ):
@@ -731,6 +1197,20 @@ class CliTests(unittest.TestCase):
         self.assertIn("PostgreSQL is unavailable", payload)
         self.assertNotIn(secret, payload)
         self.assertNotIn("opaque-driver-sensitive-marker", payload)
+
+    def test_runtime_cli_never_reads_scenario_verifier_database_dsn(self) -> None:
+        cli_source = Path("src/crypto_agent/cli.py").read_text(encoding="utf-8")
+        self.assertNotIn("CRYPTO_AGENT_POSTGRES_EVIDENCE_DSN", cli_source)
+        with patch.dict(
+            os.environ,
+            {
+                "CRYPTO_AGENT_EVIDENCE_VERIFIER_TOKEN": "v" * 32,
+                "CRYPTO_AGENT_EVIDENCE_VERIFIER_URL": "http://127.0.0.1:8791",
+            },
+            clear=False,
+        ):
+            client = _scenario_evidence_repository()
+        self.assertEqual(type(client).__name__, "EvidenceVerifierClient")
 
     def test_compose_bootstrap_does_not_bypass_migration_ledger(self) -> None:
         compose = Path("compose.yaml").read_text(encoding="utf-8")

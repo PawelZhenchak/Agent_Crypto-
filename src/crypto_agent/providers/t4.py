@@ -7,8 +7,9 @@ import threading
 import time
 from contextlib import suppress
 from datetime import datetime, timedelta
+from urllib.error import HTTPError
 from urllib.parse import urlencode, urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 from ..deadline import (
     AnalysisDeadlineExceeded,
@@ -67,6 +68,23 @@ class Plus500T4Provider:
     _max_response_bytes = 4_000_000
     _bridge_schema_version = 5
     _allowed_environments = frozenset({"t4_simulator", "live_t4"})
+    _bridge_failure_codes = frozenset(
+        {
+            "T4_APPLICATION_REGISTRATION_REQUIRED",
+            "T4_AUTHENTICATION_FAILED",
+            "T4_CONTRACT_UNAVAILABLE",
+            "T4_DATA_STALE",
+            "T4_DELAYED_MARKET_DATA",
+            "T4_DEPTH_SUBSCRIPTION_REJECTED",
+            "T4_HISTORY_UNAVAILABLE",
+            "T4_MISSING_DATA",
+            "T4_PREWARM_IN_PROGRESS",
+            "T4_RATE_LIMITED",
+            "T4_SESSION_DISCONNECTED",
+            "T4_SESSION_STARTING",
+            "T4_STALE_DATA",
+        }
+    )
 
     def __init__(
         self,
@@ -156,7 +174,7 @@ class Plus500T4Provider:
         ensure_analysis_deadline()
         request_timeout = bounded_analysis_timeout(self._timeout_seconds)
         try:
-            response = build_opener(_NoRedirectHandler()).open(
+            response = build_opener(ProxyHandler({}), _NoRedirectHandler()).open(
                 request, timeout=request_timeout
             )
             try:
@@ -169,6 +187,22 @@ class Plus500T4Provider:
                 _close_response(response)
         except AnalysisDeadlineExceeded:
             raise
+        except HTTPError as exc:
+            try:
+                reason_code = exc.headers.get(
+                    "X-Crypto-Agent-T4-Reason-Code", ""
+                )
+                if exc.code == 429 and not reason_code:
+                    reason_code = "T4_RATE_LIMITED"
+            finally:
+                _close_response(exc)
+            ensure_analysis_deadline()
+            if reason_code not in self._bridge_failure_codes:
+                reason_code = "T4_BRIDGE_UNAVAILABLE"
+            raise ProviderError(
+                "Plus500 T4 bridge rejected the market-data request",
+                code=reason_code,
+            ) from None
         except Exception as exc:
             # A response closed by the deadline timer will normally surface as
             # an I/O error. Preserve the machine-specific total-deadline error.

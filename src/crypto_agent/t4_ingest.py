@@ -5,6 +5,7 @@ import binascii
 import hashlib
 import json
 import math
+import re
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -66,6 +67,7 @@ class T4ReplayResult:
     futures_evidence: FuturesEvidence | None
     source_batch_hashes: tuple[str, ...]
     replay_fingerprint_sha256: str
+    source_batch_ids: tuple[int, ...] = ()
     environment: str | None = None
     exchange_id: str | None = None
     market_id: str | None = None
@@ -115,6 +117,11 @@ class T4ReplayResult:
                 "t4_replay_as_of": self.as_of.isoformat(),
                 "t4_replay_fingerprint_sha256": self.replay_fingerprint_sha256,
                 "t4_replay_source_batch_hashes": list(self.source_batch_hashes),
+                "t4_replay_source_batch_ids": list(self.source_batch_ids),
+                "t4_replay_provenance_sha256": _replay_provenance_hash(
+                    self.source_batch_ids,
+                    self.source_batch_hashes,
+                ),
                 "t4_futures_evidence_attested": bool(
                     self.bridge_schema_version in {3, 4, 5}
                     and self.futures_evidence is not None
@@ -162,7 +169,6 @@ class T4IngestRepository:
                     SELECT source_id
                     FROM crypto_agent.data_sources
                     WHERE source_key = %s
-                    FOR SHARE
                     """,
                     (T4_SOURCE_ID,),
                 )
@@ -623,9 +629,19 @@ class T4IngestRepository:
             for row in ordered
         )
         _verify_replay_batch_integrity(ordered, candles)
-        source_hashes = tuple(
-            sorted({str(_row_value(row, "raw_payload_hash", 9)) for row in ordered})
+        source_batches = tuple(
+            sorted(
+                {
+                    (
+                        int(_row_value(row, "t4_batch_id", 20)),
+                        str(_row_value(row, "raw_payload_hash", 9)),
+                    )
+                    for row in ordered
+                }
+            )
         )
+        source_batch_ids = tuple(item[0] for item in source_batches)
+        source_hashes = tuple(item[1] for item in source_batches)
         reference = ReferencePriceSnapshot(
             symbol=symbol,
             observations=(
@@ -771,6 +787,7 @@ class T4IngestRepository:
             futures_evidence=futures_evidence,
             source_batch_hashes=source_hashes,
             replay_fingerprint_sha256=fingerprint,
+            source_batch_ids=source_batch_ids,
             environment=environment,
             exchange_id=exchange_id,
             market_id=active_market_id,
@@ -872,9 +889,19 @@ class T4IngestRepository:
             )
             for row in ordered
         )
-        source_hashes = tuple(
-            sorted({str(_row_value(row, "raw_payload_hash", 9)) for row in ordered})
+        source_batches = tuple(
+            sorted(
+                {
+                    (
+                        int(_row_value(row, "t4_batch_id", 20)),
+                        str(_row_value(row, "raw_payload_hash", 9)),
+                    )
+                    for row in ordered
+                }
+            )
         )
+        source_batch_ids = tuple(item[0] for item in source_batches)
+        source_hashes = tuple(item[1] for item in source_batches)
         reference = ReferencePriceSnapshot(
             symbol=symbol,
             observations=(
@@ -910,6 +937,7 @@ class T4IngestRepository:
             futures_evidence=None,
             source_batch_hashes=source_hashes,
             replay_fingerprint_sha256=fingerprint,
+            source_batch_ids=source_batch_ids,
         )
 
 
@@ -1819,6 +1847,30 @@ def _replay_hash(
             "rolled_from_market_id": rolled_from_market_id,
         }
     return hashlib.sha256(_canonical_json(payload)).hexdigest()
+
+
+def _replay_provenance_hash(
+    source_batch_ids: tuple[int, ...],
+    source_batch_hashes: tuple[str, ...],
+) -> str:
+    if (
+        not source_batch_ids
+        or len(source_batch_ids) != len(source_batch_hashes)
+        or tuple(sorted(source_batch_ids)) != source_batch_ids
+        or len(set(source_batch_ids)) != len(source_batch_ids)
+        or any(item <= 0 for item in source_batch_ids)
+        or any(re.fullmatch(r"[0-9a-f]{64}", item) is None for item in source_batch_hashes)
+    ):
+        raise ValueError("T4 replay source-batch provenance is invalid")
+    framed = "t4-replay-provenance-v1\n" + "".join(
+        f"{batch_id}:{batch_hash}\n"
+        for batch_id, batch_hash in zip(
+            source_batch_ids,
+            source_batch_hashes,
+            strict=True,
+        )
+    )
+    return hashlib.sha256(framed.encode("ascii")).hexdigest()
 
 
 def _object_hash(value: object) -> str:

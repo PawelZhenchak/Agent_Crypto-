@@ -198,5 +198,6 @@ public static class FuturesEvidenceValidator
 
     private static bool ValidOpaqueId(string value, int maximumLength) =>
         value.Length is > 0 && value.Length <= maximumLength &&
-        value == value.Trim() && !value.Any(char.IsControl);
+        value == value.Trim() && value.All(character =>
+            character is >= ' ' and <= '~');
 }

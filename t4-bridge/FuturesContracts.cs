@@ -117,7 +117,8 @@ public sealed class FuturesContractCatalog
         if (!_contracts.TryGetValue(logicalSymbol, out var contracts) || contracts.Count == 0)
         {
             throw new T4SessionUnavailableException(
-                "The requested T4 contract catalog is not configured.");
+                "The requested T4 contract catalog is not configured.",
+                "T4_CONTRACT_UNAVAILABLE");
         }
 
         var selectedIndex = -1;
@@ -134,7 +135,8 @@ public sealed class FuturesContractCatalog
         if (selectedIndex < 0)
         {
             throw new T4SessionUnavailableException(
-                "No safe front-month T4 contract is available for the requested time.");
+                "No safe front-month T4 contract is available for the requested time.",
+                "T4_CONTRACT_UNAVAILABLE");
         }
 
         string? previous = null;
@@ -198,5 +200,6 @@ public sealed class FuturesContractCatalog
 
     private static bool ValidOpaqueId(string value, int maximumLength) =>
         value.Length is > 0 && value.Length <= maximumLength &&
-        value == value.Trim() && !value.Any(char.IsControl);
+        value == value.Trim() && value.All(character =>
+            character is >= ' ' and <= '~');
 }

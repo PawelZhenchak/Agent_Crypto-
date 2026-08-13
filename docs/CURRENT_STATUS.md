@@ -1,4 +1,4 @@
-# Aktualny stan — 0.8.0
+# Aktualny stan — 0.9.0, etap 1
 
 ## Zaimplementowane
 
@@ -20,36 +20,56 @@
   replayu v2-v4 z bezpieczną kwalifikacją;
 - migracja `0017` z niezmiennym baseline kampanii, łańcuchem hashy cykli i zdarzeń
   sesji, ochroną przed backfillem oraz niezmiennym raportem końcowym;
+- migracja `0018` z append-only dziennikiem zdarzeń bridge'a, rejestrem kluczy,
+  próbami scenariuszy i obiektywnym predykatem bramki w PostgreSQL;
+- ECDSA P-256, pin fingerprintu SPKI w baseline oraz weryfikacja podpisu,
+  projekcji claims i globalnego hash chain przed zapisaniem zdarzenia;
+- podpis pochodzi z naszego bridge'a dowodowego; nie jest podpisem ani
+  atestacją kryptograficzną Plus500/T4;
 - wersjonowana polityka `t4-observation-v1-2026-08-12`: minimum `672` godzin,
   progi prób/sukcesu, limity luk i RTT oraz obowiązkowe scenariusze;
-- komendy `observe-start`, `observe-run`, `observe-status` i `observe-report`,
+- komendy `observe-start`, `observe-run`, `observe-scenarios`, `observe-status`
+  i `observe-report`,
   korzystające z czasu serwera PostgreSQL; start wykonuje live preflight każdego
   scope’u, a run wiąże jeden fetch z dokładnym batchem i analizą;
+- pięć scenariuszy kontrolowanych i dwa pasywne; caller zapisuje referencje, a
+  PostgreSQL sam wyprowadza `pass` albo `fail` z powiązanych zdarzeń, batchy,
+  cykli i runów;
+- niezależny predykat `t4_observation_gate_is_verified(...)`; raport końcowy musi
+  mieć dokładnie taki sam wynik bramki jak dane w bazie;
 - bezpieczna ewaluacja `PASS`, `FAIL`, `NOT_OBSERVED`; zapis raportu jest możliwy
-  dopiero po `planned_ends_at + cycle_interval_seconds`, a schema `0.8.0` celowo
-  blokuje `PASS` scenariusza i `v1_gate_passed=true` do późniejszej migracji z
-  obiektywnymi referencjami dowodów;
+  dopiero po `planned_ends_at + cycle_interval_seconds`;
 - monitoring punktu 7, append-only outbox i lokalne delivery stdout nadal mają
   semantykę at-least-once z deduplikacją po `idempotency_key`.
 
 ## Nie jest jeszcze potwierdzone
 
-- provisioning działającego `T4_API_KEY` dla wybranego środowiska;
+- provisioning działającego `T4_API_KEY` dla wybranego środowiska — obecnie nie
+  ma dostępu do prawdziwego T4;
 - uprawnienia depth dla giełd futures i niezależnego indeksu;
 - rzeczywiste `ExchangeID`, produktowe `ContractID` i `MarketID` bieżących oraz
-  następnych serii BTC/ETH;
+  następnych serii BTC/ETH — nie zostały jeszcze pozyskane;
 - contract test na prawdziwej sesji T4 Simulator, a następnie live;
 - empiryczne zachowanie Chart REST, reconnectu, limitów, opóźnień, rollu i braków
   danych na przydzielonym koncie;
 - operacyjne uruchomienie i nadzór `observe-run` dla każdego scope’u przez cały
   czas kampanii;
 - wykonanie obowiązkowych kontrolowanych scenariuszy i zapis dowodów;
+- pasywny dowód prawdziwego rollu kontraktu w oknie kampanii;
 - minimum cztery tygodnie nieprzerwanej obserwacji read-only;
 - końcowy raport jakości V1.
 
-Zakres zamrożonej kampanii odbiorowej `0.8.0` to obecnie BTC i ETH na interwale
+Zakres zamrożonej kampanii odbiorowej `0.9.0` to BTC i ETH na interwale
 4h (`240` minut). Standardowy publiczny T4 Simulator trwa dwa tygodnie, więc do
 pełnych 28 dni potrzebne jest przedłużenie albo właściwy dostęp live.
+
+Etap 1 nie dostarcza jeszcze automatycznego supervisora 24/7. Próba
+`bridge_restart` zatrzymuje bridge po utrwaleniu receipt i wymaga zewnętrznego
+supervisora, aby uruchomić nowy proces. Utrzymanie procesu i kampanii to etap 2.
+
+Kontrolowany `rate_limit` potwierdza zachowanie naszego handlera i ścieżkę
+fail-closed. Nie potwierdza, że dostawca zwrócił prawdziwe `429`; naturalny limit
+upstream pozostaje osobnym zdarzeniem i nie wolno go wywoływać spamowaniem T4.
 
 ## Bramka
 
@@ -58,8 +78,16 @@ fixture’y, testy offline ani sesja Simulator nie zaliczają odbioru live.
 
 `v1_gate_passed=false`.
 
-W `0.8.0` stan nie może zmienić się na `true`: schema PostgreSQL odrzuca zarówno
-scenariusz z wynikiem `pass`, jak i raport z `v1_gate_passed=true`. Finalizacja
-raportu jest dozwolona dopiero po końcu 672-godzinnego okna i dodatkowym okresie
-grace równym jednemu interwałowi cyklu. Późniejsza migracja musi najpierw dodać
-obiektywne referencje dowodów scenariuszy i ich walidację w bazie.
+Nie jest to już blokada „na sztywno”. PostgreSQL może wyliczyć `true`, ale tylko
+po zakończeniu realnego okna co najmniej 672 godzin i okresu grace, przy progach
+prób/sukcesu/luk/RTT, zerze naruszeń oraz siedmiu scenariuszach `pass`. Każdy
+scenariusz musi mieć obiektywny dowód; `roll_transition` wymaga realnego live
+batcha schema v5 ze starym i nowym `MarketID`. Brak rollu daje brak zaliczenia,
+nie sztuczny sukces.
+
+Kampania wymaga trzech osobnych loginów PostgreSQL bez superusera: runtime,
+verifier-write należącego tylko do `crypto_agent_evidence_verifier` oraz
+evidence-reader należącego tylko do `crypto_agent_evidence_reader`. Reader służy
+isolated verifierowi do in-memory replay zamrożonych scope’ów, a zapis atestacji
+przechodzi wyłącznie przez verifier-write. Login runtime nie jest właścicielem
+bazy ani członkiem ról dowodowych. DSN administratora jest poza tymi ścieżkami.

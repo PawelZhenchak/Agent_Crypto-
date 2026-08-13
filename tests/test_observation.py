@@ -8,6 +8,7 @@ from pathlib import Path
 from crypto_agent.observation import (
     CriterionResult,
     CriterionStatus,
+    ObservationBridgeCheckpoint,
     ObservationCampaign,
     ObservationCycle,
     ObservationCycleExecution,
@@ -24,6 +25,7 @@ from tests.db_fakes import FakeConnection, SQLStep
 
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=UTC)
 CAMPAIGN_ID = "7bf3c831-ae63-4d32-b750-1d694c1de236"
+CHECKPOINT_EVENT_ID = "6e1808e6-f5cb-43e2-aef4-9f1470c6f510"
 
 
 def _policy() -> ObservationPolicy:
@@ -39,6 +41,7 @@ def _campaign() -> ObservationCampaign:
         code_commit_hash="a" * 64,
         t4_protocol_commit_hash="b" * 64,
         runtime_config_hash="c" * 64,
+        bridge_evidence_key_fingerprint="e" * 64,
         scope_manifest=("BTC/USD:240m", "ETH/USD:240m"),
     )
 
@@ -56,6 +59,7 @@ def _campaign_row(database_now: datetime) -> tuple[object, ...]:
         campaign.code_commit_hash,
         campaign.t4_protocol_commit_hash,
         campaign.runtime_config_hash,
+        campaign.bridge_evidence_key_fingerprint,
         list(campaign.scope_manifest),
         campaign.scope_manifest_hash_sha256,
         campaign.frozen_baseline_hash_sha256(policy),
@@ -70,16 +74,30 @@ def _complete_aggregate() -> tuple[object, ...]:
 def _final_store_steps(*, include_insert: bool) -> list[SQLStep]:
     steps = [
         SQLStep("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"),
+        SQLStep("SELECT pg_advisory_xact_lock"),
         SQLStep(
             "FROM crypto_agent.t4_observation_campaigns",
             [_campaign_row(NOW + timedelta(hours=673))],
         ),
         SQLStep("WITH campaign AS", [_complete_aggregate()]),
         SQLStep("SELECT scenario_code, BOOL_AND", []),
+        SQLStep(
+            "FROM crypto_agent.t4_bridge_observation_events",
+            [(CHECKPOINT_EVENT_ID,)],
+        ),
     ]
     if include_insert:
         steps.append(SQLStep("INSERT INTO crypto_agent.t4_observation_quality_reports"))
     return steps
+
+
+def _checkpoint() -> ObservationBridgeCheckpoint:
+    return ObservationBridgeCheckpoint(
+        campaign_id=CAMPAIGN_ID,
+        action_request_id="31f5ef33-d35e-4d97-a599-f861eaa9ed4f",
+        sequence_no=19,
+        event_hash_sha256="f" * 64,
+    )
 
 
 def _canonical_final_report() -> ObservationQualityReport:
@@ -219,6 +237,27 @@ class ObservationEvaluationTests(unittest.TestCase):
 
 
 class ObservationRepositoryTests(unittest.TestCase):
+    def test_finalization_remaining_seconds_includes_final_slot_grace(self) -> None:
+        observed_at = NOW + timedelta(hours=672)
+        connection = FakeConnection(
+            [
+                SQLStep("SET TRANSACTION READ ONLY"),
+                SQLStep("planned_ends_at", [(3600,)]),
+            ]
+        )
+        repository = ObservationRepository(lambda: connection, _policy())
+
+        remaining = repository.finalization_remaining_seconds(
+            CAMPAIGN_ID,
+            observed_at=observed_at,
+        )
+
+        self.assertEqual(remaining, 3600)
+        query, params = connection.scripted_cursor.executions[-1]
+        self.assertIn("make_interval(secs => cycle_interval_seconds)", query)
+        self.assertIn("planned_ends_at", query)
+        self.assertEqual(params, (observed_at, CAMPAIGN_ID))
+
     def test_observation_trace_is_stable_per_frozen_slot(self) -> None:
         first = deterministic_observation_trace_id(
             CAMPAIGN_ID, "BTC/USD:240m", 7
@@ -287,6 +326,7 @@ class ObservationRepositoryTests(unittest.TestCase):
             campaign.code_commit_hash,
             campaign.t4_protocol_commit_hash,
             campaign.runtime_config_hash,
+            campaign.bridge_evidence_key_fingerprint,
             list(campaign.scope_manifest),
             campaign.scope_manifest_hash_sha256,
             baseline,
@@ -330,6 +370,12 @@ class ObservationRepositoryTests(unittest.TestCase):
         self.assertEqual(report.overall_status, CriterionStatus.PASS)
         self.assertTrue(report.v1_gate_passed)
         self.assertEqual(report.frozen_baseline_hash_sha256, baseline)
+        aggregate_query = connection.scripted_cursor.executions[2][0]
+        self.assertIn("bridge_safety AS", aggregate_query)
+        self.assertIn("scenario_safety AS", aggregate_query)
+        self.assertIn("event_type = 'outbound_rejected'", aggregate_query)
+        self.assertIn("campaign_id IS DISTINCT FROM", aggregate_query)
+        self.assertIn("alert_delivery_attempts", aggregate_query)
         self.assertTrue(connection.committed)
 
     def test_database_time_prevents_a_future_cutoff_from_faking_elapsed_time(self) -> None:
@@ -345,6 +391,7 @@ class ObservationRepositoryTests(unittest.TestCase):
             campaign.code_commit_hash,
             campaign.t4_protocol_commit_hash,
             campaign.runtime_config_hash,
+            campaign.bridge_evidence_key_fingerprint,
             list(campaign.scope_manifest),
             campaign.scope_manifest_hash_sha256,
             campaign.frozen_baseline_hash_sha256(policy),
@@ -369,6 +416,7 @@ class ObservationRepositoryTests(unittest.TestCase):
     def test_cycle_record_uses_per_scope_hash_chain_and_exact_links(self) -> None:
         connection = FakeConnection(
             [
+                SQLStep("SELECT pg_advisory_xact_lock"),
                 SQLStep("SELECT pg_advisory_xact_lock"),
                 SQLStep("FROM crypto_agent.t4_observation_cycles", rows=[]),
                 SQLStep("INSERT INTO crypto_agent.t4_observation_research_inputs"),
@@ -399,8 +447,8 @@ class ObservationRepositoryTests(unittest.TestCase):
 
         self.assertEqual(len(content_hash), 64)
         self.assertTrue(connection.committed)
-        link_params = connection.scripted_cursor.executions[2][1]
-        insert_params = connection.scripted_cursor.executions[3][1]
+        link_params = connection.scripted_cursor.executions[3][1]
+        insert_params = connection.scripted_cursor.executions[4][1]
         self.assertIn(41, link_params)
         self.assertIn(73, link_params)
         self.assertIn("d" * 64, link_params)
@@ -414,6 +462,7 @@ class ObservationRepositoryTests(unittest.TestCase):
             [
                 SQLStep("SET LOCAL lock_timeout"),
                 SQLStep("SET LOCAL idle_in_transaction_session_timeout"),
+                SQLStep("SELECT pg_advisory_xact_lock"),
                 SQLStep("SELECT pg_advisory_xact_lock"),
                 SQLStep(
                     "FROM crypto_agent.t4_observation_campaigns",
@@ -472,6 +521,7 @@ class ObservationRepositoryTests(unittest.TestCase):
             connection = FakeConnection(
                 [
                     SQLStep("SELECT pg_advisory_xact_lock"),
+                    SQLStep("SELECT pg_advisory_xact_lock"),
                     SQLStep("FROM crypto_agent.t4_observation_cycles", rows=[]),
                     SQLStep("INSERT INTO crypto_agent.t4_observation_research_inputs"),
                     SQLStep("INSERT INTO crypto_agent.t4_observation_cycles"),
@@ -501,7 +551,7 @@ class ObservationRepositoryTests(unittest.TestCase):
                     ),
                 )
             )
-            params = connection.scripted_cursor.executions[2][1]
+            params = connection.scripted_cursor.executions[3][1]
             assert isinstance(params, tuple)
             links.append(params)
 
@@ -519,6 +569,7 @@ class ObservationRepositoryTests(unittest.TestCase):
             [
                 SQLStep("SET LOCAL lock_timeout"),
                 SQLStep("SET LOCAL idle_in_transaction_session_timeout"),
+                SQLStep("SELECT pg_advisory_xact_lock"),
                 SQLStep("SELECT pg_advisory_xact_lock"),
                 SQLStep(
                     "FROM crypto_agent.t4_observation_campaigns",
@@ -553,11 +604,54 @@ class ObservationRepositoryTests(unittest.TestCase):
         self.assertEqual(executed, [])
         self.assertTrue(connection.rolled_back)
 
+    def test_cycle_preserves_a_safe_typed_provider_failure_code(self) -> None:
+        database_now = NOW + timedelta(hours=1, minutes=5)
+        connection = FakeConnection(
+            [
+                SQLStep("SET LOCAL lock_timeout"),
+                SQLStep("SET LOCAL idle_in_transaction_session_timeout"),
+                SQLStep("SELECT pg_advisory_xact_lock"),
+                SQLStep("SELECT pg_advisory_xact_lock"),
+                SQLStep(
+                    "FROM crypto_agent.t4_observation_campaigns",
+                    [
+                        (
+                            "live_t4",
+                            NOW,
+                            NOW + timedelta(hours=672),
+                            3600,
+                            ["BTC/USD:240m"],
+                            database_now,
+                        )
+                    ],
+                ),
+                SQLStep("FROM crypto_agent.t4_observation_cycles", rows=[]),
+                SQLStep(
+                    "SELECT clock_timestamp()",
+                    [(database_now + timedelta(seconds=1),)],
+                ),
+                SQLStep("INSERT INTO crypto_agent.t4_observation_cycles"),
+            ]
+        )
+        repository = ObservationRepository(lambda: connection, _policy())
+
+        def execute(plan):  # type: ignore[no-untyped-def]
+            del plan
+            raise ObservationError("safe failure", code="T4_STALE_DATA")
+
+        result = repository.run_cycle(CAMPAIGN_ID, "BTC/USD:240m", execute)
+
+        self.assertEqual(result.outcome, "failure")
+        self.assertEqual(result.error_code, "T4_STALE_DATA")
+        insert_params = connection.scripted_cursor.executions[-1][1]
+        self.assertIn("T4_STALE_DATA", insert_params)
+
     def test_scope_outside_frozen_manifest_fails_before_execution(self) -> None:
         connection = FakeConnection(
             [
                 SQLStep("SET LOCAL lock_timeout"),
                 SQLStep("SET LOCAL idle_in_transaction_session_timeout"),
+                SQLStep("SELECT pg_advisory_xact_lock"),
                 SQLStep("SELECT pg_advisory_xact_lock"),
                 SQLStep(
                     "FROM crypto_agent.t4_observation_campaigns",
@@ -591,6 +685,7 @@ class ObservationRepositoryTests(unittest.TestCase):
             [
                 SQLStep("SET LOCAL lock_timeout"),
                 SQLStep("SET LOCAL idle_in_transaction_session_timeout"),
+                SQLStep("SELECT pg_advisory_xact_lock"),
                 SQLStep("SELECT pg_advisory_xact_lock"),
                 SQLStep(
                     "FROM crypto_agent.t4_observation_campaigns",
@@ -646,6 +741,7 @@ class ObservationRepositoryTests(unittest.TestCase):
         connection = FakeConnection(
             [
                 SQLStep("SELECT pg_advisory_xact_lock"),
+                SQLStep("SELECT pg_advisory_xact_lock"),
                 SQLStep("FROM crypto_agent.t4_observation_cycles", rows=[(2, "f" * 64)]),
             ]
         )
@@ -666,6 +762,7 @@ class ObservationRepositoryTests(unittest.TestCase):
     def test_session_scenarios_are_append_only_hash_chained_events(self) -> None:
         connection = FakeConnection(
             [
+                SQLStep("SELECT pg_advisory_xact_lock"),
                 SQLStep("FROM crypto_agent.t4_observation_session_events", rows=[]),
                 SQLStep("INSERT INTO crypto_agent.t4_observation_session_events"),
             ]
@@ -705,6 +802,7 @@ class ObservationRepositoryTests(unittest.TestCase):
         connection = FakeConnection(
             [
                 SQLStep("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"),
+                SQLStep("SELECT pg_advisory_xact_lock"),
                 SQLStep(
                     "FROM crypto_agent.t4_observation_campaigns",
                     [_campaign_row(NOW + timedelta(hours=672))],
@@ -720,7 +818,7 @@ class ObservationRepositoryTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ObservationError, "final-slot grace"):
-            repository.store_final_report(early)
+            repository.store_final_report(early, bridge_checkpoint=_checkpoint())
         self.assertTrue(connection.rolled_back)
 
     def test_final_report_storage_preserves_not_observed_as_gate_false(self) -> None:
@@ -728,7 +826,10 @@ class ObservationRepositoryTests(unittest.TestCase):
         repository = ObservationRepository(lambda: connection, _policy())
         report = _canonical_final_report()
 
-        report_hash = repository.store_final_report(report)
+        report_hash = repository.store_final_report(
+            report,
+            bridge_checkpoint=_checkpoint(),
+        )
 
         self.assertEqual(report_hash, report.report_hash_sha256)
         self.assertEqual(report.overall_status, CriterionStatus.NOT_OBSERVED)
@@ -759,11 +860,11 @@ class ObservationRepositoryTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ObservationError, "canonical database ledger"):
-            repository.store_final_report(forged)
+            repository.store_final_report(forged, bridge_checkpoint=_checkpoint())
 
         self.assertTrue(connection.rolled_back)
 
-    def test_final_store_keeps_gate_closed_without_verified_scenario_references(
+    def test_final_store_delegates_verified_gate_enforcement_to_database(
         self,
     ) -> None:
         policy = _policy()
@@ -771,6 +872,7 @@ class ObservationRepositoryTests(unittest.TestCase):
         connection = FakeConnection(
             [
                 SQLStep("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"),
+                SQLStep("SELECT pg_advisory_xact_lock"),
                 SQLStep(
                     "FROM crypto_agent.t4_observation_campaigns",
                     [_campaign_row(NOW + timedelta(hours=673))],
@@ -780,6 +882,11 @@ class ObservationRepositoryTests(unittest.TestCase):
                     "SELECT scenario_code, BOOL_AND",
                     [(scenario, True) for scenario in policy.mandatory_scenarios],
                 ),
+                SQLStep(
+                    "FROM crypto_agent.t4_bridge_observation_events",
+                    [(CHECKPOINT_EVENT_ID,)],
+                ),
+                SQLStep("INSERT INTO crypto_agent.t4_observation_quality_reports"),
             ]
         )
         repository = ObservationRepository(lambda: connection, policy)
@@ -793,10 +900,13 @@ class ObservationRepositoryTests(unittest.TestCase):
             policy,
         )
 
-        with self.assertRaisesRegex(ObservationError, "gate stays closed"):
-            repository.store_final_report(report)
+        report_hash = repository.store_final_report(
+            report,
+            bridge_checkpoint=_checkpoint(),
+        )
 
-        self.assertTrue(connection.rolled_back)
+        self.assertEqual(report_hash, report.report_hash_sha256)
+        self.assertTrue(connection.committed)
 
 
 class ObservationMigrationContractTests(unittest.TestCase):

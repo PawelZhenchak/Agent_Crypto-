@@ -64,6 +64,19 @@ def _migration_function_source(name: str) -> str:
     migration_name = (
         "0016_operational_alert_outbox.sql"
         if name == "enforce_alert_delivery_attempt"
+        else "0018_t4_scenario_evidence.sql"
+        if name
+        in {
+            "enforce_t4_observation_campaign_start",
+            "enforce_t4_observation_final_report",
+            "enforce_t4_bridge_observation_event",
+            "enforce_t4_observation_scenario_trial",
+            "enforce_t4_observation_research_input",
+            "enforce_t4_observation_cycle_chain",
+            "enforce_t4_observation_event_chain",
+            "enforce_t4_scenario_alert_finalization",
+            "serialize_t4_observation_campaign_write",
+        }
         else "0017_t4_observation_campaign.sql"
     )
     migration_sql = (PROJECT_ROOT / "db/migrations" / migration_name).read_text(
@@ -81,6 +94,35 @@ def _migration_function_source(name: str) -> str:
     return matched.group(1)
 
 
+def _migration_routine_source(name: str, argument_count: int) -> str:
+    if name == "forbid_append_only_change" and argument_count == 0:
+        schema_sql = (PROJECT_ROOT / "db/schema.sql").read_text(encoding="utf-8")
+        matched = re.search(
+            r"CREATE OR REPLACE FUNCTION forbid_append_only_change\(\).*?"
+            r"AS \$\$(.*?)\$\$;",
+            schema_sql,
+            re.DOTALL,
+        )
+        if matched is None:
+            raise AssertionError("base append-only function is missing")
+        return matched.group(1)
+    migration_sql = (
+        PROJECT_ROOT / "db/migrations/0018_t4_scenario_evidence.sql"
+    ).read_text(encoding="utf-8")
+    matches = re.findall(
+        r"CREATE OR REPLACE FUNCTION "
+        rf"crypto_agent\.{re.escape(name)}\((.*?)\)\s*"
+        r"RETURNS.*?AS \$\$(.*?)\$\$;",
+        migration_sql,
+        re.DOTALL,
+    )
+    for arguments, source in matches:
+        count = 0 if not arguments.strip() else arguments.count(",") + 1
+        if count == argument_count:
+            return source
+    raise AssertionError(f"migration routine is missing: {name}/{argument_count}")
+
+
 def _function_definition_rows(
     requirements: tuple[postgres_module._FunctionDefinitionRequirement, ...],
 ) -> list[tuple[object, ...]]:
@@ -96,11 +138,40 @@ def _function_definition_rows(
     ]
 
 
+def _routine_rows(
+    requirements: tuple[postgres_module._RoutineRequirement, ...],
+) -> list[tuple[object, ...]]:
+    return [
+        (
+            item.name,
+            item.argument_count,
+            item.identity_arguments,
+            item.language,
+            item.volatility,
+            item.security_definer,
+            item.owner,
+            item.fixed_search_path,
+            _migration_routine_source(item.name, item.argument_count),
+        )
+        for item in requirements
+    ]
+
+
 def _health_steps(
     *,
     server_version_num: str = "160004",
     server_version: str = "16.4",
     session_replication_role: str = "origin",
+    current_user: str = "crypto_agent_runtime",
+    current_user_super: bool = False,
+    current_user_owner_member: bool = False,
+    current_user_verifier_member: bool = False,
+    current_user_reader_member: bool = True,
+    current_user_database_owner: bool = False,
+    current_user_schema_owner: bool = False,
+    current_user_table_owner: bool = False,
+    current_user_function_owner: bool = False,
+    current_user_role_safe: bool = True,
     namespace_exists: bool = True,
     base_relations: tuple[str, ...] | None = None,
     base_triggers: list[tuple[object, ...]] | None = None,
@@ -110,6 +181,8 @@ def _health_steps(
     migrated_constraints: list[tuple[object, ...]] | None = None,
     migrated_indexes: list[tuple[object, ...]] | None = None,
     migrated_function_definitions: list[tuple[object, ...]] | None = None,
+    migrated_routines: list[tuple[object, ...]] | None = None,
+    evidence_boundary: tuple[object, ...] | None = None,
     migrated_triggers: list[tuple[object, ...]] | None = None,
     bindings: tuple[tuple[str, str, str, str], ...] | None = None,
     series: tuple[tuple[str, int], ...] | None = None,
@@ -129,7 +202,14 @@ def _health_steps(
         SQLStep("SET LOCAL search_path TO pg_catalog"),
         SQLStep(
             "server_version_num",
-            [(server_version_num, server_version, session_replication_role)],
+            [(
+                server_version_num, server_version, session_replication_role,
+                current_user, current_user_super, current_user_owner_member,
+                current_user_verifier_member, current_user_reader_member,
+                current_user_database_owner, current_user_schema_owner,
+                current_user_table_owner, current_user_function_owner,
+                current_user_role_safe,
+            )],
         ),
         SQLStep("FROM pg_catalog.pg_namespace", [(namespace_exists,)]),
         SQLStep(
@@ -143,7 +223,16 @@ def _health_steps(
         ),
         SQLStep(
             "FROM pg_catalog.pg_trigger AS trg",
-            _trigger_rows(postgres_module._BASE_TRIGGER_REQUIREMENTS)
+            _trigger_rows(
+                (
+                    *postgres_module._BASE_TRIGGER_REQUIREMENTS,
+                    *(
+                        requirement
+                        for requirement in postgres_module._MIGRATED_TRIGGER_REQUIREMENTS
+                        if requirement.table in postgres_module._BASE_TABLES
+                    ),
+                )
+            )
             if base_triggers is None
             else base_triggers,
         ),
@@ -171,6 +260,16 @@ def _health_steps(
             [(name,) for name in postgres_module._MIGRATED_TRIGGER_FUNCTIONS],
         ),
         SQLStep(
+            "AS fixed_search_path",
+            _routine_rows(postgres_module._MIGRATED_ROUTINE_REQUIREMENTS)
+            if migrated_routines is None
+            else migrated_routines,
+        ),
+        SQLStep(
+            "AS owner_inputs_readable",
+            [evidence_boundary or (True,) * 11],
+        ),
+        SQLStep(
             "FROM pg_catalog.pg_constraint AS con",
             _constraint_rows(postgres_module._OPERATIONAL_CONSTRAINT_REQUIREMENTS)
             if migrated_constraints is None
@@ -190,7 +289,17 @@ def _health_steps(
         ),
         SQLStep(
             "FROM pg_catalog.pg_trigger AS trg",
-            _trigger_rows(postgres_module._MIGRATED_TRIGGER_REQUIREMENTS)
+            _trigger_rows(
+                (
+                    *postgres_module._MIGRATED_TRIGGER_REQUIREMENTS,
+                    *(
+                        requirement
+                        for requirement in postgres_module._BASE_TRIGGER_REQUIREMENTS
+                        if requirement.table
+                        in postgres_module._MIGRATED_TRIGGER_CATALOG_TABLES
+                    ),
+                )
+            )
             if migrated_triggers is None
             else migrated_triggers,
         ),
@@ -206,6 +315,29 @@ class _BrokenDriver:
 
 
 class PostgresV11Tests(unittest.TestCase):
+    def test_runtime_provisioning_uses_minimal_row_lock_update_grants(self) -> None:
+        provisioning_sql = " ".join(
+            (PROJECT_ROOT / "db/provision_t4_evidence_roles.sql")
+            .read_text(encoding="utf-8")
+            .split()
+        )
+        self.assertNotIn(
+            'GRANT UPDATE (source_id) ON crypto_agent.data_sources TO :"runtime_role";',
+            provisioning_sql,
+        )
+        self.assertIn(
+            "GRANT UPDATE (alert_delivery_outbox_id) ON "
+            'crypto_agent.alert_delivery_outbox TO :"runtime_role";',
+            provisioning_sql,
+        )
+        ingest_sql = (PROJECT_ROOT / "src/crypto_agent/t4_ingest.py").read_text(
+            encoding="utf-8"
+        )
+        source_lookup = ingest_sql.split("SELECT source_id", 1)[1].split(
+            "source_row =", 1
+        )[0]
+        self.assertNotIn("FOR SHARE", source_lookup)
+
     def test_health_manifest_covers_all_versioned_tables_and_triggers(self) -> None:
         base_sql = (PROJECT_ROOT / "db/schema.sql").read_text(encoding="utf-8")
         migration_sql = "\n".join(
@@ -218,6 +350,7 @@ class PostgresV11Tests(unittest.TestCase):
                 "0015_t4_futures_evidence.sql",
                 "0016_operational_alert_outbox.sql",
                 "0017_t4_observation_campaign.sql",
+                "0018_t4_scenario_evidence.sql",
             )
         )
         base_tables = set(re.findall(r"^CREATE TABLE ([a-z0-9_]+)", base_sql, re.MULTILINE))
@@ -231,16 +364,26 @@ class PostgresV11Tests(unittest.TestCase):
         self.assertEqual(set(postgres_module._BASE_TABLES), base_tables)
         self.assertEqual(set(postgres_module._MIGRATED_TABLES), migrated_tables)
         self.assertEqual(len(postgres_module._BASE_TABLES), 42)
-        self.assertEqual(len(postgres_module._MIGRATED_TABLES), 21)
+        self.assertEqual(len(postgres_module._MIGRATED_TABLES), 26)
         self.assertEqual(
             len(postgres_module._BASE_TRIGGER_REQUIREMENTS)
             + len(postgres_module._MIGRATED_TRIGGER_REQUIREMENTS),
-            150,
+            165,
         )
-        for requirement in (
+        trigger_requirements = (
             *postgres_module._BASE_TRIGGER_REQUIREMENTS,
             *postgres_module._MIGRATED_TRIGGER_REQUIREMENTS,
-        ):
+        )
+        self.assertEqual(
+            len({requirement.name for requirement in trigger_requirements}),
+            len(trigger_requirements),
+        )
+        self.assertIn(
+            "t4_observation_scenario_trial_requests_append_only_truncate_gua",
+            {requirement.name for requirement in trigger_requirements},
+        )
+        for requirement in trigger_requirements:
+            self.assertLessEqual(len(requirement.name.encode("ascii")), 63)
             self.assertIs(type(requirement.type_mask), int)
             self.assertIs(type(requirement.deferrable), bool)
             self.assertIs(type(requirement.initially_deferred), bool)
@@ -252,6 +395,17 @@ class PostgresV11Tests(unittest.TestCase):
                 ),
             )
             self.assertRegex(function_requirement.source_sha256, r"^[0-9a-f]{64}$")
+        evidence_sql = (
+            PROJECT_ROOT / "db/migrations/0018_t4_scenario_evidence.sql"
+        ).read_text(encoding="utf-8")
+        named_constraints = set(re.findall(
+            r"\bCONSTRAINT\s+([a-z0-9_]+)", evidence_sql, re.IGNORECASE
+        ))
+        manifested_constraints = {
+            item.name for item in postgres_module._OPERATIONAL_CONSTRAINT_REQUIREMENTS
+        }
+        self.assertEqual(len(named_constraints), 53)
+        self.assertTrue(named_constraints <= manifested_constraints)
 
     def test_settings_repr_never_contains_dsn_secret(self) -> None:
         settings = PostgresSettings(dsn="opaque-sensitive-dsn")
@@ -275,7 +429,7 @@ class PostgresV11Tests(unittest.TestCase):
         migrations = discover_migrations(PROJECT_ROOT / "db/migrations")
         self.assertEqual(
             [item.version for item in migrations],
-            ["0011", "0012", "0013", "0014", "0015", "0016", "0017"],
+            ["0011", "0012", "0013", "0014", "0015", "0016", "0017", "0018"],
         )
         for migration in migrations:
             self.assertRegex(migration.checksum_sha256, r"^[0-9a-f]{64}$")
@@ -357,6 +511,147 @@ class PostgresV11Tests(unittest.TestCase):
         self.assertIn("previous_event_hash <> previous_row.content_hash", sql)
         self.assertIn("NOT v1_gate_passed", sql)
         self.assertNotIn("CREATE TABLE crypto_agent.orders", sql)
+
+    def test_t4_scenario_evidence_is_restricted_and_database_derived(self) -> None:
+        sql = (
+            PROJECT_ROOT / "db/migrations/0018_t4_scenario_evidence.sql"
+        ).read_text(encoding="utf-8")
+        self.assertIn("CREATE ROLE crypto_agent_evidence_owner NOLOGIN", sql)
+        self.assertIn("CREATE ROLE crypto_agent_evidence_verifier NOLOGIN", sql)
+        self.assertIn("UNIQUE (evidence_key_fingerprint_sha256, sequence_no)", sql)
+        self.assertIn("scenario_verified IS DISTINCT FROM TRUE", sql)
+        self.assertIn("passive scenario evidence is not complete yet", sql)
+        self.assertIn(
+            "CREATE OR REPLACE FUNCTION crypto_agent.t4_observation_gate_is_verified(",
+            sql,
+        )
+        self.assertRegex(
+            sql,
+            r"NEW\.v1_gate_passed IS DISTINCT FROM\s+"
+            r"crypto_agent\.t4_observation_gate_is_verified\(\s*"
+            r"NEW\.campaign_id, NEW\.bridge_checkpoint_event_id\s*\)",
+        )
+        self.assertIn("campaign_checkpoint", sql)
+        self.assertIn("bridge_checkpoint_sequence_no", sql)
+        self.assertIn("SELECT max(head.sequence_no)", sql)
+        self.assertIn("t4_scenario_alert_finalization_guard", sql)
+        self.assertIn(
+            "cannot append an alert to finalized T4 scenario evidence", sql
+        )
+        self.assertIn("SECURITY DEFINER\nSET search_path = pg_catalog, crypto_agent", sql)
+        self.assertIn("event.campaign_id IS DISTINCT FROM p_campaign_id", sql)
+        self.assertIn("cycle_interval_seconds", sql)
+        self.assertIn("pre_cycle.campaign_id = p_campaign_id", sql)
+        self.assertIn("pre_cycle.outcome = 'success'", sql)
+        self.assertIn(
+            "secs => campaign_row.cycle_interval_seconds",
+            sql,
+        )
+        self.assertIn("scenario evidence is not in exact signed chain order", sql)
+        self.assertIn("alert_delivery_attempts attempt", sql)
+        for table in (
+            "t4_bridge_evidence_keys",
+            "t4_bridge_observation_events",
+            "t4_replay_verifier_attestations",
+            "t4_observation_scenario_trial_requests",
+            "t4_observation_scenario_trials",
+        ):
+            self.assertIn(f"{table}_append_only_row_guard", sql)
+            self.assertIn(f"{table}_append_only_truncate_guard", sql)
+        self.assertIn("record_verified_t4_replay_attestation", sql)
+        self.assertIn("t4_replay_attestations_are_verified", sql)
+        self.assertIn("replay_attestation_ids", sql)
+        self.assertIn("replay_limit = 120", sql)
+        self.assertIn("external_delivery_eligible", sql)
+        self.assertIn("attested < campaign_row.planned_ends_at", sql)
+        self.assertNotIn(
+            "attested NOT BETWEEN campaign_row.planned_ends_at", sql
+        )
+        self.assertRegex(
+            sql,
+            r"attestation\.attested_at > checkpoint_row\.event_at",
+        )
+        self.assertIn(
+            "replay attestation does not match an open frozen campaign", sql
+        )
+
+    def test_health_check_requires_restricted_evidence_routines(self) -> None:
+        routines = _routine_rows(postgres_module._MIGRATED_ROUTINE_REQUIREMENTS)
+        routines = [
+            row for row in routines if row[0] != "t4_observation_gate_is_verified"
+        ]
+        health = check_postgres_health(
+            lambda: FakeConnection(_health_steps(migrated_routines=routines))
+        )
+        self.assertEqual(health.status_code, "MIGRATED_SCHEMA_MISSING")
+        self.assertIn(
+            "routine:t4_observation_gate_is_verified",
+            health.missing_schema_objects,
+        )
+
+        routines = _routine_rows(postgres_module._MIGRATED_ROUTINE_REQUIREMENTS)
+        gate_two = next(
+            index for index, row in enumerate(routines)
+            if row[0] == "t4_observation_gate_is_verified" and row[1] == 2
+        )
+        row = list(routines[gate_two])
+        row[8] = "BEGIN RETURN TRUE; END;"
+        routines[gate_two] = tuple(row)
+        health = check_postgres_health(
+            lambda: FakeConnection(_health_steps(migrated_routines=routines))
+        )
+        self.assertEqual(health.status_code, "MIGRATED_SCHEMA_MISSING")
+        self.assertIn(
+            "routine:t4_observation_gate_is_verified",
+            health.missing_schema_objects,
+        )
+
+    def test_routine_catalog_includes_attested_trigger_functions(self) -> None:
+        requirements = tuple(
+            requirement
+            for requirement in postgres_module._MIGRATED_ROUTINE_REQUIREMENTS
+            if requirement.name == "forbid_append_only_change"
+        )
+        connection = FakeConnection([
+            SQLStep("AS fixed_search_path", _routine_rows(requirements))
+        ])
+
+        actual = postgres_module._catalog_routines(
+            connection.scripted_cursor,
+            requirements,
+        )
+
+        self.assertIn(("forbid_append_only_change", 0), actual)
+        query = connection.scripted_cursor.executions[0][0]
+        self.assertNotIn("proc.prorettype <>", query)
+
+    def test_health_check_requires_evidence_roles_acl_and_pgcrypto_schema(self) -> None:
+        boundary = (
+            False, True, True, True, True, True, True, True, True, True, True
+        )
+        health = check_postgres_health(
+            lambda: FakeConnection(_health_steps(evidence_boundary=boundary))
+        )
+        self.assertEqual(health.status_code, "MIGRATED_SCHEMA_MISSING")
+        self.assertIn("boundary:pgcrypto_schema", health.missing_schema_objects)
+
+        boundary = (
+            True, True, True, True, False, True, True, True, True, True, True
+        )
+        health = check_postgres_health(
+            lambda: FakeConnection(_health_steps(evidence_boundary=boundary))
+        )
+        self.assertIn(
+            "boundary:evidence_roles_separated", health.missing_schema_objects
+        )
+
+        boundary = (
+            True, True, True, True, True, True, False, True, True, True, True
+        )
+        health = check_postgres_health(
+            lambda: FakeConnection(_health_steps(evidence_boundary=boundary))
+        )
+        self.assertIn("boundary:evidence_table_acl", health.missing_schema_objects)
 
     def test_reference_price_policy_migration_is_exact_and_guarded(self) -> None:
         sql = (PROJECT_ROOT / "db/migrations/0012_reference_price_policy_contract.sql").read_text(
@@ -491,7 +786,7 @@ class PostgresV11Tests(unittest.TestCase):
         self.assertEqual(health.status_code, "MIGRATIONS_PENDING")
         self.assertEqual(
             health.missing_migrations,
-            ("0011", "0012", "0013", "0014", "0015", "0016", "0017"),
+            ("0011", "0012", "0013", "0014", "0015", "0016", "0017", "0018"),
         )
         self.assertTrue(connection.committed)
         self.assertTrue(connection.closed)
@@ -519,6 +814,26 @@ class PostgresV11Tests(unittest.TestCase):
         self.assertTrue(health.database_reachable)
         self.assertEqual(health.status_code, "POSTGRES_SESSION_UNSAFE")
 
+    def test_health_check_rejects_privileged_or_unseparated_runtime(self) -> None:
+        for override in (
+            {"current_user_super": True},
+            {"current_user_owner_member": True},
+            {"current_user_verifier_member": True},
+            {"current_user_reader_member": False},
+            {"current_user_database_owner": True},
+            {"current_user_schema_owner": True},
+            {"current_user_table_owner": True},
+            {"current_user_function_owner": True},
+            {"current_user_role_safe": False},
+        ):
+            with self.subTest(override=override):
+                health = check_postgres_health(
+                    lambda override=override: FakeConnection(
+                        _health_steps(**override)
+                    )
+                )
+                self.assertEqual(health.status_code, "POSTGRES_SESSION_UNSAFE")
+
     def test_empty_supplied_migration_manifest_cannot_bypass_packaged_manifest(self) -> None:
         connection = FakeConnection(_health_steps(applied_migrations=[]))
         health = check_postgres_health(lambda: connection, expected_migrations=())
@@ -526,7 +841,7 @@ class PostgresV11Tests(unittest.TestCase):
         self.assertEqual(health.status_code, "MIGRATIONS_PENDING")
         self.assertEqual(
             health.missing_migrations,
-            ("0011", "0012", "0013", "0014", "0015", "0016", "0017"),
+            ("0011", "0012", "0013", "0014", "0015", "0016", "0017", "0018"),
         )
 
     def test_caller_cannot_replace_packaged_migration_manifest_with_subset(self) -> None:

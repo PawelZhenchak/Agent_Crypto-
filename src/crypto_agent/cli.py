@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import io
 import json
 import os
 import re
@@ -10,11 +11,12 @@ import sys
 import threading
 import time
 from collections.abc import Sequence
+from contextlib import redirect_stdout, suppress
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
-from uuid import UUID, uuid4, uuid5
+from uuid import UUID, uuid5
 
 from .factory import build_monitoring_repository, build_orchestrator
 from .monitoring import run_monitored_analysis
@@ -35,7 +37,11 @@ from .t4_ingest import (
 )
 
 if TYPE_CHECKING:
+    from .evidence_verifier import EvidenceVerifierClient
     from .observation import ObservationRepository
+    from .observation_scenarios import (
+        ScenarioCheckpointReceipt,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -123,7 +129,7 @@ def build_parser() -> argparse.ArgumentParser:
         "observe-start",
         help="Freeze and start the real-time 28-day live-T4 observation baseline",
     )
-    observation_start.add_argument("--campaign-id", default=None)
+    observation_start.add_argument("--campaign-id", required=True)
     observation_start.add_argument("--cycle-interval-seconds", type=int, default=300)
     observation_start.add_argument(
         "--scope",
@@ -154,6 +160,40 @@ def build_parser() -> argparse.ArgumentParser:
     observation_run.add_argument("--campaign-id", required=True)
     observation_run.add_argument("--scope", required=True)
     observation_run.add_argument("--limit", type=int, default=120)
+
+    observation_scenarios = subparsers.add_parser(
+        "observe-scenarios",
+        help="Collect one DB-verified signed T4 scenario without caller PASS input",
+    )
+    observation_scenarios.add_argument("--campaign-id", required=True)
+    observation_scenarios.add_argument(
+        "--scenario",
+        required=True,
+        choices=(
+            "bridge_restart",
+            "missing_data",
+            "rate_limit",
+            "reconnect",
+            "replay_blocked",
+            "roll_transition",
+            "stale_data",
+        ),
+    )
+    observation_scenarios.add_argument("--scope", default="BTC/USD:240m")
+    observation_scenarios.add_argument("--limit", type=int, default=120)
+    observation_scenarios.add_argument("--timeout-seconds", type=float, default=180.0)
+    observation_scenarios.add_argument("--poll-seconds", type=float, default=0.5)
+
+    evidence_verifier = subparsers.add_parser(
+        "evidence-verifier",
+        help="Run the isolated loopback T4 evidence verifier service",
+    )
+    evidence_verifier.add_argument(
+        "--host",
+        choices=("127.0.0.1", "::1"),
+        default="127.0.0.1",
+    )
+    evidence_verifier.add_argument("--port", type=int, default=8791)
     return parser
 
 
@@ -190,6 +230,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_observation_report_command(args)
     if args.command == "observe-run":
         return _run_observation_cycle_command(args)
+    if args.command == "observe-scenarios":
+        return _run_observation_scenario_command(args)
+    if args.command == "evidence-verifier":
+        return _run_evidence_verifier_command(args)
     return 2
 
 
@@ -449,6 +493,32 @@ def _observation_repository() -> ObservationRepository:
     )
 
 
+def _scenario_evidence_repository() -> EvidenceVerifierClient:
+    from .evidence_verifier import EvidenceVerifierClient
+
+    return EvidenceVerifierClient.from_env()
+
+
+def _run_evidence_verifier_command(args: argparse.Namespace) -> int:
+    from .evidence_verifier import run_evidence_verifier_service
+
+    try:
+        run_evidence_verifier_service(host=args.host, port=args.port)
+    except Exception:
+        print(
+            json.dumps(
+                {
+                    "status": "error",
+                    "error_code": "EVIDENCE_VERIFIER_START_FAILED",
+                    "execution_enabled": False,
+                }
+            ),
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
 def _observation_database_now(repository: ObservationRepository) -> datetime:
     """Use PostgreSQL time so the CLI cannot accept a caller-supplied cutoff."""
 
@@ -473,6 +543,74 @@ def _observation_database_now(repository: ObservationRepository) -> datetime:
     return row[0].astimezone(UTC)
 
 
+def _observation_scope_is_due(
+    repository: ObservationRepository,
+    *,
+    campaign_id: str,
+    scope_key: str,
+) -> bool:
+    """Read-only preflight so a fault is never armed without a writable due slot."""
+
+    from .postgres import cursor, transaction
+
+    with (
+        transaction(repository.connection_factory) as connection,
+        cursor(connection) as db_cursor,
+    ):
+        db_cursor.execute("SET TRANSACTION READ ONLY")
+        db_cursor.execute(
+            """
+            WITH campaign AS (
+                SELECT started_at, planned_ends_at, cycle_interval_seconds,
+                       clock_timestamp() AS database_now,
+                       COALESCE(MAX(cycle.sequence_no), 0) + 1 AS next_sequence
+                FROM crypto_agent.t4_observation_campaigns item
+                LEFT JOIN crypto_agent.t4_observation_cycles cycle
+                  ON cycle.campaign_id = item.campaign_id
+                 AND cycle.scope_key = %s
+                WHERE item.campaign_id = %s
+                  AND item.scope_manifest ? %s
+                GROUP BY item.started_at, item.planned_ends_at,
+                         item.cycle_interval_seconds
+            )
+            SELECT database_now >= started_at
+                       + make_interval(secs => cycle_interval_seconds * next_sequence)
+               AND started_at
+                       + make_interval(secs => cycle_interval_seconds * next_sequence)
+                       <= planned_ends_at
+               AND database_now <= planned_ends_at
+                       + make_interval(secs => cycle_interval_seconds)
+            FROM campaign
+            """,
+            (scope_key, campaign_id, scope_key),
+        )
+        row = db_cursor.fetchone()
+    return (
+        isinstance(row, Sequence)
+        and not isinstance(row, (str, bytes))
+        and len(row) == 1
+        and row[0] is True
+    )
+
+
+def _sync_bridge_observation_events(campaign_id: str) -> int:
+    """Ask the isolated verifier to fetch, verify and persist the journal."""
+
+    return _scenario_evidence_repository().sync_bridge_events(
+        campaign_id=campaign_id
+    )
+
+
+def _checkpoint_and_sync_bridge_observation_events(
+    campaign_id: str,
+) -> ScenarioCheckpointReceipt:
+    """Ask the isolated verifier to sign and persist the exact journal head."""
+
+    return _scenario_evidence_repository().record_campaign_checkpoint(
+        campaign_id=campaign_id
+    )
+
+
 def _run_observation_start_command(args: argparse.Namespace) -> int:
     from .observation import ObservationCampaign
 
@@ -481,8 +619,12 @@ def _run_observation_start_command(args: argparse.Namespace) -> int:
         policy = repository.policy
         started_at = _observation_database_now(repository)
         scopes = tuple(sorted(args.scope or ("BTC/USD:240m", "ETH/USD:240m")))
+        evidence_repository = _scenario_evidence_repository()
+        evidence_registration = evidence_repository.register_campaign(
+            args.campaign_id
+        )
         campaign = ObservationCampaign(
-            campaign_id=args.campaign_id or str(uuid4()),
+            campaign_id=args.campaign_id,
             started_at=started_at,
             planned_ends_at=started_at
             + timedelta(seconds=policy.minimum_elapsed_seconds),
@@ -499,9 +641,14 @@ def _run_observation_start_command(args: argparse.Namespace) -> int:
                 args.runtime_config_hash
                 or os.getenv("CRYPTO_AGENT_RUNTIME_CONFIG_HASH", "")
             ),
+            bridge_evidence_key_fingerprint=(
+                evidence_registration.evidence_key_fingerprint_sha256
+            ),
             scope_manifest=scopes,
         )
         campaign.validate(policy)
+        if evidence_registration.campaign_id != campaign.campaign_id:
+            raise RuntimeError("bridge evidence key registration mismatch")
         live_provider = _t4_provider()
         for scope_key in campaign.scope_manifest:
             symbol, interval_minutes = _parse_observation_scope(scope_key)
@@ -513,6 +660,9 @@ def _run_observation_start_command(args: argparse.Namespace) -> int:
             )
             _validate_live_observation_batch(preflight_batch)
         frozen_baseline_hash = repository.create_campaign(campaign)
+        evidence_repository.sync_bridge_events(
+            campaign_id=campaign.campaign_id,
+        )
         payload: dict[str, object] = {
             "schema_version": 1,
             "status": "started",
@@ -604,12 +754,25 @@ def _run_observation_cycle_command(args: argparse.Namespace) -> int:
         def execute(plan: ObservationCyclePlan) -> ObservationCycleExecution:
             provider = _t4_provider()
             fetch_started = time.monotonic_ns()
-            batch = provider.fetch_batch(
-                symbol=symbol,
-                interval_minutes=interval_minutes,
-                as_of=plan.expected_at,
-                limit=args.limit,
-            )
+            try:
+                batch = provider.fetch_batch(
+                    symbol=symbol,
+                    interval_minutes=interval_minutes,
+                    as_of=plan.expected_at,
+                    limit=args.limit,
+                )
+            except ProviderError as exc:
+                # The immutable observation cycle remains the primary
+                # fail-closed record if monitoring storage is unavailable.
+                with suppress(Exception):
+                    build_monitoring_repository().record_failure(
+                        trace_id=plan.trace_id,
+                        operation="live_t4_analysis",
+                        error_code=exc.code,
+                        component="t4_provider",
+                        scope=f"{symbol}:{interval_minutes}",
+                    )
+                raise
             bridge_rtt_milliseconds = max(
                 0, (time.monotonic_ns() - fetch_started) // 1_000_000
             )
@@ -719,6 +882,7 @@ def _run_observation_cycle_command(args: argparse.Namespace) -> int:
             "trace_id": result.trace_id,
             "t4_batch_id": result.t4_batch_id,
             "research_run_id": result.research_run_id,
+            "error_code": result.error_code,
             "cycle_content_hash": result.content_hash,
             "missed_cycles_recorded": result.missed_cycles_recorded,
             "read_only": True,
@@ -735,6 +899,172 @@ def _run_observation_cycle_command(args: argparse.Namespace) -> int:
                 exc.code
                 if isinstance(exc, ObservationError)
                 else "OBSERVATION_CYCLE_FAILED"
+            ),
+            "read_only": True,
+            "execution_enabled": False,
+        }
+        exit_code = 1
+    _print_observation_json(payload)
+    return exit_code
+
+
+def _run_observation_scenario_command(args: argparse.Namespace) -> int:
+    from .observation_scenarios import (
+        CONTROLLED_SCENARIOS,
+        PASSIVE_SCENARIOS,
+        ScenarioEvidenceError,
+    )
+
+    try:
+        if type(args.limit) is not int or not 60 <= args.limit <= 720:
+            raise ScenarioEvidenceError(
+                "Scenario recovery limit is invalid",
+                code="T4_SCENARIO_LIMIT_INVALID",
+            )
+        if not _valid_poll_seconds(args.poll_seconds, minimum=0.01):
+            raise ScenarioEvidenceError(
+                "Scenario polling interval is invalid",
+                code="T4_SCENARIO_TIMING_INVALID",
+            )
+        if (
+            isinstance(args.timeout_seconds, bool)
+            or not isinstance(args.timeout_seconds, (int, float))
+            or not 1.0 <= float(args.timeout_seconds) <= 300.0
+            or float(args.poll_seconds) > float(args.timeout_seconds)
+        ):
+            raise ScenarioEvidenceError(
+                "Scenario timeout is invalid",
+                code="T4_SCENARIO_TIMING_INVALID",
+            )
+        symbol, interval_minutes = _parse_observation_scope(args.scope)
+        repository = _scenario_evidence_repository()
+        if args.scenario in PASSIVE_SCENARIOS:
+            result = repository.verify_passive_trial(
+                campaign_id=args.campaign_id,
+                scenario_code=args.scenario,
+            )
+            result.validate()
+        elif args.scenario in CONTROLLED_SCENARIOS:
+            def before_trigger() -> None:
+                if args.scenario not in {
+                    "missing_data",
+                    "rate_limit",
+                    "stale_data",
+                }:
+                    return
+                observation_repository = _observation_repository()
+                if not _observation_scope_is_due(
+                    observation_repository,
+                    campaign_id=args.campaign_id,
+                    scope_key=args.scope,
+                ):
+                    raise ScenarioEvidenceError(
+                        "Controlled fault requires a currently due frozen slot",
+                        code="T4_SCENARIO_SLOT_NOT_DUE",
+                    )
+
+            def exercise(_run: object) -> None:
+                expected_code = {
+                    "missing_data": "T4_MISSING_DATA",
+                    "rate_limit": "T4_RATE_LIMITED",
+                    "stale_data": "T4_STALE_DATA",
+                }.get(args.scenario)
+                if expected_code is None:
+                    return
+                cycle_args = argparse.Namespace(
+                    campaign_id=args.campaign_id,
+                    scope=args.scope,
+                    limit=args.limit,
+                )
+                captured = io.StringIO()
+                with redirect_stdout(captured):
+                    exit_code = _run_observation_cycle_command(cycle_args)
+                try:
+                    cycle_payload = json.loads(captured.getvalue())
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    raise ScenarioEvidenceError(
+                        "Controlled failure cycle result is invalid",
+                        code="T4_SCENARIO_FAILURE_NOT_RECORDED",
+                    ) from None
+                if (
+                    exit_code != 1
+                    or not isinstance(cycle_payload, dict)
+                    or cycle_payload.get("status") != "recorded"
+                    or cycle_payload.get("outcome") != "failure"
+                    or cycle_payload.get("error_code") != expected_code
+                ):
+                    raise ScenarioEvidenceError(
+                        "Controlled failure cycle was not recorded with its typed code",
+                        code="T4_SCENARIO_FAILURE_NOT_RECORDED",
+                    )
+
+            def recovery(_run: object) -> None:
+                observation_repository = _observation_repository()
+                deadline = time.monotonic() + min(
+                    60.0, float(args.timeout_seconds)
+                )
+                while time.monotonic() < deadline:
+                    try:
+                        cutoff = _observation_database_now(observation_repository)
+                        batch = _t4_provider().fetch_batch(
+                            symbol=symbol,
+                            interval_minutes=interval_minutes,
+                            as_of=cutoff,
+                            limit=args.limit,
+                        )
+                        _validate_live_observation_batch(batch)
+                        receipt = _t4_repository().ingest(
+                            batch, requested_as_of=cutoff
+                        )
+                        if receipt.payload_sha256 != batch.raw_payload_sha256:
+                            raise ScenarioEvidenceError(
+                                "Scenario recovery batch linkage is invalid",
+                                code="T4_SCENARIO_RECOVERY_INVALID",
+                            )
+                        return
+                    except ProviderError:
+                        time.sleep(max(0.05, float(args.poll_seconds)))
+                raise ScenarioEvidenceError(
+                    "Live T4 recovery was not observed before the deadline",
+                    code="T4_SCENARIO_RECOVERY_TIMEOUT",
+                )
+
+            result = repository.run_controlled(
+                campaign_id=args.campaign_id,
+                scenario_code=args.scenario,
+                scope_key=args.scope,
+                before_trigger=before_trigger,
+                exercise=exercise,
+                recovery=recovery,
+                timeout_seconds=float(args.timeout_seconds),
+                poll_seconds=float(args.poll_seconds),
+            )
+        else:
+            raise ScenarioEvidenceError(
+                "Scenario is not approved",
+                code="T4_SCENARIO_INVALID",
+            )
+        payload: dict[str, object] = {
+            "schema_version": 1,
+            "status": "verified",
+            "campaign_id": result.campaign_id,
+            "scenario": result.scenario_code,
+            "outcome": result.outcome,
+            "trial_id": result.trial_id,
+            "completed_at": result.completed_at.isoformat(),
+            "content_hash_sha256": result.content_hash_sha256,
+            "read_only": True,
+            "execution_enabled": False,
+        }
+        exit_code = 0 if result.outcome == "pass" else 3
+    except Exception as exc:
+        payload = {
+            "schema_version": 1,
+            "status": "error",
+            "error_code": (
+                exc.code
+                if isinstance(exc, ScenarioEvidenceError)
+                else "T4_SCENARIO_VERIFICATION_FAILED"
             ),
             "read_only": True,
             "execution_enabled": False,
@@ -796,9 +1126,17 @@ def _run_observation_status_command(args: argparse.Namespace) -> int:
             args.campaign_id,
             observed_until=observed_until,
         )
-        remaining_seconds = max(
+        observation_remaining_seconds = max(
             0,
             repository.policy.minimum_elapsed_seconds - report.elapsed_seconds,
+        )
+        finalization_remaining_seconds = repository.finalization_remaining_seconds(
+            args.campaign_id,
+            observed_at=observed_until,
+        )
+        remaining_seconds = max(
+            observation_remaining_seconds,
+            finalization_remaining_seconds,
         )
         payload: dict[str, object] = {
             "schema_version": 1,
@@ -807,6 +1145,10 @@ def _run_observation_status_command(args: argparse.Namespace) -> int:
             "observed_until": report.observed_until.isoformat(),
             "elapsed_seconds": report.elapsed_seconds,
             "remaining_seconds": remaining_seconds,
+            "observation_remaining_seconds": observation_remaining_seconds,
+            "finalization_grace_remaining_seconds": (
+                finalization_remaining_seconds
+            ),
             "overall_status": report.overall_status.value,
             "v1_gate_passed": report.v1_gate_passed,
             "final_report_eligible": remaining_seconds == 0,
@@ -830,26 +1172,48 @@ def _run_observation_status_command(args: argparse.Namespace) -> int:
 
 
 def _run_observation_report_command(args: argparse.Namespace) -> int:
+    from .observation import ObservationBridgeCheckpoint
+
     try:
         repository = _observation_repository()
+        # Freeze the database cutoff first.  Before the window ends, report
+        # status needs no bridge mutation.  At finalization the signed
+        # checkpoint closes one journal prefix, which is imported and then
+        # evaluated again against this same immutable cutoff.
         observed_until = _observation_database_now(repository)
         report = repository.build_quality_report(
             args.campaign_id,
             observed_until=observed_until,
         )
-        remaining_seconds = max(
+        observation_remaining_seconds = max(
             0,
             repository.policy.minimum_elapsed_seconds - report.elapsed_seconds,
+        )
+        finalization_remaining_seconds = repository.finalization_remaining_seconds(
+            args.campaign_id,
+            observed_at=observed_until,
+        )
+        remaining_seconds = max(
+            observation_remaining_seconds,
+            finalization_remaining_seconds,
         )
         if remaining_seconds:
             payload: dict[str, object] = {
                 "schema_version": 1,
                 "status": "error",
-                "error_code": "OBSERVATION_WINDOW_INCOMPLETE",
+                "error_code": (
+                    "OBSERVATION_WINDOW_INCOMPLETE"
+                    if observation_remaining_seconds
+                    else "OBSERVATION_FINALIZATION_GRACE_INCOMPLETE"
+                ),
                 "campaign_id": report.campaign_id,
                 "observed_until": report.observed_until.isoformat(),
                 "elapsed_seconds": report.elapsed_seconds,
                 "remaining_seconds": remaining_seconds,
+                "observation_remaining_seconds": observation_remaining_seconds,
+                "finalization_grace_remaining_seconds": (
+                    finalization_remaining_seconds
+                ),
                 "overall_status": report.overall_status.value,
                 "v1_gate_passed": False,
                 "read_only": True,
@@ -857,7 +1221,23 @@ def _run_observation_report_command(args: argparse.Namespace) -> int:
             }
             exit_code = 1
         else:
-            stored_hash = repository.store_final_report(report)
+            receipt = _checkpoint_and_sync_bridge_observation_events(
+                args.campaign_id
+            )
+            report = repository.build_quality_report(
+                args.campaign_id,
+                observed_until=observed_until,
+            )
+            checkpoint = ObservationBridgeCheckpoint(
+                campaign_id=receipt.campaign_id,
+                action_request_id=receipt.action_request_id,
+                sequence_no=receipt.event_sequence_no,
+                event_hash_sha256=receipt.event_hash_sha256,
+            )
+            stored_hash = repository.store_final_report(
+                report,
+                bridge_checkpoint=checkpoint,
+            )
             payload = {
                 "schema_version": 1,
                 "status": "stored",
