@@ -726,7 +726,7 @@ def _assert_operational_ingest_and_replay() -> None:
         raise AssertionError("expected ten immutable T4 order-book levels")
     _expect_sqlstate_after(
         (),
-        "UPDATE crypto_agent.data_sources SET source_id = source_id "
+        "UPDATE crypto_agent.data_sources SET source_key = source_key "
         "WHERE source_key = 'plus500_t4_futures_v1'",
         "42501",
         _role_factory(_RUNTIME_ROLE),
