@@ -1,0 +1,39 @@
+[Unit]
+Description=Crypto Agent read-only Plus500 T4 bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=crypto-bridge
+Group=crypto-bridge
+WorkingDirectory=/opt/crypto-agent/current/t4-bridge
+EnvironmentFile=/etc/crypto-agent/t4-bridge.env
+Environment=T4_EVIDENCE_SIGNING_KEY_PATH=%d/t4-evidence-key.pem
+Environment=T4_OBSERVATION_EVENT_JOURNAL_PATH=/var/lib/crypto-agent-t4-bridge/observation-events.jsonl
+LoadCredential=t4-evidence-key.pem:/etc/crypto-agent/secrets/t4-evidence-key.pem
+ExecStart=/usr/bin/dotnet /opt/crypto-agent/current/t4-bridge/publish/CryptoAgent.T4Bridge.dll
+Restart=always
+RestartSec=3s
+TimeoutStopSec=30s
+StateDirectory=crypto-agent-t4-bridge
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

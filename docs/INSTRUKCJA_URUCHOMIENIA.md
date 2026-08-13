@@ -213,16 +213,20 @@ backfillowany.
 ```bash
 crypto-agent observe-run --campaign-id <uuid> --scope BTC/USD:240m --limit 120
 crypto-agent observe-run --campaign-id <uuid> --scope ETH/USD:240m --limit 120
+crypto-agent observe-supervise --campaign-id <uuid>
+crypto-agent observe-supervisor-status --campaign-id <uuid>
 crypto-agent observe-status --campaign-id <uuid>
 crypto-agent observe-report --campaign-id <uuid>
 ```
 
-Supervisor wywołuje `observe-run` dla obu zamrożonych scope’ów. Komenda korzysta
+`observe-supervise` wywołuje `observe-run` dla obu zamrożonych scope’ów. Korzysta
 z harmonogramu i czasu PostgreSQL, pobiera live batch schema v5 tylko raz, a ten
 sam obiekt przekazuje do ingestu i zamkniętego providera analizy. Sukces wiąże
 batch, run, trace i raw hash. Retry w tym samym slocie nie pobiera danych, a
 wygasłe sloty mogą zostać zapisane tylko jako `missed`. Szczegóły zawiera
 [runbook obserwacji](T4_OBSERVATION_RUNBOOK.md).
+Instalację jednostek, restart procesów, status i dzienne snapshoty opisuje
+[runbook supervisora](CAMPAIGN_SUPERVISOR_RUNBOOK.md).
 
 Pięć prób kontrolowanych uruchamiaj pojedynczo, w zaplanowanym oknie. Wtedy
 zrestartuj bridge z `T4_OBSERVATION_CONTROL_ENABLED=true`, zachowując ten sam
@@ -235,8 +239,8 @@ crypto-agent observe-scenarios --campaign-id <uuid> \
 
 Dozwolone scenariusze kontrolowane to `bridge_restart`, `missing_data`,
 `rate_limit`, `reconnect` i `stale_data`. `bridge_restart` wymaga zewnętrznego
-supervisora, który uruchomi proces ponownie. Etap 1 nie zawiera jeszcze takiego
-supervisora 24/7; to etap 2.
+supervisora. Od `0.10.0` jednostka bridge'a ma `Restart=always`, a nadzorca
+sprawdza jej powrót przed następnym cyklem.
 
 Kontrolowany `rate_limit` potwierdza reakcję naszego handlera. Nie jest dowodem
 prawdziwego `429` od T4 i nie wolno wywoływać go spamowaniem dostawcy.

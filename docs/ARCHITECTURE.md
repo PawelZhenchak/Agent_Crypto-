@@ -117,8 +117,10 @@ superusera: runtime, verifier-write oraz evidence-reader read-only do
 samodzielnego replay po stronie isolated verifiera. DSN administratora nie
 uczestniczy w żadnej z tych ścieżek.
 
-Etap 1 nie zawiera automatycznego supervisora 24/7. Kontrolowany restart wymaga
-zewnętrznego procesu, który uruchomi bridge ponownie; to zakres etapu 2.
+Etap 2 zawiera automatycznego supervisora 24/7. Każdy cykl działa w izolowanym
+podprocesie, a utwardzone jednostki systemd uruchamiają bridge i verifier
+ponownie. Frozen schedule, advisory lock i hash chain PostgreSQL zachowują
+idempotencję po restarcie lub utracie odpowiedzi.
 
 Provisioning, rzeczywiste testy Simulator/live i kampania nie zostały wykonane.
 Nie ma też dostępu T4 ani prawdziwych identyfikatorów rynków, więc

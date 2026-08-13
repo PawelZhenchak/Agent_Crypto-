@@ -1,0 +1,35 @@
+[Unit]
+Description=Crypto Agent isolated T4 evidence verifier
+After=network-online.target postgresql.service crypto-agent-t4-bridge.service
+Wants=network-online.target
+Wants=crypto-agent-t4-bridge.service
+
+[Service]
+Type=simple
+User=crypto-verifier
+Group=crypto-verifier
+WorkingDirectory=/opt/crypto-agent/current
+EnvironmentFile=/etc/crypto-agent/evidence-verifier.env
+ExecStart=/opt/crypto-agent/venv/bin/crypto-agent evidence-verifier --host 127.0.0.1 --port 8791
+Restart=always
+RestartSec=3s
+TimeoutStopSec=30s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

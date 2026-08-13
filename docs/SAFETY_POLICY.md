@@ -63,7 +63,7 @@ w tym prawdziwego rollu live.
 
 Zdarzenia podpisuje nasz bridge dowodowy, nie T4. Kontrolowany `rate_limit`
 sprawdza nasz handler, nie naturalne `429` dostawcy. Kontrolowany restart wymaga
-zewnętrznego supervisora; etap 1 go nie dostarcza.
+utwardzonej jednostki systemd i supervisora kampanii z etapu 2.
 
 Loginy runtime, `crypto_agent_evidence_verifier` i read-only
 `crypto_agent_evidence_reader` są osobne, bez superusera i bez wspólnego

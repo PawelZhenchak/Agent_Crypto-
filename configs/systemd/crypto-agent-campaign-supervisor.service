@@ -1,0 +1,38 @@
+[Unit]
+Description=Crypto Agent 28-day campaign supervisor
+After=network-online.target postgresql.service crypto-agent-t4-bridge.service crypto-agent-evidence-verifier.service
+Wants=network-online.target
+Wants=crypto-agent-t4-bridge.service crypto-agent-evidence-verifier.service
+
+[Service]
+Type=simple
+User=crypto-runtime
+Group=crypto-runtime
+WorkingDirectory=/opt/crypto-agent/current
+EnvironmentFile=/etc/crypto-agent/runtime.env
+EnvironmentFile=/etc/crypto-agent/campaign-supervisor.env
+ExecStart=/opt/crypto-agent/venv/bin/crypto-agent observe-supervise --campaign-id=${CRYPTO_AGENT_OBSERVATION_CAMPAIGN_ID}
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+StateDirectory=crypto-agent-supervisor
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
