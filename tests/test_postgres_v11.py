@@ -573,6 +573,25 @@ class PostgresV11Tests(unittest.TestCase):
             health.missing_schema_objects,
         )
 
+    def test_routine_catalog_includes_attested_trigger_functions(self) -> None:
+        requirements = tuple(
+            requirement
+            for requirement in postgres_module._MIGRATED_ROUTINE_REQUIREMENTS
+            if requirement.name == "forbid_append_only_change"
+        )
+        connection = FakeConnection([
+            SQLStep("AS fixed_search_path", _routine_rows(requirements))
+        ])
+
+        actual = postgres_module._catalog_routines(
+            connection.scripted_cursor,
+            requirements,
+        )
+
+        self.assertIn(("forbid_append_only_change", 0), actual)
+        query = connection.scripted_cursor.executions[0][0]
+        self.assertNotIn("proc.prorettype <>", query)
+
     def test_health_check_requires_evidence_roles_acl_and_pgcrypto_schema(self) -> None:
         boundary = (
             False, True, True, True, True, True, True, True, True, True, True

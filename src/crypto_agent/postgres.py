@@ -3123,7 +3123,6 @@ def _catalog_routines(
         JOIN pg_catalog.pg_language AS language ON language.oid = proc.prolang
         WHERE ns.nspname = 'crypto_agent'
           AND proc.proname = ANY(%s)
-          AND proc.prorettype <> 'pg_catalog.trigger'::pg_catalog.regtype
         """,
         ([item.name for item in required],),
     )
