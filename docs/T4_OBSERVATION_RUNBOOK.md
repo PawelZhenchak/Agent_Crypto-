@@ -1,4 +1,4 @@
-# Runbook odbioru T4 V1 — 0.9.0, etap 1
+# Runbook odbioru T4 V1 — 0.10.0, etap 2
 
 ## Cel i stan
 
@@ -51,8 +51,8 @@ Nie uruchamiaj `observe-start`, dopóki wszystkie warunki nie są spełnione:
 - UUID jest taki sam w bridge'u i `observe-start`;
 - `observe-run` jest przetestowany i supervisor może wywoływać go dla obu
   scope’ów przez pełne okno;
-- zewnętrzny supervisor potrafi ponownie uruchomić bridge po kontrolowanym
-  `restart`; etap 1 sam nie zapewnia nadzoru procesu 24/7.
+- jednostki systemd i `observe-supervise` są zainstalowane oraz potrafią
+  ponownie uruchomić bridge po kontrolowanym `restart`.
 
 Publiczny Simulator trwa dwa tygodnie i sam nie wystarcza do kampanii. Simulator,
 fixture, synthetic oraz replay nie mogą być źródłem cyklu live.
@@ -188,7 +188,8 @@ w audycie.
 
 ## 4. Runner cykli
 
-Supervisor wywołuje dla obu scope’ów:
+Automatyczny supervisor wywołuje oba scope’y; ręczne komendy poniżej służą tylko
+do diagnostyki:
 
 ```bash
 crypto-agent observe-run --campaign-id <uuid> --scope BTC/USD:240m --limit 120
@@ -208,6 +209,19 @@ należnego slotu w jednej kontrolowanej ścieżce:
 
 Retry przed kolejnym slotem nie pobiera nowych danych. Recovery dopisuje wyłącznie
 `missed` dla wygasłych slotów; nie udaje historycznego sukcesu.
+
+Normalny tryb 28-dniowy:
+
+```bash
+crypto-agent observe-supervise --campaign-id <uuid>
+crypto-agent observe-supervisor-status --campaign-id <uuid>
+```
+
+Supervisor korzysta z czasu PostgreSQL, uruchamia każdy cykl w osobnym
+podprocesie, kończy zawieszony proces po timeout i ponawia tylko błędy techniczne.
+Utrata odpowiedzi po commicie nie tworzy duplikatu, ponieważ następne wywołanie
+jest rozstrzygane przez advisory lock, sekwencję i hash chain w bazie. Pełna
+obsługa: [runbook supervisora](CAMPAIGN_SUPERVISOR_RUNBOOK.md).
 
 Nie zapisuj cykli ręcznie przez SQL. Triggery sprawdzają zamrożony harmonogram,
 hash chain, realny batch/run, środowisko live oraz chronią przed cyklem z
@@ -264,8 +278,8 @@ Pięć scenariuszy kontrolowanych:
 
 - `bridge_restart` — receipt i `bridge_stopping`, nowy `boot_id`, ponowne
   `session_ready` oraz realny batch po odzyskaniu. Bridge sam się zatrzymuje;
-  etap 1 wymaga zewnętrznego supervisora, który go uruchomi. Automatyczny
-  supervisor kampanii należy do etapu 2;
+  jednostka systemd z `Restart=always` uruchamia go ponownie, a supervisor
+  potwierdza recovery przed dalszym cyklem;
 - `missing_data` — kontrolowany brak danych musi utworzyć typowany nieudany cykl
   `T4_MISSING_DATA`, bez alertu, a potem realny batch odzyskania;
 - `rate_limit` — kontrolowany fault musi utworzyć nieudany cykl
@@ -309,11 +323,12 @@ inaczej `roll_transition` pozostanie `NOT_OBSERVED`.
 
 ```bash
 crypto-agent observe-status --campaign-id <uuid>
+crypto-agent observe-supervisor-status --campaign-id <uuid>
 crypto-agent monitoring-status
 ```
 
-Archiwizuj kanoniczny JSON statusu i jego hash w systemie operacyjnym bez
-sekretów. Sprawdzaj w szczególności:
+Supervisor automatycznie zapisuje atomowy status, hash-chain zdarzeń i najwyżej
+jeden snapshot na dzień UTC. Sprawdzaj w szczególności:
 
 - `remaining_seconds`, `observation_remaining_seconds`,
   `finalization_grace_remaining_seconds` i zgodność czasu z PostgreSQL;
@@ -355,7 +370,7 @@ SHA-256. Model wyników to:
 - `FAIL` — co najmniej jedno kryterium ma `FAIL`, bramka pozostaje zamknięta;
 - `NOT_OBSERVED` — brak wymaganego dowodu, bramka pozostaje zamknięta.
 
-W `0.9.0` dodatni wynik nie jest blokowany stałą. Funkcja
+W `0.10.0` dodatni wynik nie jest blokowany stałą. Funkcja
 `t4_observation_gate_is_verified(...)` liczy go bezpośrednio z ledgerów
 PostgreSQL. Trigger odrzuca raport, jeżeli przesłane `v1_gate_passed` różni się od
 wyniku tej funkcji.

@@ -184,6 +184,37 @@ def build_parser() -> argparse.ArgumentParser:
     observation_scenarios.add_argument("--timeout-seconds", type=float, default=180.0)
     observation_scenarios.add_argument("--poll-seconds", type=float, default=0.5)
 
+    observation_supervisor = subparsers.add_parser(
+        "observe-supervise",
+        help="Supervise all frozen BTC/ETH campaign cycles for 28 days",
+    )
+    observation_supervisor.add_argument("--campaign-id", required=True)
+    observation_supervisor.add_argument("--poll-seconds", type=float, default=15.0)
+    observation_supervisor.add_argument(
+        "--cycle-timeout-seconds", type=float, default=120.0
+    )
+    observation_supervisor.add_argument("--command-retries", type=int, default=2)
+    observation_supervisor.add_argument(
+        "--retry-backoff-seconds", type=float, default=2.0
+    )
+    observation_supervisor.add_argument("--limit", type=int, default=120)
+    observation_supervisor.add_argument(
+        "--state-directory",
+        default=None,
+        help="Absolute persistent root (default: CRYPTO_AGENT_SUPERVISOR_STATE_DIRECTORY)",
+    )
+    observation_supervisor.add_argument(
+        "--process-manager", choices=("none", "systemd"), default=None
+    )
+    observation_supervisor.add_argument("--once", action="store_true")
+
+    observation_supervisor_status = subparsers.add_parser(
+        "observe-supervisor-status",
+        help="Read the safe local campaign-supervisor status JSON",
+    )
+    observation_supervisor_status.add_argument("--campaign-id", required=True)
+    observation_supervisor_status.add_argument("--state-directory", default=None)
+
     evidence_verifier = subparsers.add_parser(
         "evidence-verifier",
         help="Run the isolated loopback T4 evidence verifier service",
@@ -232,6 +263,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_observation_cycle_command(args)
     if args.command == "observe-scenarios":
         return _run_observation_scenario_command(args)
+    if args.command == "observe-supervise":
+        return _run_observation_supervisor_command(args)
+    if args.command == "observe-supervisor-status":
+        return _run_observation_supervisor_status_command(args)
     if args.command == "evidence-verifier":
         return _run_evidence_verifier_command(args)
     return 2
@@ -517,6 +552,150 @@ def _run_evidence_verifier_command(args: argparse.Namespace) -> int:
         )
         return 1
     return 0
+
+
+def _supervisor_state_root(value: object) -> Path:
+    configured = (
+        value
+        if isinstance(value, str) and value
+        else os.getenv(
+            "CRYPTO_AGENT_SUPERVISOR_STATE_DIRECTORY",
+            "/var/lib/crypto-agent/campaign-supervisor",
+        )
+    )
+    path = Path(configured)
+    if not path.is_absolute():
+        raise ValueError("supervisor state directory must be absolute")
+    return path
+
+
+def _run_observation_supervisor_command(args: argparse.Namespace) -> int:
+    from .campaign_supervisor import (
+        CampaignSupervisor,
+        CampaignSupervisorConfig,
+        CampaignSupervisorError,
+        NullServiceManager,
+        PostgresCampaignProgressReader,
+        SubprocessCampaignCommandRunner,
+        SupervisorStateStore,
+        SystemdServiceManager,
+        install_signal_handlers,
+    )
+    from .postgres import PostgresSettings, PsycopgConnectionFactory
+
+    try:
+        state_directory = _supervisor_state_root(args.state_directory) / args.campaign_id
+        process_manager = args.process_manager or os.getenv(
+            "CRYPTO_AGENT_SUPERVISOR_PROCESS_MANAGER", "systemd"
+        )
+        config = CampaignSupervisorConfig(
+            campaign_id=args.campaign_id,
+            state_directory=state_directory,
+            poll_seconds=args.poll_seconds,
+            cycle_timeout_seconds=args.cycle_timeout_seconds,
+            command_retries=args.command_retries,
+            retry_backoff_seconds=args.retry_backoff_seconds,
+            limit=args.limit,
+            process_manager=process_manager,
+            bridge_unit=os.getenv(
+                "CRYPTO_AGENT_SUPERVISOR_BRIDGE_UNIT",
+                "crypto-agent-t4-bridge.service",
+            ),
+            verifier_unit=os.getenv(
+                "CRYPTO_AGENT_SUPERVISOR_VERIFIER_UNIT",
+                "crypto-agent-evidence-verifier.service",
+            ),
+            service_restart_cooldown_seconds=float(
+                os.getenv("CRYPTO_AGENT_SUPERVISOR_RESTART_COOLDOWN_SECONDS", "30")
+            ),
+        )
+        config.validate()
+        service_manager = (
+            NullServiceManager()
+            if config.process_manager == "none"
+            else SystemdServiceManager(
+                {
+                    "bridge": config.bridge_unit,
+                    "evidence_verifier": config.verifier_unit,
+                },
+                cooldown_seconds=config.service_restart_cooldown_seconds,
+            )
+        )
+        supervisor = CampaignSupervisor(
+            config=config,
+            progress_reader=PostgresCampaignProgressReader(
+                PsycopgConnectionFactory(PostgresSettings.from_env())
+            ),
+            command_runner=SubprocessCampaignCommandRunner(),
+            service_manager=service_manager,
+            store=SupervisorStateStore(state_directory, config.campaign_id),
+        )
+        stop_event = threading.Event()
+        install_signal_handlers(stop_event)
+        print(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "status": "supervisor_started",
+                    "campaign_id": config.campaign_id,
+                    "process_manager": config.process_manager,
+                    "read_only": True,
+                    "execution_enabled": False,
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        supervisor.run(stop_event, once=args.once)
+        payload = SupervisorStateStore(
+            state_directory, config.campaign_id
+        ).read_status()
+        if payload is None:
+            raise CampaignSupervisorError(
+                "Supervisor status is unavailable",
+                code="SUPERVISOR_STATUS_UNAVAILABLE",
+            )
+        exit_code = 0
+    except Exception as exc:
+        payload = {
+            "schema_version": 1,
+            "status": "error",
+            "error_code": (
+                exc.code
+                if isinstance(exc, CampaignSupervisorError)
+                else "CAMPAIGN_SUPERVISOR_FAILED"
+            ),
+            "read_only": True,
+            "execution_enabled": False,
+        }
+        exit_code = 1
+    _print_observation_json(payload)
+    return exit_code
+
+
+def _run_observation_supervisor_status_command(args: argparse.Namespace) -> int:
+    from .campaign_supervisor import SupervisorStateStore
+
+    try:
+        UUID(args.campaign_id)
+        state_directory = _supervisor_state_root(args.state_directory) / args.campaign_id
+        payload = SupervisorStateStore(
+            state_directory, args.campaign_id
+        ).read_status()
+        if payload is None:
+            raise RuntimeError("supervisor status is unavailable")
+        exit_code = 0
+    except Exception:
+        payload = {
+            "schema_version": 1,
+            "status": "error",
+            "error_code": "SUPERVISOR_STATUS_UNAVAILABLE",
+            "read_only": True,
+            "execution_enabled": False,
+        }
+        exit_code = 1
+    _print_observation_json(payload)
+    return exit_code
 
 
 def _observation_database_now(repository: ObservationRepository) -> datetime:

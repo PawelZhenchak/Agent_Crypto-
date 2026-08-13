@@ -101,8 +101,8 @@ Kontrolowany `rate_limit` testuje handler, nie rzeczywiste `429` dostawcy.
 6. Minimum 672 godziny obserwacji czasu rzeczywistego dla zamrożonego scope’u
    BTC/ETH 4h. Publiczny dwutygodniowy Simulator jest niewystarczający.
 7. Zapis końcowego raportu i komplet obowiązkowych kryteriów `PASS`.
-8. Zewnętrzny supervisor dla kontrolowanego restartu i działania 24/7. Etap 1
-   zatrzymuje bridge po receipt, ale nie uruchamia go ponownie; to etap 2.
+8. Automatyczny supervisor `0.10.0` dla kontrolowanego restartu, cykli obu
+   scope’ów, timeoutów, missed, dziennego stanu i działania 24/7.
 
 Provisioning, rzeczywiste testy Simulator/live i kampania nie zostały wykonane.
 Nie ma jeszcze dostępu T4 ani rzeczywistych `ExchangeID`, `ContractID` i

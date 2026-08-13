@@ -1,4 +1,4 @@
-# Aktualny stan — 0.9.0, etap 1
+# Aktualny stan — 0.10.0, etap 2
 
 ## Zaimplementowane
 
@@ -41,6 +41,13 @@
   dopiero po `planned_ends_at + cycle_interval_seconds`;
 - monitoring punktu 7, append-only outbox i lokalne delivery stdout nadal mają
   semantykę at-least-once z deduplikacją po `idempotency_key`.
+- automatyczny supervisor uruchamia cykle BTC/ETH z frozen schedule, izoluje je
+  w podprocesach, wykrywa timeouty i `missed`, ponawia błędy techniczne bez
+  duplikowania slotów i automatycznie finalizuje kampanię po grace;
+- atomowy status, append-only event journal i jeden dzienny snapshot UTC są
+  odtwarzane po restarcie i chronione hash chainem;
+- utwardzone jednostki systemd automatycznie restartują bridge, verifier i sam
+  supervisor, zachowując trzy oddzielne UID i granice sekretów.
 
 ## Nie jest jeszcze potwierdzone
 
@@ -52,8 +59,7 @@
 - contract test na prawdziwej sesji T4 Simulator, a następnie live;
 - empiryczne zachowanie Chart REST, reconnectu, limitów, opóźnień, rollu i braków
   danych na przydzielonym koncie;
-- operacyjne uruchomienie i nadzór `observe-run` dla każdego scope’u przez cały
-  czas kampanii;
+- instalacja przygotowanych jednostek systemd na docelowym hoście 24/7;
 - wykonanie obowiązkowych kontrolowanych scenariuszy i zapis dowodów;
 - pasywny dowód prawdziwego rollu kontraktu w oknie kampanii;
 - minimum cztery tygodnie nieprzerwanej obserwacji read-only;
@@ -63,9 +69,9 @@ Zakres zamrożonej kampanii odbiorowej `0.9.0` to BTC i ETH na interwale
 4h (`240` minut). Standardowy publiczny T4 Simulator trwa dwa tygodnie, więc do
 pełnych 28 dni potrzebne jest przedłużenie albo właściwy dostęp live.
 
-Etap 1 nie dostarcza jeszcze automatycznego supervisora 24/7. Próba
-`bridge_restart` zatrzymuje bridge po utrwaleniu receipt i wymaga zewnętrznego
-supervisora, aby uruchomić nowy proces. Utrzymanie procesu i kampanii to etap 2.
+Etap 2 dostarcza automatycznego supervisora i jednostki systemd. Kod nie jest
+jeszcze zainstalowany na docelowym hoście, ponieważ nadal brakuje dostępu T4 i
+prawdziwych identyfikatorów. Samo wdrożenie infrastruktury 24/7 jest etapem 3.
 
 Kontrolowany `rate_limit` potwierdza zachowanie naszego handlera i ścieżkę
 fail-closed. Nie potwierdza, że dostawca zwrócił prawdziwe `429`; naturalny limit

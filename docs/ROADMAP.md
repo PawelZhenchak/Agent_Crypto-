@@ -46,10 +46,11 @@
    obiektywny wynik `pass`; `roll_transition` wymaga prawdziwego rollu live.
    Zakres kampanii `0.9.0` to BTC/ETH 4h;
    publiczny dwutygodniowy Simulator sam nie wystarcza.
-9. **Nadzór kampanii 24/7 — etap 2** — do wdrożenia: zewnętrzny supervisor
-   procesów, bezpieczny restart bridge'a, utrzymanie runnerów obu scope'ów,
-   rotacja operacyjna i alarmowanie. W `0.9.0` kontrolowany `bridge_restart`
-   zatrzymuje host, ale sam go nie uruchamia.
+9. **Nadzór kampanii 24/7 — etap 2** — zrealizowany w `0.10.0`: supervisor
+   frozen schedule BTC/ETH, izolowane cykle z timeoutem, ograniczony retry bez
+   duplikatów, wykrywanie `missed`, automatyczna finalizacja, dzienny hash-chain
+   stanu i utwardzone restarty systemd. Instalacja na docelowym hoście należy do
+   etapu 3.
 
 Provisioning, rzeczywiste testy Simulator/live i kampania nie zostały wykonane.
 Nie ma jeszcze dostępu T4 ani rzeczywistych identyfikatorów rynków.

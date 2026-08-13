@@ -1,9 +1,9 @@
 # Plus500 Futures T4 Research Agent
 
-Wersja `0.9.0` dodaje etap 1 dowodów siedmiu obowiązkowych scenariuszy kampanii
-V1. Bridge zapisuje własny, podpisany dziennik, a migracja `0018` wiąże go z
-realnymi batchami, cyklami i runami. Wynik scenariusza oraz końcową bramkę
-wylicza PostgreSQL z obiektywnych rekordów; CLI nie przyjmuje deklaracji `PASS`.
+Wersja `0.10.0` dodaje etap 2: automatyczny nadzorca przez 28 dni uruchamia
+zamrożone cykle BTC/ETH, wykrywa timeouty i pominięcia, bezpiecznie restartuje
+procesy oraz zapisuje dzienny stan. Dowody scenariuszy z etapu 1 nadal są
+wyliczane przez PostgreSQL; CLI nie przyjmuje deklaracji `PASS`.
 
 To nadal nie jest odbiór V1. Nie ma jeszcze provisionowanego dostępu T4,
 rzeczywistych identyfikatorów rynków ani wykonanej kampanii. Dlatego obecny stan
@@ -171,6 +171,8 @@ crypto-agent observe-start \
 
 crypto-agent observe-run --campaign-id <uuid> --scope BTC/USD:240m --limit 120
 crypto-agent observe-run --campaign-id <uuid> --scope ETH/USD:240m --limit 120
+crypto-agent observe-supervise --campaign-id <uuid>
+crypto-agent observe-supervisor-status --campaign-id <uuid>
 crypto-agent observe-scenarios --campaign-id <uuid> \
   --scenario reconnect --scope BTC/USD:240m
 crypto-agent observe-status --campaign-id <uuid>
@@ -189,9 +191,15 @@ referencje dowodowe; to baza wyprowadza `pass` albo `fail`.
 
 Kontrolowany `rate_limit` sprawdza granicę naszego handlera, nie dowodzi
 rzeczywistej odpowiedzi `429` od T4. Nie wolno spamować dostawcy. `bridge_restart`
-w etapie 1 wymaga zewnętrznego supervisora, który ponownie uruchomi proces;
-automatyzacja 24/7 należy do etapu 2. `roll_transition` jest pasywny i może zostać
+jest automatycznie obsługiwany przez jednostkę bridge'a i nadzorcę etapu 2.
+`roll_transition` jest pasywny i może zostać
 zaliczony wyłącznie po prawdziwym rollu widocznym w live batchu schema v5.
+
+`observe-supervise` sam uruchamia należne cykle obu zamrożonych scope’ów,
+wykrywa `missed` i timeouty, wykonuje ograniczone idempotentne retry, zapisuje
+codzienny hash-chain statusu oraz po 28 dniach i grace próbuje zapisać raport.
+Bridge, verifier i supervisor mają osobne utwardzone jednostki systemd i osobne
+UID. Szczegóły: [runbook supervisora](docs/CAMPAIGN_SUPERVISOR_RUNBOOK.md).
 
 `observe-report` finalizuje kampanię dopiero po
 `planned_ends_at + cycle_interval_seconds`, czyli po okresie grace na zapis
@@ -201,7 +209,7 @@ dni ani sam podpis bridge'a nie wystarczają.
 Pełna procedura: [runbook obserwacji](docs/T4_OBSERVATION_RUNBOOK.md).
 Pozostałe materiały: [instrukcja uruchomienia](docs/INSTRUKCJA_URUCHOMIENIA.md),
 [architektura](docs/ARCHITECTURE.md), [stan projektu](docs/CURRENT_STATUS.md).
-Zmiany wydania: [0.9.0](docs/RELEASE_NOTES_0.9.0.md).
+Zmiany wydania: [0.10.0](docs/RELEASE_NOTES_0.10.0.md).
 
 Oficjalne informacje: [Plus500 Futures T4 API](https://futures-technologies.plus500.com/api/),
 [T4 API tools](https://github.com/CTS-Futures/t4-api-tools/tree/1a68b674482194f1cf3b9d7f129ce5fbed8bcb51),

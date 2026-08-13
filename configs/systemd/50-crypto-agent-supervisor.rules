@@ -1,0 +1,17 @@
+// Install as root-owned 0644 in /etc/polkit-1/rules.d/.
+// Permit only the runtime supervisor to start/restart its two read-only helpers.
+polkit.addRule(function(action, subject) {
+    if (action.id !== "org.freedesktop.systemd1.manage-units" ||
+        subject.user !== "crypto-runtime") {
+        return polkit.Result.NOT_HANDLED;
+    }
+    var unit = action.lookup("unit");
+    var verb = action.lookup("verb");
+    var approvedUnit = unit === "crypto-agent-t4-bridge.service" ||
+        unit === "crypto-agent-evidence-verifier.service";
+    var approvedVerb = verb === "start" || verb === "restart";
+    if (approvedUnit && approvedVerb) {
+        return polkit.Result.YES;
+    }
+    return polkit.Result.NOT_HANDLED;
+});

@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
@@ -285,6 +286,26 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(scenario.scenario, "rate_limit")
         self.assertEqual(scenario.scope, "BTC/USD:240m")
+        supervisor = parser.parse_args(
+            [
+                "observe-supervise",
+                "--campaign-id",
+                _CAMPAIGN_ID,
+                "--process-manager",
+                "systemd",
+            ]
+        )
+        self.assertEqual(supervisor.command, "observe-supervise")
+        self.assertEqual(supervisor.poll_seconds, 15.0)
+        self.assertEqual(supervisor.cycle_timeout_seconds, 120.0)
+        self.assertEqual(supervisor.command_retries, 2)
+        self.assertEqual(supervisor.limit, 120)
+        supervisor_status = parser.parse_args(
+            ["observe-supervisor-status", "--campaign-id", _CAMPAIGN_ID]
+        )
+        self.assertEqual(
+            supervisor_status.command, "observe-supervisor-status"
+        )
 
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             parser.parse_args(
@@ -310,6 +331,40 @@ class CliTests(unittest.TestCase):
                     "pass",
                 ]
             )
+
+    def test_supervisor_status_reads_only_safe_local_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directory = root / _CAMPAIGN_ID
+            directory.mkdir()
+            (directory / "status.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "campaign_id": _CAMPAIGN_ID,
+                        "status": "running",
+                        "read_only": True,
+                        "execution_enabled": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = io.StringIO()
+            with redirect_stdout(output):
+                exit_code = main(
+                    [
+                        "observe-supervisor-status",
+                        "--campaign-id",
+                        _CAMPAIGN_ID,
+                        "--state-directory",
+                        str(root),
+                    ]
+                )
+        payload = json.loads(output.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["status"], "running")
+        self.assertTrue(payload["read_only"])
+        self.assertFalse(payload["execution_enabled"])
 
     def test_observation_start_uses_database_time_and_freezes_baseline(self) -> None:
         repository = SimpleNamespace(
