@@ -1259,8 +1259,8 @@ def _assert_scenario_evidence_boundary(
     replay_attestation_call = (
         "SELECT * FROM crypto_agent.record_verified_t4_replay_attestation("
         f"'{uuid.uuid4()}'::uuid, '{_CAMPAIGN_ID}'::uuid, 'BTC/USD:240m', "
-        "(SELECT planned_ends_at FROM crypto_agent.t4_observation_campaigns "
-        f"WHERE campaign_id = '{_CAMPAIGN_ID}'::uuid), repeat('a',64), "
+        f"'{(event_at + timedelta(hours=672)).isoformat()}'::timestamptz, "
+        "repeat('a',64), "
         "ARRAY[1]::bigint[], "
         "ARRAY[repeat('b',64)]::crypto_agent.sha256_hex[], repeat('c',64))"
     )
