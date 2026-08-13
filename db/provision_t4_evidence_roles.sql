@@ -109,6 +109,13 @@ GRANT SELECT ON
     crypto_agent.alert_delivery_outbox,
     crypto_agent.alert_delivery_attempts
     TO :"runtime_role";
+-- PostgreSQL row-locking SELECTs require UPDATE on at least one column of each
+-- locked table.  Grant only the immutable identity column; append-only triggers
+-- still reject every attempted UPDATE.
+GRANT UPDATE (source_id) ON crypto_agent.data_sources
+    TO :"runtime_role";
+GRANT UPDATE (alert_delivery_outbox_id) ON crypto_agent.alert_delivery_outbox
+    TO :"runtime_role";
 GRANT USAGE, SELECT ON SEQUENCE
     crypto_agent.t4_ingestion_batches_t4_batch_id_seq,
     crypto_agent.t4_canonical_candles_t4_candle_id_seq,

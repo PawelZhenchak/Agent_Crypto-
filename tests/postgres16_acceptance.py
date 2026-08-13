@@ -186,6 +186,11 @@ def _provision_acceptance_roles() -> None:
                     crypto_agent.alert_delivery_outbox,
                     crypto_agent.alert_delivery_attempts
                     TO {_RUNTIME_ROLE};
+                GRANT UPDATE (source_id) ON crypto_agent.data_sources
+                    TO {_RUNTIME_ROLE};
+                GRANT UPDATE (alert_delivery_outbox_id)
+                    ON crypto_agent.alert_delivery_outbox
+                    TO {_RUNTIME_ROLE};
                 GRANT USAGE, SELECT ON SEQUENCE
                     crypto_agent.t4_ingestion_batches_t4_batch_id_seq,
                     crypto_agent.t4_canonical_candles_t4_candle_id_seq,
@@ -268,6 +273,29 @@ def _assert_runtime_identity_sequence_grants() -> None:
         connection.commit()
     finally:
         connection.close()
+
+
+def _assert_runtime_row_lock_grants() -> None:
+    connection = _factory()()
+    try:
+        with connection.cursor() as db_cursor:
+            db_cursor.execute(
+                "SELECT has_column_privilege(%s, "
+                "'crypto_agent.data_sources', 'source_id', 'UPDATE'), "
+                "has_column_privilege(%s, 'crypto_agent.alert_delivery_outbox', "
+                "'alert_delivery_outbox_id', 'UPDATE'), "
+                "has_column_privilege(%s, "
+                "'crypto_agent.data_sources', 'source_key', 'UPDATE'), "
+                "has_column_privilege(%s, 'crypto_agent.alert_delivery_outbox', "
+                "'payload', 'UPDATE')",
+                (_RUNTIME_ROLE,) * 4,
+            )
+            row = db_cursor.fetchone()
+        connection.commit()
+    finally:
+        connection.close()
+    if row != (True, True, False, False):
+        raise AssertionError(f"runtime row-lock grants are unsafe: {row!r}")
 
 
 def _execute_file(path: Path) -> None:
@@ -698,6 +726,13 @@ def _assert_operational_ingest_and_replay() -> None:
         raise AssertionError("expected one immutable T4 futures snapshot")
     if _scalar("SELECT COUNT(*) FROM crypto_agent.t4_orderbook_levels") != 10:
         raise AssertionError("expected ten immutable T4 order-book levels")
+    _expect_sqlstate_after(
+        (),
+        "UPDATE crypto_agent.data_sources SET source_id = source_id "
+        "WHERE source_key = 'plus500_t4_futures_v1'",
+        "55000",
+        _role_factory(_RUNTIME_ROLE),
+    )
     replay_as_of = datetime.now(UTC)
     replay_a = repository.replay(
         symbol="BTC/USD", interval_minutes=240, as_of=replay_as_of, limit=120
@@ -752,6 +787,13 @@ def _assert_operational_alert_outbox() -> None:
     delivery = repository.deliver_one(output, now=datetime.now(UTC))
     if delivery.status != "delivered" or delivery.attempt_no != 1:
         raise AssertionError("operational stdout delivery did not reach delivered")
+    _expect_sqlstate_after(
+        (),
+        "UPDATE crypto_agent.alert_delivery_outbox "
+        "SET alert_delivery_outbox_id = alert_delivery_outbox_id",
+        "55000",
+        _role_factory(_RUNTIME_ROLE),
+    )
     emitted = json.loads(output.getvalue())
     if (
         emitted.get("channel") != "stdout_json"
@@ -1565,6 +1607,7 @@ def bootstrap_and_test() -> None:
         raise AssertionError("clean PostgreSQL 16 did not apply migration 0018")
     _provision_acceptance_roles()
     _assert_runtime_identity_sequence_grants()
+    _assert_runtime_row_lock_grants()
     apply_v1_seeds(_factory(), default_v1_seed_path())
     apply_v1_seeds(_factory(), default_v1_seed_path())
     _assert_ready()

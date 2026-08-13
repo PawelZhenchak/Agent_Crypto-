@@ -315,6 +315,22 @@ class _BrokenDriver:
 
 
 class PostgresV11Tests(unittest.TestCase):
+    def test_runtime_provisioning_uses_minimal_row_lock_update_grants(self) -> None:
+        provisioning_sql = " ".join(
+            (PROJECT_ROOT / "db/provision_t4_evidence_roles.sql")
+            .read_text(encoding="utf-8")
+            .split()
+        )
+        self.assertIn(
+            'GRANT UPDATE (source_id) ON crypto_agent.data_sources TO :"runtime_role";',
+            provisioning_sql,
+        )
+        self.assertIn(
+            "GRANT UPDATE (alert_delivery_outbox_id) ON "
+            'crypto_agent.alert_delivery_outbox TO :"runtime_role";',
+            provisioning_sql,
+        )
+
     def test_health_manifest_covers_all_versioned_tables_and_triggers(self) -> None:
         base_sql = (PROJECT_ROOT / "db/schema.sql").read_text(encoding="utf-8")
         migration_sql = "\n".join(
