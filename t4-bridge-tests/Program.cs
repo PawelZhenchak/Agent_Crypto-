@@ -167,7 +167,7 @@ Assert(!T4OutboundPolicy.IsAllowed(ClientMessage.PayloadOneofCase.OrderBatch),
     "order batch was not blocked");
 Assert(!T4OutboundPolicy.IsAllowed(ClientMessage.PayloadOneofCase.CreateUds),
     "UDS creation was not blocked");
-var allowedOutboundPayloads = Enum.GetValues<ClientMessage.PayloadOneofCase>()
+var allowedOutboundPayloads = System.Enum.GetValues<ClientMessage.PayloadOneofCase>()
     .Where(T4OutboundPolicy.IsAllowed)
     .ToHashSet();
 Assert(allowedOutboundPayloads.SetEquals(new[]

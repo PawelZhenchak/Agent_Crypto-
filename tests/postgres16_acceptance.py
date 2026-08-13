@@ -201,13 +201,70 @@ def _provision_acceptance_roles() -> None:
                     crypto_agent.alert_events_alert_event_id_seq,
                     crypto_agent.alert_delivery_outbox_alert_delivery_outbox_id_seq,
                     crypto_agent.alert_delivery_attempts_alert_delivery_attempt_id_seq,
-                    crypto_agent.t4_observation_research_inputs_observation_research_input_id_seq,
+                    crypto_agent.t4_observation_research_input_observation_research_input_id_seq,
                     crypto_agent.t4_observation_cycles_observation_cycle_id_seq,
                     crypto_agent.t4_observation_session_events_observation_session_event_id_seq,
-                    crypto_agent.t4_observation_quality_reports_observation_quality_report_id_seq
+                    crypto_agent.t4_observation_quality_report_observation_quality_report_id_seq
                     TO {_RUNTIME_ROLE};
                 """
             )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _assert_runtime_identity_sequence_grants() -> None:
+    identity_columns = (
+        ("t4_ingestion_batches", "t4_batch_id"),
+        ("t4_canonical_candles", "t4_candle_id"),
+        ("t4_futures_snapshots", "t4_snapshot_id"),
+        ("t4_contract_transition_evidence", "t4_transition_id"),
+        ("research_runs", "research_run_id"),
+        ("research_run_events", "research_run_event_id"),
+        ("research_run_inputs", "research_run_input_id"),
+        ("research_artifacts", "research_artifact_id"),
+        ("data_quality_incidents", "data_quality_incident_id"),
+        ("data_quality_incident_events", "data_quality_incident_event_id"),
+        ("alerts", "alert_id"),
+        ("alert_events", "alert_event_id"),
+        ("alert_delivery_outbox", "alert_delivery_outbox_id"),
+        ("alert_delivery_attempts", "alert_delivery_attempt_id"),
+        ("t4_observation_research_inputs", "observation_research_input_id"),
+        ("t4_observation_cycles", "observation_cycle_id"),
+        ("t4_observation_session_events", "observation_session_event_id"),
+        ("t4_observation_quality_reports", "observation_quality_report_id"),
+    )
+    connection = _factory()()
+    try:
+        with connection.cursor() as db_cursor:
+            for table_name, column_name in identity_columns:
+                db_cursor.execute(
+                    "SELECT pg_get_serial_sequence(%s, %s)",
+                    (f"crypto_agent.{table_name}", column_name),
+                )
+                row = db_cursor.fetchone()
+                sequence_name = None if row is None else row[0]
+                if sequence_name is None:
+                    raise AssertionError(
+                        "runtime identity sequence is missing: "
+                        f"crypto_agent.{table_name}.{column_name}"
+                    )
+                db_cursor.execute(
+                    "SELECT has_sequence_privilege(%s, %s, 'USAGE') "
+                    "AND has_sequence_privilege(%s, %s, 'SELECT')",
+                    (
+                        _RUNTIME_ROLE,
+                        sequence_name,
+                        _RUNTIME_ROLE,
+                        sequence_name,
+                    ),
+                )
+                privilege_row = db_cursor.fetchone()
+                if privilege_row is None or privilege_row[0] is not True:
+                    raise AssertionError(
+                        "runtime identity sequence grants are incomplete: "
+                        f"{sequence_name}"
+                    )
         connection.commit()
     finally:
         connection.close()
@@ -1507,6 +1564,7 @@ def bootstrap_and_test() -> None:
     if apply_migrations(_factory(), migrations) != ("0018",):
         raise AssertionError("clean PostgreSQL 16 did not apply migration 0018")
     _provision_acceptance_roles()
+    _assert_runtime_identity_sequence_grants()
     apply_v1_seeds(_factory(), default_v1_seed_path())
     apply_v1_seeds(_factory(), default_v1_seed_path())
     _assert_ready()

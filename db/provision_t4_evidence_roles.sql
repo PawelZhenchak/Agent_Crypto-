@@ -124,10 +124,10 @@ GRANT USAGE, SELECT ON SEQUENCE
     crypto_agent.alert_events_alert_event_id_seq,
     crypto_agent.alert_delivery_outbox_alert_delivery_outbox_id_seq,
     crypto_agent.alert_delivery_attempts_alert_delivery_attempt_id_seq,
-    crypto_agent.t4_observation_research_inputs_observation_research_input_id_seq,
+    crypto_agent.t4_observation_research_input_observation_research_input_id_seq,
     crypto_agent.t4_observation_cycles_observation_cycle_id_seq,
     crypto_agent.t4_observation_session_events_observation_session_event_id_seq,
-    crypto_agent.t4_observation_quality_reports_observation_quality_report_id_seq
+    crypto_agent.t4_observation_quality_report_observation_quality_report_id_seq
     TO :"runtime_role";
 
 DO $provision$
