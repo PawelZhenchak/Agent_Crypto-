@@ -13,6 +13,9 @@ flowchart TD
     H --> I["stdout JSON — at-least-once"]
     E --> J["Replay / analyze-replay"]
     E --> K["Kampania 28 dni i raport V1"]
+    B --> L["Podpisany dziennik bridge'a"]
+    L --> M["Osobny weryfikator DB"]
+    M --> K
 ```
 
 ## Granica T4
@@ -60,7 +63,7 @@ się fail-closed.
 
 ## Ingest, replay i monitoring
 
-Migracje `0014`–`0017` tworzą append-only ścieżkę danych. Batch zachowuje dokładny
+Migracje `0014`–`0018` tworzą append-only ścieżkę danych. Batch zachowuje dokładny
 payload i SHA-256, świece zachowują `MarketID`, a snapshot, poziomy order booka i
 transition evidence mają osobne hashe. Replay korzysta tylko z rekordów
 `available_at <= as_of`; brak pełnego okna oznacza `T4_REPLAY_INCOMPLETE`.
@@ -82,18 +85,41 @@ Migracja `0017` dodaje niezmienny baseline kampanii, append-only cykle i zdarzen
 sesji, ochronę przed deklarowaniem cykli z wyprzedzeniem/backfillem oraz niezmienny
 raport końcowy. Czas startu, statusu i końca pochodzi z PostgreSQL.
 
+Migracja `0018` dodaje etap 1 dowodów scenariuszy. Bridge utrwala kanoniczne
+zdarzenia w trwałym JSONL, łączy je globalnym hash chain i podpisuje własnym
+kluczem ECDSA P-256. Jest to podpis naszego bridge'a, nie podpis T4 ani Plus500.
+
+Python przypina fingerprint SPKI zamrożony w baseline, sprawdza podpis i claims,
+a potem zapisuje zdarzenie przez osobny login weryfikatora. PostgreSQL ponownie
+sprawdza klucz, hashe, łańcuch, okno kampanii i referencje do realnych batchy,
+cykli i runów. Caller nie ma parametru pozwalającego zadeklarować `PASS`.
+
 Polityka wymaga minimum `672` godzin czasu rzeczywistego, pokrycia zamrożonych
 scope’ów, progów prób i sukcesu, limitów luk i RTT, braku naruszeń read-only oraz
 zaliczenia obowiązkowych scenariuszy. Raport można finalizować dopiero po
 `planned_ends_at + cycle_interval_seconds`. Status każdego kryterium to `PASS`,
-`FAIL` albo `NOT_OBSERVED`, ale schema `0.8.0` celowo blokuje scenariusz `PASS` i
-`v1_gate_passed=true` do późniejszej migracji z obiektywnymi referencjami dowodów.
+`FAIL` albo `NOT_OBSERVED`.
 
-Zakres kampanii `0.8.0` jest obecnie zamrożony na BTC/ETH 4h. Standardowy
+Niezależna funkcja PostgreSQL wylicza bramkę bez użycia caller-computed statusów.
+Wymaga wszystkich siedmiu scenariuszy `pass`. Kontrolowany `rate_limit` dowodzi
+naszej ścieżki handlera, nie vendorowego `429`. Pasywny `roll_transition` wymaga
+prawdziwego rollu live; brak rollu nie może zostać zastąpiony injectorem.
+
+Zakres kampanii `0.9.0` jest zamrożony na BTC/ETH 4h. Standardowy
 dwutygodniowy Simulator nie pokrywa 28 dni. `observe-start` wykonuje live preflight
 każdego scope’u. `observe-run` pobiera dokładnie jeden live batch należnego slotu,
 utrwala go i analizuje ten sam zamknięty obiekt; wygasłe sloty zapisuje wyłącznie
 jako `missed`, bez backfillu.
 
-Provisioning, rzeczywiste testy Simulator/live i kampania nie zostały wykonane;
+UUID kampanii, klucz bridge'a i pusty dziennik muszą być wybrane przed startem
+bridge'a i nowe dla każdej kampanii. PostgreSQL ma trzy osobne loginy bez
+superusera: runtime, verifier-write oraz evidence-reader read-only do
+samodzielnego replay po stronie isolated verifiera. DSN administratora nie
+uczestniczy w żadnej z tych ścieżek.
+
+Etap 1 nie zawiera automatycznego supervisora 24/7. Kontrolowany restart wymaga
+zewnętrznego procesu, który uruchomi bridge ponownie; to zakres etapu 2.
+
+Provisioning, rzeczywiste testy Simulator/live i kampania nie zostały wykonane.
+Nie ma też dostępu T4 ani prawdziwych identyfikatorów rynków, więc
 `v1_gate_passed=false`.

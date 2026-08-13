@@ -266,6 +266,20 @@ class ResearchOrchestrator:
                     "t4_bridge_schema_version"
                 ),
                 "t4_environment": provider_metadata.get("t4_environment"),
+                "t4_replay": provider_metadata.get("t4_replay"),
+                "t4_replay_as_of": provider_metadata.get("t4_replay_as_of"),
+                "t4_replay_fingerprint_sha256": provider_metadata.get(
+                    "t4_replay_fingerprint_sha256"
+                ),
+                "t4_replay_source_batch_ids": provider_metadata.get(
+                    "t4_replay_source_batch_ids"
+                ),
+                "t4_replay_source_batch_hashes": provider_metadata.get(
+                    "t4_replay_source_batch_hashes"
+                ),
+                "t4_replay_provenance_sha256": provider_metadata.get(
+                    "t4_replay_provenance_sha256"
+                ),
                 "plus500_t4_volume_anomaly_attested": volume_anomaly_attested,
                 "futures_gate_passed": futures_analysis.gate_passed,
                 "futures_policy_id": self.futures_policy.policy_id,

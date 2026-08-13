@@ -1,6 +1,6 @@
 # Runbook monitoringu i lokalnego dostarczania alertów
 
-## Zakres 0.8.0
+## Zakres 0.9.0
 
 Monitoring działa read-only i przechowuje w PostgreSQL trace, bezpieczne artifacts,
 incydenty, alerty oraz delivery outbox. Jedynym kanałem jest kanoniczny JSON
@@ -9,15 +9,16 @@ webhooka, Slacka, Telegrama, e-maila ani SMS.
 
 Oficjalny reader oparty o `Plus500US.T4Proto` 1.0.73 oraz
 `Plus500US.T4ChartDecoder` 1.0.97 jest zaimplementowany, ale provisioning i
-rzeczywiste testy Simulator/live nie zostały wykonane. Nadal potrzebne są
-uprawnienia oraz prawidłowe identyfikatory rynku i niezależnego indeksu. Stan
+rzeczywiste testy Simulator/live nie zostały wykonane. Nie ma jeszcze dostępu T4
+ani prawidłowych identyfikatorów rynku i niezależnego indeksu. Stan
 `pending` albo niegotowy prewarm zwraca `503`: cykl daje `NO_SIGNAL` i lokalny
 incydent, a nie przesyłkę.
 
 ## Wymagania
 
-1. Skonfiguruj `CRYPTO_AGENT_POSTGRES_DSN` bez commitowania credentials.
-2. Zastosuj migracje `0011`–`0017` i seed.
+1. Skonfiguruj `CRYPTO_AGENT_POSTGRES_DSN` dla loginu runtime bez superusera,
+   bez commitowania credentials. Nie używaj DSN administratora.
+2. Zastosuj migracje `0011`–`0018` i seed.
 3. Sprawdź `crypto-agent db health`; wynik musi być `READY`.
 4. Dla realnego cyklu skonfiguruj prywatny token, katalog schema v2 i lokalny
    bridge T4. Delivery live wymaga schema v5 oraz `environment=live_t4`;
@@ -141,4 +142,5 @@ transakcji. Nie należy deklarować atomowości między tymi bazami.
 
 `v1_gate_passed=false`. Monitoring nie zastępuje kampanii punktu 8. Rzeczywisty
 test live, zatwierdzony runner cykli i minimum 672 godziny obserwacji BTC/ETH 4h
-nie zostały jeszcze wykonane.
+nie zostały jeszcze wykonane. Dodatnia bramka wymaga też siedmiu scenariuszy
+zweryfikowanych przez PostgreSQL, w tym prawdziwego rollu live.

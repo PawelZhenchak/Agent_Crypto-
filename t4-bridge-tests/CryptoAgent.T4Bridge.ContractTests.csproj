@@ -9,4 +9,7 @@
   <ItemGroup>
     <ProjectReference Include="../t4-bridge/CryptoAgent.T4Bridge.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
 </Project>

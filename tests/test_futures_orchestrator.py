@@ -57,9 +57,13 @@ class FuturesOrchestratorTests(unittest.TestCase):
             futures_evidence=batch.futures_evidence,
             source_batch_hashes=(batch.raw_payload_sha256 or "0" * 64,),
             replay_fingerprint_sha256="f" * 64,
+            source_batch_ids=(1,),
             environment=str(metadata["t4_environment"]),
             exchange_id=str(metadata["t4_exchange_id"]),
             market_id=str(metadata["t4_market_id"]),
+            basis_exchange_id=str(metadata["t4_basis_exchange_id"]),
+            basis_contract_id=str(metadata["t4_basis_contract_id"]),
+            basis_market_id=str(metadata["t4_basis_market_id"]),
             candle_market_ids=tuple(metadata["t4_candle_market_ids"]),
             rolled_from_market_id=None,
         )

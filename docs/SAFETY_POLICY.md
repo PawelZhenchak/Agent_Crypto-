@@ -27,7 +27,7 @@
 - `NO_SIGNAL`, synthetic, fixture, replay, veto, stale, provider error i expiry
   nigdy nie są dostarczane;
 - jedyną trasą jest lokalne `stdout_json` → `process_stdout`; dowolny webhook,
-  Slack, Telegram, e-mail i SMS są niedozwolone w 0.8.0;
+  Slack, Telegram, e-mail i SMS są niedozwolone w 0.9.0;
 - outbox i próby są append-only, hashowane, idempotentne i mają ograniczony retry;
   stdout działa at-least-once, więc konsument deduplikuje po `idempotency_key`;
   exactly-once nie jest gwarantowane;
@@ -54,6 +54,23 @@ Simulator nie mogą być przedstawiane jako dane live.
 Provisioning, rzeczywiste testy Simulator/live i kampania 28-dniowa nie zostały
 wykonane. Baseline i cykle są append-only, czas pochodzi z PostgreSQL, backfill
 jest zabroniony, a końcowy raport przed
-`planned_ends_at + cycle_interval_seconds` jest odrzucany. Schema `0.8.0` blokuje
-scenariusz `PASS` i `v1_gate_passed=true` do późniejszej migracji z obiektywnymi
-referencjami dowodów oraz ich walidacją.
+`planned_ends_at + cycle_interval_seconds` jest odrzucany.
+
+W `0.9.0` scenariusz i bramka nie są blokowane stałą. PostgreSQL wyprowadza
+wyniki z obiektywnych zdarzeń, batchy, cykli i runów. Dodatnia bramka wymaga
+realnych 28 dni, wszystkich progów jakości, zera naruszeń i siedmiu dowodów,
+w tym prawdziwego rollu live.
+
+Zdarzenia podpisuje nasz bridge dowodowy, nie T4. Kontrolowany `rate_limit`
+sprawdza nasz handler, nie naturalne `429` dostawcy. Kontrolowany restart wymaga
+zewnętrznego supervisora; etap 1 go nie dostarcza.
+
+Loginy runtime, `crypto_agent_evidence_verifier` i read-only
+`crypto_agent_evidence_reader` są osobne, bez superusera i bez wspólnego
+członkostwa. DSN administratora ani właściciela nie może wejść do ścieżki
+kampanii. UUID,
+klucz dowodowy i pusty trwały dziennik są nowe i wybrane przed startem każdej
+kampanii.
+
+Nie ma jeszcze dostępu T4 ani rzeczywistych identyfikatorów rynków. Kampania nie
+została rozpoczęta, dlatego `v1_gate_passed=false`.

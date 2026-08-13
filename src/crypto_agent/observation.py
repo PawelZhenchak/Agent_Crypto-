@@ -48,6 +48,7 @@ class ObservationCampaign:
     code_commit_hash: str
     t4_protocol_commit_hash: str
     runtime_config_hash: str
+    bridge_evidence_key_fingerprint: str
     scope_manifest: tuple[str, ...]
     environment: str = "live_t4"
 
@@ -70,6 +71,7 @@ class ObservationCampaign:
             "code_commit_hash",
             "t4_protocol_commit_hash",
             "runtime_config_hash",
+            "bridge_evidence_key_fingerprint",
         ):
             _sha256(getattr(self, field_name), field_name)
         if (
@@ -104,6 +106,9 @@ class ObservationCampaign:
                 "code_commit_hash": self.code_commit_hash,
                 "t4_protocol_commit_hash": self.t4_protocol_commit_hash,
                 "runtime_config_hash": self.runtime_config_hash,
+                "bridge_evidence_key_fingerprint": (
+                    self.bridge_evidence_key_fingerprint
+                ),
                 "scope_manifest_hash_sha256": self.scope_manifest_hash_sha256,
                 "read_only": True,
                 "execution_enabled": False,
@@ -172,6 +177,7 @@ class ObservationCycleRunResult:
     missed_cycles_recorded: int
     t4_batch_id: int | None = None
     research_run_id: int | None = None
+    error_code: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,6 +269,21 @@ class ObservationQualityReport:
     @property
     def report_hash_sha256(self) -> str:
         return _hash(self.as_payload())
+
+
+@dataclass(frozen=True, slots=True)
+class ObservationBridgeCheckpoint:
+    campaign_id: str
+    action_request_id: str
+    sequence_no: int
+    event_hash_sha256: str
+
+    def validate(self) -> None:
+        _uuid(self.campaign_id, "campaign_id")
+        _uuid(self.action_request_id, "action_request_id")
+        if type(self.sequence_no) is not int or self.sequence_no <= 0:
+            raise ObservationError("Observation checkpoint sequence is invalid")
+        _sha256(self.event_hash_sha256, "event_hash_sha256")
 
 
 def evaluate_observation(
@@ -421,11 +442,12 @@ class ObservationRepository:
                         cycle_interval_seconds, observation_policy_id,
                         observation_policy_hash, code_commit_hash,
                         t4_protocol_commit_hash, runtime_config_hash,
-                        scope_manifest, scope_manifest_hash, frozen_baseline_hash,
+                        bridge_evidence_key_fingerprint, scope_manifest,
+                        scope_manifest_hash, frozen_baseline_hash,
                         read_only, execution_enabled, content_hash
                     ) VALUES (
                         %s, 'live_t4', %s, %s, %s, %s, %s, %s, %s, %s,
-                        %s::jsonb, %s, %s, TRUE, FALSE, %s
+                        %s, %s::jsonb, %s, %s, TRUE, FALSE, %s
                     )
                     """,
                     (
@@ -438,6 +460,7 @@ class ObservationRepository:
                         campaign.code_commit_hash,
                         campaign.t4_protocol_commit_hash,
                         campaign.runtime_config_hash,
+                        campaign.bridge_evidence_key_fingerprint,
                         _canonical_json(list(campaign.scope_manifest)),
                         campaign.scope_manifest_hash_sha256,
                         baseline_hash,
@@ -478,6 +501,49 @@ class ObservationRepository:
             raise ObservationError("Observation evidence storage is unavailable") from None
         return report
 
+    def finalization_remaining_seconds(
+        self,
+        campaign_id: str,
+        *,
+        observed_at: datetime,
+    ) -> int:
+        """Return database-derived time until the final-slot grace has elapsed."""
+
+        _uuid(campaign_id, "campaign_id")
+        observed_at = _utc(observed_at, "observed_at")
+        try:
+            with (
+                transaction(self.connection_factory) as connection,
+                cursor(connection) as db_cursor,
+            ):
+                db_cursor.execute("SET TRANSACTION READ ONLY")
+                db_cursor.execute(
+                    """
+                    SELECT GREATEST(
+                        0,
+                        CEIL(EXTRACT(EPOCH FROM (
+                            planned_ends_at
+                            + make_interval(secs => cycle_interval_seconds)
+                            - %s::timestamptz
+                        )))::bigint
+                    )
+                    FROM crypto_agent.t4_observation_campaigns
+                    WHERE campaign_id = %s
+                    """,
+                    (observed_at, campaign_id),
+                )
+                row = db_cursor.fetchone()
+        except ObservationError:
+            raise
+        except Exception:
+            raise ObservationError("Observation evidence storage is unavailable") from None
+        if row is None:
+            raise ObservationError("Observation campaign does not exist")
+        remaining = _int_value(row, 0)
+        if remaining < 0:
+            raise ObservationError("Observation finalization time is invalid")
+        return remaining
+
     def _build_quality_report_with_cursor(
         self,
         db_cursor: DBCursor,
@@ -493,18 +559,22 @@ class ObservationRepository:
                    cycle_interval_seconds, observation_policy_id,
                    observation_policy_hash, code_commit_hash,
                    t4_protocol_commit_hash, runtime_config_hash,
-                   scope_manifest, scope_manifest_hash,
+                   bridge_evidence_key_fingerprint, scope_manifest,
+                   scope_manifest_hash,
                    frozen_baseline_hash, CURRENT_TIMESTAMP
             FROM crypto_agent.t4_observation_campaigns
             WHERE campaign_id = %s
         """
         if lock_campaign:
-            campaign_query += " FOR UPDATE"
+            db_cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (f"t4-observation-campaign:{campaign_id}",),
+            )
         db_cursor.execute(campaign_query, (campaign_id,))
         row = db_cursor.fetchone()
         if row is None:
             raise ObservationError("Observation campaign does not exist")
-        database_now = _datetime_value(row, 12, "database_now")
+        database_now = _datetime_value(row, 13, "database_now")
         requested_until = (
             database_now
             if observed_until is None
@@ -514,7 +584,7 @@ class ObservationRepository:
             raise ObservationError("Observation cutoff cannot be in the future")
         planned_ends_at = _datetime_value(row, 2, "planned_ends_at")
         effective_until = min(requested_until, planned_ends_at)
-        scopes = _scope_manifest(_value(row, 9))
+        scopes = _scope_manifest(_value(row, 10))
         campaign = ObservationCampaign(
             campaign_id=campaign_id,
             environment=str(_value(row, 0)),
@@ -524,10 +594,11 @@ class ObservationRepository:
             code_commit_hash=str(_value(row, 6)),
             t4_protocol_commit_hash=str(_value(row, 7)),
             runtime_config_hash=str(_value(row, 8)),
+            bridge_evidence_key_fingerprint=str(_value(row, 9)),
             scope_manifest=scopes,
         )
-        stored_scope_hash = str(_value(row, 10))
-        stored_baseline_hash = str(_value(row, 11))
+        stored_scope_hash = str(_value(row, 11))
+        stored_baseline_hash = str(_value(row, 12))
         policy_matches = bool(
             _value(row, 4) == self.policy.policy_id
             and _value(row, 5) == self.policy.policy_hash_sha256
@@ -540,7 +611,9 @@ class ObservationRepository:
         db_cursor.execute(
             """
             WITH campaign AS (
-                SELECT started_at, cycle_interval_seconds, scope_manifest
+                SELECT campaign_id, started_at, planned_ends_at,
+                       cycle_interval_seconds, scope_manifest,
+                       bridge_evidence_key_fingerprint
                 FROM crypto_agent.t4_observation_campaigns
                 WHERE campaign_id = %s
             ), scopes AS (
@@ -582,7 +655,33 @@ class ObservationRepository:
                        COUNT(*) * MAX(cycle_interval_seconds) AS gap_seconds
                 FROM marked WHERE unexplained
                 GROUP BY scope_key, gap_group
-            ), safety AS (
+            ), safety_bounds AS (
+                SELECT campaign.*,
+                       COALESCE(checkpoint.event_at, %s) AS bridge_cutoff_at,
+                       checkpoint.sequence_no AS bridge_checkpoint_sequence_no,
+                       CASE
+                           WHEN checkpoint.sequence_no IS NULL THEN %s
+                           ELSE LEAST(
+                               checkpoint.event_at,
+                               campaign.planned_ends_at + make_interval(
+                                   secs => campaign.cycle_interval_seconds
+                               )
+                           )
+                       END AS session_cutoff_at
+                FROM campaign
+                LEFT JOIN LATERAL (
+                    SELECT event.event_at, event.sequence_no
+                    FROM crypto_agent.t4_bridge_observation_events event
+                    WHERE event.campaign_id = campaign.campaign_id
+                      AND event.evidence_key_fingerprint_sha256 =
+                            campaign.bridge_evidence_key_fingerprint
+                      AND event.event_type = 'campaign_checkpoint'
+                      AND event.reason_code =
+                            'OBSERVATION_CAMPAIGN_CHECKPOINT'
+                    ORDER BY event.sequence_no DESC
+                    LIMIT 1
+                ) checkpoint ON TRUE
+            ), session_safety AS (
                 SELECT
                     COUNT(*) FILTER (WHERE event_type = 'read_only_violation')
                         AS read_only_violations,
@@ -600,8 +699,101 @@ class ObservationRepository:
                             'backfill_attempt'
                         )
                     ) AS prohibited_data_mode_violations
-                FROM crypto_agent.t4_observation_session_events
-                WHERE campaign_id = %s AND event_at <= %s
+                FROM crypto_agent.t4_observation_session_events event
+                CROSS JOIN safety_bounds bounds
+                WHERE event.campaign_id = bounds.campaign_id
+                  AND event.event_at BETWEEN bounds.started_at
+                                         AND bounds.session_cutoff_at
+            ), bridge_safety AS (
+                SELECT
+                    COUNT(*) FILTER (WHERE NOT event.read_only)
+                        AS read_only_violations,
+                    COUNT(*) FILTER (
+                        WHERE event.order_routes_exposed
+                           OR event.event_type = 'outbound_rejected'
+                    ) AS order_route_attempts,
+                    COUNT(*) FILTER (
+                        WHERE event.campaign_id IS DISTINCT FROM
+                                bounds.campaign_id
+                           OR event.environment <> 'live_t4'
+                           OR event.bridge_schema_version <> 5
+                           OR NOT event.signature_verified
+                    ) AS integrity_failures
+                FROM crypto_agent.t4_bridge_observation_events event
+                CROSS JOIN safety_bounds bounds
+                WHERE event.evidence_key_fingerprint_sha256 =
+                        bounds.bridge_evidence_key_fingerprint
+                  AND event.event_at BETWEEN bounds.started_at
+                                         AND bounds.bridge_cutoff_at
+                  AND (
+                      bounds.bridge_checkpoint_sequence_no IS NULL
+                      OR event.sequence_no <=
+                            bounds.bridge_checkpoint_sequence_no
+                  )
+            ), scenario_safety AS (
+                SELECT
+                    (
+                        SELECT COUNT(*)
+                        FROM crypto_agent.t4_observation_scenario_trials trial
+                        JOIN crypto_agent.alerts alert
+                          ON alert.research_run_id = trial.research_run_id
+                        WHERE trial.campaign_id = bounds.campaign_id
+                          AND trial.outcome = 'pass'
+                          AND trial.scenario_code IN (
+                              'missing_data', 'rate_limit', 'stale_data',
+                              'replay_blocked'
+                          )
+                    ) + (
+                        SELECT COUNT(*)
+                        FROM crypto_agent.t4_observation_scenario_trials trial
+                        JOIN crypto_agent.alerts alert
+                          ON alert.research_run_id = trial.research_run_id
+                        JOIN crypto_agent.alert_delivery_outbox outbox
+                          ON outbox.alert_id = alert.alert_id
+                        WHERE trial.campaign_id = bounds.campaign_id
+                          AND trial.outcome = 'pass'
+                          AND trial.scenario_code IN (
+                              'missing_data', 'rate_limit', 'stale_data',
+                              'replay_blocked'
+                          )
+                    ) + (
+                        SELECT COUNT(*)
+                        FROM crypto_agent.t4_observation_scenario_trials trial
+                        JOIN crypto_agent.alerts alert
+                          ON alert.research_run_id = trial.research_run_id
+                        JOIN crypto_agent.alert_delivery_outbox outbox
+                          ON outbox.alert_id = alert.alert_id
+                        JOIN crypto_agent.alert_delivery_attempts attempt
+                          ON attempt.alert_delivery_outbox_id =
+                                outbox.alert_delivery_outbox_id
+                        WHERE trial.campaign_id = bounds.campaign_id
+                          AND trial.outcome = 'pass'
+                          AND trial.scenario_code IN (
+                              'missing_data', 'rate_limit', 'stale_data',
+                              'replay_blocked'
+                          )
+                    ) AS fail_closed_violations
+                FROM safety_bounds bounds
+            ), safety AS (
+                SELECT
+                    session_safety.read_only_violations
+                        + bridge_safety.read_only_violations
+                            AS read_only_violations,
+                    session_safety.order_route_attempts
+                        + bridge_safety.order_route_attempts
+                            AS order_route_attempts,
+                    session_safety.secret_leaks AS secret_leaks,
+                    session_safety.integrity_failures
+                        + bridge_safety.integrity_failures
+                            AS integrity_failures,
+                    session_safety.fail_closed_violations
+                        + scenario_safety.fail_closed_violations
+                        AS fail_closed_violations,
+                    session_safety.prohibited_data_mode_violations
+                        AS prohibited_data_mode_violations
+                FROM session_safety
+                CROSS JOIN bridge_safety
+                CROSS JOIN scenario_safety
             ), cycle_stats AS (
                 SELECT
                     COUNT(*) AS expected_cycles,
@@ -654,7 +846,7 @@ class ObservationRepository:
                 campaign_id,
                 effective_until,
                 campaign_id,
-                campaign_id,
+                effective_until,
                 effective_until,
                 self.policy.required_bridge_schema_version,
             ),
@@ -664,13 +856,26 @@ class ObservationRepository:
             raise ObservationError("Observation campaign evidence is unavailable")
         db_cursor.execute(
             """
-            SELECT scenario_code, BOOL_AND(outcome = 'pass')
-            FROM crypto_agent.t4_observation_session_events
-            WHERE campaign_id = %s AND event_at <= %s
-              AND scenario_code IS NOT NULL
+            WITH scenario_outcomes AS (
+                SELECT scenario_code, outcome = 'pass' AS verified
+                FROM crypto_agent.t4_observation_scenario_trials
+                WHERE campaign_id = %s AND completed_at <= %s
+                UNION ALL
+                SELECT request.scenario_code, FALSE
+                FROM crypto_agent.t4_observation_scenario_trial_requests request
+                WHERE request.campaign_id = %s
+                  AND request.started_at <= %s
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM crypto_agent.t4_observation_scenario_trials trial
+                      WHERE trial.trial_id = request.trial_id
+                  )
+            )
+            SELECT scenario_code, BOOL_AND(verified)
+            FROM scenario_outcomes
             GROUP BY scenario_code ORDER BY scenario_code
             """,
-            (campaign_id, effective_until),
+            (campaign_id, effective_until, campaign_id, effective_until),
         )
         scenarios = tuple(
             (str(_value(item, 0)), bool(_value(item, 1)))
@@ -714,6 +919,10 @@ class ObservationRepository:
             ):
                 db_cursor.execute(
                     "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (f"t4-observation-campaign:{record.campaign_id}",),
+                )
+                db_cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                     (f"t4-observation:{record.campaign_id}:{record.scope_key}",),
                 )
                 db_cursor.execute(
@@ -721,7 +930,7 @@ class ObservationRepository:
                     SELECT sequence_no, content_hash
                     FROM crypto_agent.t4_observation_cycles
                     WHERE campaign_id = %s AND scope_key = %s
-                    ORDER BY sequence_no DESC LIMIT 1 FOR UPDATE
+                    ORDER BY sequence_no DESC LIMIT 1
                     """,
                     (record.campaign_id, record.scope_key),
                 )
@@ -745,10 +954,9 @@ class ObservationRepository:
     ) -> ObservationCycleRunResult:
         """Run one due slot from a PostgreSQL-frozen schedule.
 
-        A transaction-scoped advisory lock serializes retries for this frozen scope
-        while a shared campaign lock keeps finalization fail-closed. Expired slots are
-        represented only by honest ``missed`` records; success and failure can never
-        be backfilled.
+        Transaction-scoped advisory locks serialize finalization first and then
+        retries for this frozen scope. Expired slots are represented only by
+        honest ``missed`` records; success and failure can never be backfilled.
         """
 
         _uuid(campaign_id, "campaign_id")
@@ -776,6 +984,10 @@ class ObservationRepository:
                 )
                 db_cursor.execute(
                     "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (f"t4-observation-campaign:{campaign_id}",),
+                )
+                db_cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                     (f"t4-observation:{campaign_id}:{scope_key}",),
                 )
                 db_cursor.execute(
@@ -785,7 +997,6 @@ class ObservationRepository:
                            clock_timestamp()
                     FROM crypto_agent.t4_observation_campaigns
                     WHERE campaign_id = %s
-                    FOR SHARE
                     """,
                     (campaign_id,),
                 )
@@ -818,7 +1029,7 @@ class ObservationRepository:
                     SELECT sequence_no, content_hash
                     FROM crypto_agent.t4_observation_cycles
                     WHERE campaign_id = %s AND scope_key = %s
-                    ORDER BY sequence_no DESC LIMIT 1 FOR UPDATE
+                    ORDER BY sequence_no DESC LIMIT 1
                     """,
                     (campaign_id, scope_key),
                 )
@@ -900,8 +1111,14 @@ class ObservationRepository:
                 try:
                     execution = execute(plan)
                     _validate_cycle_execution(execution, plan)
-                except Exception:
-                    failure_code = "OBSERVATION_CYCLE_EXECUTION_FAILED"
+                except Exception as exc:
+                    candidate_code = getattr(exc, "code", None)
+                    failure_code = (
+                        candidate_code
+                        if isinstance(candidate_code, str)
+                        and _SAFE_UPPER_CODE.fullmatch(candidate_code) is not None
+                        else "OBSERVATION_CYCLE_EXECUTION_FAILED"
+                    )
 
                 db_cursor.execute("SELECT clock_timestamp()")
                 finished_row = db_cursor.fetchone()
@@ -932,6 +1149,7 @@ class ObservationRepository:
                         trace_id=trace_id,
                         content_hash=content_hash,
                         missed_cycles_recorded=missed_count,
+                        error_code=failure_code,
                     )
 
                 success = ObservationCycle(
@@ -979,11 +1197,15 @@ class ObservationRepository:
                 cursor(connection) as db_cursor,
             ):
                 db_cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (f"t4-observation-campaign:{event.campaign_id}",),
+                )
+                db_cursor.execute(
                     """
                     SELECT sequence_no, content_hash
                     FROM crypto_agent.t4_observation_session_events
                     WHERE campaign_id = %s
-                    ORDER BY sequence_no DESC LIMIT 1 FOR UPDATE
+                    ORDER BY sequence_no DESC LIMIT 1
                     """,
                     (event.campaign_id,),
                 )
@@ -1024,10 +1246,18 @@ class ObservationRepository:
             raise ObservationError("Observation event storage is unavailable") from None
         return content_hash
 
-    def store_final_report(self, report: ObservationQualityReport) -> str:
+    def store_final_report(
+        self,
+        report: ObservationQualityReport,
+        *,
+        bridge_checkpoint: ObservationBridgeCheckpoint,
+    ) -> str:
         """Persist only the canonical ledger report rebuilt under one DB lock."""
 
         _validate_report(report)
+        bridge_checkpoint.validate()
+        if bridge_checkpoint.campaign_id != report.campaign_id:
+            raise ObservationError("Observation checkpoint campaign does not match")
         if report.policy_id != self.policy.policy_id or (
             report.policy_hash_sha256 != self.policy.policy_hash_sha256
         ):
@@ -1058,14 +1288,39 @@ class ObservationRepository:
                     raise ObservationError(
                         "Final report requires the full real observation window"
                     )
-                if canonical.v1_gate_passed:
-                    raise ObservationError(
-                        "Verified scenario evidence is not implemented; V1 gate stays closed"
-                    )
                 if report.as_payload() != canonical.as_payload():
                     raise ObservationError(
                         "Final report must exactly match the canonical database ledger"
                     )
+                db_cursor.execute(
+                    """
+                    SELECT event_id
+                    FROM crypto_agent.t4_bridge_observation_events
+                    WHERE campaign_id = %s
+                      AND event_type = 'campaign_checkpoint'
+                      AND reason_code = 'OBSERVATION_CAMPAIGN_CHECKPOINT'
+                      AND action_request_id = %s
+                      AND sequence_no = %s
+                      AND event_hash_sha256 = %s
+                      AND scope_key IS NULL
+                      AND scenario_code IS NULL
+                      AND control_action = 'checkpoint'
+                      AND control_step = 'consumed'
+                    """,
+                    (
+                        bridge_checkpoint.campaign_id,
+                        bridge_checkpoint.action_request_id,
+                        bridge_checkpoint.sequence_no,
+                        bridge_checkpoint.event_hash_sha256,
+                    ),
+                )
+                checkpoint_row = db_cursor.fetchone()
+                if checkpoint_row is None:
+                    raise ObservationError(
+                        "Final report requires the verified bridge checkpoint"
+                    )
+                checkpoint_event_id = str(_value(checkpoint_row, 0))
+                _uuid(checkpoint_event_id, "bridge_checkpoint_event_id")
                 payload = canonical.as_payload()
                 report_hash = canonical.report_hash_sha256
                 content_hash = _hash(
@@ -1080,8 +1335,14 @@ class ObservationRepository:
                         campaign_id, generated_at, observed_until, overall_status,
                         v1_gate_passed, observation_policy_id,
                         observation_policy_hash, frozen_baseline_hash, report,
-                        report_hash, content_hash
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s)
+                        report_hash, content_hash, bridge_checkpoint_event_id,
+                        bridge_checkpoint_sequence_no,
+                        bridge_checkpoint_event_hash,
+                        bridge_checkpoint_action_request_id
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s,
+                        %s, %s, %s, %s, %s
+                    )
                     """,
                     (
                         canonical.campaign_id,
@@ -1095,6 +1356,10 @@ class ObservationRepository:
                         _canonical_json(payload),
                         report_hash,
                         content_hash,
+                        checkpoint_event_id,
+                        bridge_checkpoint.sequence_no,
+                        bridge_checkpoint.event_hash_sha256,
+                        bridge_checkpoint.action_request_id,
                     ),
                 )
         except ObservationError:

@@ -28,6 +28,7 @@ from crypto_agent.monitoring import (
     _alert_payload,
     _eligible_for_delivery,
     _hash,
+    _replay_provenance_hash,
     _retry_delay,
     _safe_report_artifact,
     run_monitored_analysis,
@@ -295,15 +296,62 @@ class MonitoringTests(unittest.TestCase):
         self.assertFalse(_eligible_for_delivery(live, operation="analyze_replay", now=NOW))
 
     def test_safe_report_artifact_uses_redacted_allowlist(self) -> None:
-        artifact = _safe_report_artifact(_report())
+        report = _report()
+        report = replace(
+            report,
+            metadata={
+                **report.metadata,
+                "t4_replay": True,
+                "t4_replay_as_of": NOW.isoformat(),
+                "t4_replay_fingerprint_sha256": "d" * 64,
+                "t4_replay_source_batch_ids": [41],
+                "t4_replay_source_batch_hashes": ["e" * 64],
+                "t4_replay_provenance_sha256": _replay_provenance_hash(
+                    [41], ["e" * 64]
+                ),
+            },
+        )
+        artifact = _safe_report_artifact(report)
         serialized = json.dumps(artifact, sort_keys=True)
 
         self.assertTrue(artifact["read_only"])
+        self.assertEqual(
+            artifact["metadata"]["t4_replay_fingerprint_sha256"],
+            "d" * 64,
+        )
+        self.assertEqual(
+            artifact["metadata"]["t4_replay_source_batch_ids"],
+            [41],
+        )
+        self.assertEqual(
+            artifact["metadata"]["t4_replay_source_batch_hashes"],
+            ["e" * 64],
+        )
         self.assertNotIn(SECRET_MARKER, serialized)
         self.assertNotIn("provider_diagnostics", serialized)
         self.assertNotIn("raw_payload", serialized)
         self.assertNotIn("narrative", serialized)
         self.assertNotIn("authorization", serialized)
+
+    def test_replay_report_persists_exact_live_batch_input_provenance(self) -> None:
+        artifact = {
+            "metadata": {
+                "t4_replay_source_batch_ids": [41],
+                "t4_replay_source_batch_hashes": ["e" * 64],
+            }
+        }
+        connection = FakeConnection(
+            [SQLStep("INSERT INTO crypto_agent.research_run_inputs", [("e" * 64,)])]
+        )
+
+        MonitoringRepository._insert_replay_inputs(
+            connection.cursor(),
+            run_id=73,
+            artifact=artifact,
+        )
+
+        params = connection.scripted_cursor.executions[0][1]
+        self.assertEqual(params, (73, 41, "e" * 64))
 
     def test_alert_payload_has_an_exact_safe_allowlist(self) -> None:
         payload = _alert_payload(_report(), _policy())

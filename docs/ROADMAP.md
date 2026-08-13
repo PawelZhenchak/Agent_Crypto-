@@ -29,18 +29,33 @@
    wyłącznie `POST /v1/analyze` z `X-Crypto-Agent-Request: analyze-v1`. Synthetic,
    fixture, replay, `NO_SIGNAL`, veto i stale nigdy nie są dostarczane. Webhook,
    Slack, Telegram, e-mail i SMS są poza zakresem tej wersji.
-8. **Odbiór V1** — warstwa implementacyjna przygotowana w `0.8.0`: oficjalne
+8. **Odbiór V1** — warstwa bazowa przygotowana w `0.8.0`: oficjalne
    `Plus500US.T4Proto` `1.0.73` i `Plus500US.T4ChartDecoder` `1.0.97` (publiczny
    protocol commit `1a68b674482194f1cf3b9d7f129ce5fbed8bcb51`), WebSocket/Protobuf + Chart REST,
    bridge schema v5, nieprzezroczyste `MarketID` per świeca, rozdzielenie
    Simulator/live oraz append-only kampania i raport jakości z migracji `0017`.
+   Etap 1 w `0.9.0` dodaje migrację `0018`: podpisany przez bridge dziennik,
+   osobną rolę weryfikatora, obiektywne referencje do batchy/cykli/runów,
+   siedem prób scenariuszy i niezależny predykat bramki PostgreSQL. Caller nie
+   może zadeklarować `PASS`.
+
    Do faktycznego odbioru pozostają provisioning klucza/identyfikatorów/uprawnień,
    test Simulator i live, uruchomienie zatwierdzonego runnera cykli, minimum 672
    godziny obserwacji czasu rzeczywistego oraz końcowy raport ze wszystkimi
-   obowiązkowymi kryteriami `PASS`. Zakres kampanii `0.8.0` to BTC/ETH 4h;
+   obowiązkowymi kryteriami `PASS`. Wszystkie siedem scenariuszy musi mieć
+   obiektywny wynik `pass`; `roll_transition` wymaga prawdziwego rollu live.
+   Zakres kampanii `0.9.0` to BTC/ETH 4h;
    publiczny dwutygodniowy Simulator sam nie wystarcza.
+9. **Nadzór kampanii 24/7 — etap 2** — do wdrożenia: zewnętrzny supervisor
+   procesów, bezpieczny restart bridge'a, utrzymanie runnerów obu scope'ów,
+   rotacja operacyjna i alarmowanie. W `0.9.0` kontrolowany `bridge_restart`
+   zatrzymuje host, ale sam go nie uruchamia.
 
 Provisioning, rzeczywiste testy Simulator/live i kampania nie zostały wykonane.
-`v1_gate_passed=false`; schema `0.8.0` blokuje scenariusz `PASS` i dodatnią decyzję
-bramki do późniejszej migracji z obiektywnymi referencjami dowodów. Raport można
-finalizować dopiero po `planned_ends_at + cycle_interval_seconds`.
+Nie ma jeszcze dostępu T4 ani rzeczywistych identyfikatorów rynków.
+`v1_gate_passed=false`.
+
+W `0.9.0` nie jest to blokada stała. PostgreSQL może wyliczyć `true` dopiero po
+pełnym realnym oknie, okresie grace, spełnieniu progów jakości i siedmiu
+zweryfikowanych dowodach. Kontrolowany `rate_limit` dowodzi granicy naszego
+handlera, nie naturalnego `429` po stronie T4.

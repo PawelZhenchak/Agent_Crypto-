@@ -96,7 +96,7 @@ Outbox jest trwały, ale granica zapisu do stdout ma semantykę at-least-once.
 Konsument musi deduplikować po `idempotency_key`; model nie obiecuje exactly-once
 między bazą a procesem odbiorcy.
 
-## T4 schema v5 i kampania odbiorowa 0.8.0
+## T4 schema v5 i kampania odbiorowa 0.9.0
 
 Migracja `0017` rozszerza batch, świece i futures evidence o pełną tożsamość T4:
 
@@ -120,12 +120,45 @@ Ta sama migracja dodaje cztery zbiory odbiorowe:
 
 Triggery wykorzystują czas bazy i blokują deklarowanie cykli z wyprzedzeniem oraz
 backfill. Raport rozróżnia `PASS`, `FAIL` i `NOT_OBSERVED`, a jego finalizacja
-jest dozwolona dopiero po `planned_ends_at + cycle_interval_seconds`. Schema
-`0.8.0` celowo akceptuje dla scenariusza wyłącznie `fail` i odrzuca
-`v1_gate_passed=true`, ponieważ nie ma jeszcze obiektywnych referencji dowodów
-scenariuszy. Późniejsza migracja musi dodać te referencje i ich walidację, zanim
-wynik dodatni stanie się osiągalny.
+jest dozwolona dopiero po `planned_ends_at + cycle_interval_seconds`.
 
-Provisioning i rzeczywiste testy Simulator/live nie zostały wykonane, kampania nie
-została rozpoczęta; zakres odbioru 0.8.0 to BTC/ETH 4h, a
-`v1_gate_passed=false`.
+Migracja `0018` dodaje pięć append-only zbiorów dowodowych:
+
+- `t4_bridge_evidence_keys` — fingerprint SHA-256 publicznego SPKI i algorytm
+  podpisu bridge'a;
+- `t4_bridge_observation_events` — kanoniczne claims, podpis ECDSA, hash payloadu,
+  globalny `previous_event_hash`, `boot_id` i opcjonalne powiązanie z kampanią;
+- `t4_observation_scenario_trial_requests` — żądanie kontrolowanej próby,
+  utworzone zegarem bazy dla konkretnego UUID, scenariusza i scope'u;
+- `t4_observation_scenario_trials` — wynik wyprowadzony przez bazę oraz dokładne
+  referencje do zdarzeń, batchy, cykli i runów.
+- `t4_replay_verifier_attestations` — verifier-only wynik samodzielnego replay
+  120 świec dla zamrożonego scope’u: dokładny cutoff, fingerprint, batch ID/hash,
+  provenance i stałe flagi read-only/braku delivery.
+
+Podpis jest składany przez nasz bridge dowodowy. Nie jest podpisem ani atestacją
+Plus500/T4. Python sprawdza SPKI, fingerprint, podpis, kanoniczną projekcję i hash
+chain, a PostgreSQL niezależnie sprawdza zapisane hashe, zamrożony klucz,
+ciągłość, powiązania i semantykę scenariusza.
+
+Pięć prób kontrolowanych to `bridge_restart`, `missing_data`, `rate_limit`,
+`reconnect` i `stale_data`. `replay_blocked` oraz `roll_transition` są pasywne.
+Kontrolowany `rate_limit` opisuje zachowanie naszej granicy handlera; nie jest
+dowodem naturalnego `429` od T4. `roll_transition` wymaga rzeczywistego live
+batcha schema v5 oraz zgodnych starych i nowych `MarketID`.
+
+Funkcja `t4_observation_gate_is_verified(campaign_id)` nie ufa statusom
+wyliczonym przez callera. Czyta zamrożoną kampanię, planowe sloty, cykle, batche,
+RTT, naruszenia i siedem wyników scenariuszy. Trigger raportu końcowego wymaga,
+aby `v1_gate_passed` był dokładnie równy wynikowi tej funkcji.
+
+Ścieżki używają trzech rozłącznych loginów PostgreSQL bez superusera: runtime,
+verifier-write należącego do `crypto_agent_evidence_verifier` oraz read-only
+reader należącego do `crypto_agent_evidence_reader`. Isolated verifier czyta
+zamrożone replay inputs przez readera, a atestację zapisuje przez verifier-write.
+Runtime nie jest właścicielem bazy ani członkiem ról dowodowych. DSN
+administratora jest poza wszystkimi ścieżkami kampanii.
+
+Provisioning i rzeczywiste testy Simulator/live nie zostały wykonane. Nie ma
+jeszcze prawdziwych identyfikatorów T4 ani rozpoczętej kampanii. Zakres odbioru
+`0.9.0` to BTC/ETH 4h, a obecny wynik to `v1_gate_passed=false`.

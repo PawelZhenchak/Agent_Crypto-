@@ -6,6 +6,7 @@ import unittest
 from datetime import UTC, datetime, timedelta
 from email.message import Message
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 from crypto_agent.orchestrator import _source_attested
 from crypto_agent.providers.base import ProviderError
@@ -37,6 +38,25 @@ class _Opener:
         self.request = request
         del timeout
         return _Response(self.payload)
+
+
+class _ErrorOpener:
+    def __init__(self, *, status: int, reason_code: str | None) -> None:
+        self.status = status
+        self.reason_code = reason_code
+
+    def open(self, request, timeout):  # type: ignore[no-untyped-def]
+        del request, timeout
+        headers = Message()
+        if self.reason_code is not None:
+            headers["X-Crypto-Agent-T4-Reason-Code"] = self.reason_code
+        raise HTTPError(
+            "http://127.0.0.1:8784/v1/market-data",
+            self.status,
+            "bridge failure",
+            headers,
+            None,
+        )
 
 
 def _payload() -> dict[str, object]:
@@ -141,6 +161,38 @@ class Plus500T4ProviderTests(unittest.TestCase):
         for token in ("", "short", "contains whitespace " + "x" * 32):
             with self.subTest(token=token), self.assertRaises(ValueError):
                 Plus500T4Provider(bridge_token=token)
+
+    def test_bridge_preserves_only_allowlisted_failure_reason(self) -> None:
+        with patch(
+            "crypto_agent.providers.t4.build_opener",
+            return_value=_ErrorOpener(
+                status=503,
+                reason_code="T4_STALE_DATA",
+            ),
+        ), self.assertRaises(ProviderError) as raised:
+            Plus500T4Provider(bridge_token=_BRIDGE_TOKEN).fetch_batch(
+                symbol="BTC/USD",
+                interval_minutes=1440,
+                as_of=datetime(2026, 8, 11, tzinfo=UTC),
+                limit=120,
+            )
+        self.assertEqual(raised.exception.code, "T4_STALE_DATA")
+
+    def test_bridge_rejects_untrusted_failure_reason(self) -> None:
+        with patch(
+            "crypto_agent.providers.t4.build_opener",
+            return_value=_ErrorOpener(
+                status=503,
+                reason_code="DROP_DATABASE_NOW",
+            ),
+        ), self.assertRaises(ProviderError) as raised:
+            Plus500T4Provider(bridge_token=_BRIDGE_TOKEN).fetch_batch(
+                symbol="BTC/USD",
+                interval_minutes=1440,
+                as_of=datetime(2026, 8, 11, tzinfo=UTC),
+                limit=120,
+            )
+        self.assertEqual(raised.exception.code, "T4_BRIDGE_UNAVAILABLE")
 
     def test_valid_read_only_payload_is_parsed(self) -> None:
         opener = _Opener(_payload())
